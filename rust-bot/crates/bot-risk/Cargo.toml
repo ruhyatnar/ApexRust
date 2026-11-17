@@ -1,0 +1,9 @@
+[package]
+name = "bot-risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bot-core = { path = "../bot-core" }
+chrono = { workspace = true }

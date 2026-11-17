@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bot-core",
+    "crates/bot-indicators",
+    "crates/bot-exchange",
+    "crates/bot-strategy",
+    "crates/bot-risk",
+    "crates/bot-engine",
+    "crates/bot-web",
+    "crates/bot-desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["ApexRust Quant Contributors"]
+
+[workspace.dependencies]
+# Official Binance Rust Connector SDK (https://developers.binance.com/en/docs/sdks-tools/connectors/rust)
+binance-sdk = { version = "75.0.0", default-features = false, features = ["rustls-tls", "spot"] }
+
+# Async Runtime & Networking
+tokio = { version = "1.47", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# WebApp API & WebSocket Telemetry Bridge
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization, Config & Precision Math
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging & Error Handling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }

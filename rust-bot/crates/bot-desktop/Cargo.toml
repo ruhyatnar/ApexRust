@@ -1,0 +1,16 @@
+[package]
+name = "bot-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bot-core = { path = "../bot-core" }
+bot-engine = { path = "../bot-engine" }
+bot-web = { path = "../bot-web" }
+tokio = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

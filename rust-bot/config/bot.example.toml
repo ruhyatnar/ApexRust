@@ -1,0 +1,72 @@
+# ApexRust Quant — Production Configuration Example
+# Copy to `config/bot.toml` and adjust for Testnet or Production.
+
+[exchange]
+environment = "testnet" # "testnet" | "production"
+paper_trading = true    # Isolated virtual paper sandbox when true; live signed orders require credentials + armed_for_live_orders
+ws_stream_url = "wss://stream.testnet.binance.vision/stream"
+ws_api_url = "wss://ws-api.testnet.binance.vision/ws-api/v3"
+rest_base_url = "https://testnet.binance.vision"
+
+[exchange.credentials]
+auth_method = "hmac-sha256" # "hmac-sha256" | "ed25519"
+api_key_env = "BINANCE_API_KEY"
+api_secret_env = "BINANCE_API_SECRET"
+recv_window_ms = 5000
+max_order_notional_usdt = 250.0
+require_preflight_test_order = true
+armed_for_live_orders = false
+
+# Transport Failover & Watchdog
+ws_heartbeat_timeout_ms = 4500
+rest_poll_interval_ms = 1500
+ws_reconnect_initial_ms = 1000
+ws_reconnect_max_ms = 30000
+max_consecutive_rest_failures = 5
+
+[trading]
+mode = "scalping" # "scalping" | "intraday"
+timeframe = "5m"  # "1m" | "3m" | "5m" | "15m"
+pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
+max_concurrent_positions = 3
+base_risk_per_trade_pct = 0.75
+initial_equity_usdt = 10000.0
+taker_fee_bps = 10.0
+
+[indicators]
+ema_fast = 9
+ema_mid = 21
+ema_slow = 50
+ema_macro = 200
+rsi_period = 14
+rsi_long_pullback_min = 42.0
+rsi_long_pullback_max = 58.0
+rsi_short_pullback_min = 42.0
+rsi_short_pullback_max = 58.0
+adx_period = 14
+adx_min_trend = 25.0
+atr_period = 14
+require_vwap_alignment = true
+
+[exits]
+atr_sl_multiplier = 1.5
+atr_tp1_multiplier = 2.25
+atr_tp2_multiplier = 3.75
+tp1_close_ratio = 0.50
+break_even_trigger_r = 1.0
+break_even_fee_buffer_bps = 12.0
+trailing_activation_r = 1.2
+atr_trailing_multiplier = 1.4
+
+[risk]
+max_daily_drawdown_pct = 3.0
+max_pair_daily_drawdown_pct = 1.25
+max_daily_profit_pct = 5.0
+max_win_streak = 5
+max_lose_streak = 3
+streak_cooldown_minutes = 30
+flatten_on_circuit_breaker = true
+
+[web]
+bind_addr = "127.0.0.1:8080"
+allowed_origin = "http://localhost:3000"

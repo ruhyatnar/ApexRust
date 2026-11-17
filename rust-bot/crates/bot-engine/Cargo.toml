@@ -1,0 +1,15 @@
+[package]
+name = "bot-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bot-core = { path = "../bot-core" }
+bot-indicators = { path = "../bot-indicators" }
+bot-exchange = { path = "../bot-exchange" }
+bot-strategy = { path = "../bot-strategy" }
+bot-risk = { path = "../bot-risk" }
+tokio = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
