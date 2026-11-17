@@ -1,5 +1,6 @@
 import React from 'react';
 import { ArrowUpRight, CheckCircle2, RefreshCw, Wifi, WifiOff, XCircle } from 'lucide-react';
+import { evaluatePreTradeValidation } from '../engine/quantAnalytics';
 import type { BotConfig, EngineSnapshot, TransportMode } from '../engine/types';
 
 interface MarketsViewProps {
@@ -130,6 +131,7 @@ export const MarketsView: React.FC<MarketsViewProps> = ({
               <th className="px-4 py-3 text-right font-medium">Session %</th>
               <th className="px-4 py-3 text-right font-medium">ADX (14)</th>
               <th className="px-4 py-3 text-right font-medium">RSI (14)</th>
+              <th className="px-4 py-3 text-right font-medium">Vol Ratio (20)</th>
               <th className="px-4 py-3 text-right font-medium">ATR (14)</th>
               <th className="px-4 py-3 text-right font-medium">Daily PnL</th>
               <th className="px-4 py-3 text-right font-medium">Action</th>
@@ -140,6 +142,8 @@ export const MarketsView: React.FC<MarketsViewProps> = ({
               const ind = p.indicators;
               const isSelected = p.symbol === selectedSymbol;
               const isQuarantined = risk.quarantinedPairs.includes(p.symbol);
+              const volRatio = ind.volumeRatio ?? 1.0;
+              const minVolMult = config.indicators.minVolumeExpansionMult ?? 1.5;
               return (
                 <tr key={p.symbol} className={isSelected ? 'bg-white/[0.03]' : 'hover:bg-white/[0.02]'}>
                   <td className="px-4 py-3 font-sans font-semibold text-slate-100">
@@ -170,6 +174,13 @@ export const MarketsView: React.FC<MarketsViewProps> = ({
                   </td>
                   <td className="px-4 py-3 text-right text-slate-200">
                     {ind.rsi !== null ? ind.rsi.toFixed(1) : '—'}
+                  </td>
+                  <td
+                    className={`px-4 py-3 text-right ${
+                      volRatio >= minVolMult ? 'font-semibold text-emerald-400' : 'text-slate-300'
+                    }`}
+                  >
+                    {volRatio.toFixed(2)}×
                   </td>
                   <td className="px-4 py-3 text-right text-slate-200">
                     {ind.atr !== null ? `$${ind.atr.toFixed(2)}` : '—'}
@@ -331,6 +342,10 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
                 ok: rsiPullback,
               },
               { label: 'Session VWAP Alignment', ok: vwapAlign },
+              {
+                label: `Volume ≥ ${(config.indicators.minVolumeExpansionMult ?? 1.5).toFixed(1)}× Avg (${(ind.volumeRatio ?? 1).toFixed(2)}×)`,
+                ok: (ind.volumeRatio ?? 1) >= (config.indicators.minVolumeExpansionMult ?? 1.5),
+              },
             ];
           }
 
@@ -342,6 +357,31 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
                 : 'Bearish Trend'
               : 'Neutral / Transition';
 
+          const preferredSide = emaBear && !longOnly ? 'Short' : 'Long';
+          const atrVal = ind.atr ?? p.lastPrice * 0.008;
+          const slDist = atrVal * config.exits.atrSlMultiplier;
+          const slPrice = preferredSide === 'Long' ? p.lastPrice - slDist : p.lastPrice + slDist;
+          const tp1Price =
+            preferredSide === 'Long'
+              ? p.lastPrice + atrVal * config.exits.atrTp1Multiplier
+              : p.lastPrice - atrVal * config.exits.atrTp1Multiplier;
+          const tp2Price =
+            preferredSide === 'Long'
+              ? p.lastPrice + atrVal * config.exits.atrTp2Multiplier
+              : p.lastPrice - atrVal * config.exits.atrTp2Multiplier;
+
+          const preTradeAudit = evaluatePreTradeValidation({
+            pair: p,
+            side: preferredSide,
+            entryPrice: p.lastPrice,
+            stopLossPrice: slPrice,
+            takeProfit1Price: tp1Price,
+            takeProfit2Price: tp2Price,
+            notionalUsdt: config.automation.autoOrderNotionalUsdt,
+            equityUsdt: snapshot.risk.currentEquity,
+            config,
+          });
+
           return (
             <div
               key={p.symbol}
@@ -349,12 +389,35 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
             >
               <div className="flex items-baseline justify-between">
                 <div>
-                  <h3 className="text-base font-semibold text-slate-100">{p.symbol}</h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-base font-semibold text-slate-100">{p.symbol}</h3>
+                    <span className="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-[10px] font-semibold text-[#7DF2AD]">
+                      9-Step: {preTradeAudit.passedCount}/9
+                    </span>
+                  </div>
                   <div className="text-xs text-slate-400">{bias}</div>
                 </div>
                 <span className="font-mono text-sm font-semibold tabular-nums text-slate-100">
                   ${p.lastPrice >= 100 ? p.lastPrice.toFixed(2) : p.lastPrice.toFixed(4)}
                 </span>
+              </div>
+
+              {/* Multi-Timeframe Alignment Protocol (§3 Table: D1 / H4 / H1 / M5) */}
+              <div className="grid grid-cols-4 gap-1 rounded-lg border border-white/[0.05] bg-[#0D1015] p-1.5 font-mono text-[10px]">
+                {preTradeAudit.mtfAlignment.map((mtf) => (
+                  <div
+                    key={mtf.timeframe}
+                    title={`${mtf.role}: ${mtf.metricSummary}`}
+                    className={`rounded px-1.5 py-1 text-center ${
+                      mtf.aligned
+                        ? 'bg-emerald-500/15 text-emerald-300'
+                        : 'bg-white/[0.03] text-slate-500'
+                    }`}
+                  >
+                    <div className="font-bold">{mtf.timeframe.split(' ')[0]}</div>
+                    <div className="text-[9px]">{mtf.aligned ? 'ALIGN' : 'WAIT'}</div>
+                  </div>
+                ))}
               </div>
 
               <div className="space-y-2 border-y border-white/[0.06] py-3 text-xs">
@@ -374,6 +437,22 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
                     )}
                   </div>
                 ))}
+              </div>
+
+              {/* Trade Plan Invalidation & R:R Readout (§1 & §4) */}
+              <div className="flex items-center justify-between font-mono text-[10px] text-slate-400">
+                <span>
+                  Invalidation:{' '}
+                  <strong className="text-rose-300">
+                    ${slPrice.toFixed(p.lastPrice >= 100 ? 2 : 4)}
+                  </strong>
+                </span>
+                <span>
+                  Target R:R:{' '}
+                  <strong className="text-emerald-300">
+                    1:{preTradeAudit.rewardToRiskRatio.toFixed(2)}
+                  </strong>
+                </span>
               </div>
 
               <button

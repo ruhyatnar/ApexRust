@@ -14,14 +14,17 @@ import {
 import type {
   BotConfig,
   EngineSnapshot,
+  ExchangeVenue,
   LiveCredentialStatus,
   ManualOrderInput,
+  MarginType,
   Timeframe,
   TransportMode,
 } from '../engine/types';
 import { CandlestickChart } from './CandlestickChart';
 import { OrderTicketPanel } from './OrderTicketPanel';
 import { SummaryCardsRow } from './SummaryCardsRow';
+import { TradeHistoryView } from './TradeHistoryView';
 
 interface TradingDeskViewProps {
   snapshot: EngineSnapshot;
@@ -40,8 +43,17 @@ interface TradingDeskViewProps {
   onToggleAutomation: () => void;
   onRunAutoScan: () => void;
   onOpenStrategyConfig: () => void;
+  onOpenFeatureToggles: () => void;
+  onUpdateVenue: (venue: ExchangeVenue) => void;
+  onUpdateFuturesSettings: (leverage: number, marginType: MarginType) => void;
   onResetCircuitBreaker: () => void;
   onOpenLiveCredentials: () => void;
+  onSyncLiveTrades?: (symbol: string) => Promise<{
+    ok: boolean;
+    added: number;
+    latencyMs?: number;
+    message: string;
+  }>;
 }
 
 const PROFILE_LABELS: Record<BotConfig['automation']['strategyProfile'], string> = {
@@ -75,8 +87,12 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
   onToggleAutomation,
   onRunAutoScan,
   onOpenStrategyConfig,
+  onOpenFeatureToggles,
+  onUpdateVenue,
+  onUpdateFuturesSettings,
   onResetCircuitBreaker,
   onOpenLiveCredentials,
+  onSyncLiveTrades,
 }) => {
   const [ledgerTab, setLedgerTab] = useState<'positions' | 'pending' | 'trades' | 'events'>('positions');
   const activePair =
@@ -84,6 +100,8 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
   const openPositions = snapshot.pairs.filter((p) => p.openPosition !== null);
   const { risk } = snapshot;
   const auto = config.automation;
+  const enabledFeaturesCount = Object.values(config.features).filter(Boolean).length;
+  const totalFeaturesCount = Object.keys(config.features).length;
 
   return (
     <div className="space-y-4">
@@ -103,6 +121,19 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
           </div>
 
           <span className="hidden h-3.5 w-px bg-white/[0.08] sm:inline-block" aria-hidden="true" />
+
+          <span className="text-slate-400">
+            Venue:{' '}
+            <strong
+              className={`font-mono font-semibold ${
+                config.trading.venue === 'Futures' ? 'text-amber-300' : 'text-[#7DF2AD]'
+              }`}
+            >
+              {config.trading.venue === 'Futures'
+                ? `Futures · ${config.trading.leverage}x`
+                : 'Spot'}
+            </strong>
+          </span>
 
           <span className="text-slate-400">
             Strategy:{' '}
@@ -126,7 +157,7 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
           </span>
 
           <span className="font-mono text-[11px] tabular-nums text-slate-400">
-            Scans {snapshot.autoStats.scansRun} · Signals {snapshot.autoStats.signalsDetected} · Orders{' '}
+            Modules {enabledFeaturesCount}/{totalFeaturesCount} · Scans {snapshot.autoStats.scansRun} · Orders{' '}
             {snapshot.autoStats.autoOrdersDispatched}
           </span>
         </div>
@@ -161,6 +192,14 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
                 Enable Auto
               </>
             )}
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenFeatureToggles}
+            className="flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 text-xs font-medium text-slate-300 transition hover:border-[#7DF2AD]/40 hover:text-white whitespace-nowrap"
+          >
+            Feature Toggles
           </button>
 
           <button
@@ -251,6 +290,8 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
               onSubmitOrder={onSubmitOrder}
               onToggleFeedSource={onToggleFeedSource}
               onOpenLiveCredentials={onOpenLiveCredentials}
+              onUpdateVenue={onUpdateVenue}
+              onUpdateFuturesSettings={onUpdateFuturesSettings}
             />
           )}
         </div>
@@ -577,6 +618,16 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Full-Width Binance Execution & Trade History Table (Entries + Exits) */}
+      <TradeHistoryView
+        executions={snapshot.executionHistory}
+        activeSymbol={activePair?.symbol ?? selectedSymbol}
+        activeVenue={config.trading.venue}
+        symbols={snapshot.pairs.map((p) => p.symbol)}
+        onSelectSymbol={onSelectSymbol}
+        onSyncLiveTrades={onSyncLiveTrades}
+      />
     </div>
   );
 };

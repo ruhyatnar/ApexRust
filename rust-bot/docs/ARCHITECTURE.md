@@ -11,7 +11,7 @@
               |                               |
     +---------v---------+           +---------v---------+
     |      bot-web      |           |     bot-engine    |  Tokio Orchestrator
-    |  (Axum REST + WS) |<--------->|  (Event Loop +    |
+    |  (Axum REST + WS) |<--------->|  (Event Loop +    |  (+ git_sync Backup)
     +-------------------+           |   Paper/Live Sim) |
                                     +---------+---------+
                                               |
@@ -19,37 +19,52 @@
                  |                    |               |                    |
        +---------v---------+ +--------v--------+ +----v------------+ +-----v-----------+
        |   bot-exchange    | | bot-indicators  | |  bot-strategy   | |    bot-risk     |
-       |  (binance-sdk WS  | | (EMA, RSI, ADX, | | (Trend Scalp &  | | (Drawdown, CB,  |
-       |   + REST fallback)| |  ATR, VWAP)     | |  ATR Exit Plan) | |  Streak Guards) |
+       |  (binance-sdk     | | (EMA, RSI, ADX, | | (Trend Scalp &  | | (Drawdown, CB,  |
+       |   Spot + Futures) | |  ATR, VWAP)     | |  ATR Exit Plan) | |  Streak Guards) |
        +---------+---------+ +--------+--------+ +----+------------+ +-----+-----------+
                  |                    |               |                    |
                  +--------------------+---------------+--------------------+
                                               |
                                     +---------v---------+
-                                    |     bot-core      |  Shared Models, Config, Errors
+                                    |     bot-core      |  Shared Models, FeatureToggles, Config
                                     +-------------------+
 ```
 
-## 2. WebSocket Primary + REST Fallback State Machine
+## 2. Binance Spot & USD-M Futures Routing (`binance-sdk`)
 
-Official reference: [Binance Connectors — Rust](https://developers.binance.com/en/docs/sdks-tools/connectors/rust) (`binance-sdk`).
+Official reference: [Binance Connectors — Rust](https://developers.binance.com/en/docs/sdks-tools/connectors/rust) (`binance-sdk` `78.1.0` with `spot` and `derivatives_trading_usds_futures` features).
 
-1. **Cold Start Warmup (`SpotRestApi`)**
-   - On startup, `BinanceExchangeGateway` issues parallel `GET /api/v3/klines` requests (via `SpotRestApi`) for every configured pair to populate the 200+ candle ring buffer required for `EMA 200`, `ATR(14)`, and `ADX(14)`.
-2. **Primary Real-Time Stream (`WsPrimary`)**
-   - Connects to Binance combined WebSocket Stream (`/stream?streams=btcusdt@kline_5m/btcusdt@bookTicker/...`) and initializes `SpotWsApi` for low-latency authenticated order placement (`order.place`, `order.cancel`).
-   - Updates `last_ws_message_at` on every tick, kline, or ping/pong frame.
-3. **Heartbeat Watchdog & Automatic Degradation (`RestFallback`)**
-   - A Tokio interval checks `Instant::now() - last_ws_message_at`.
-   - If elapsed time exceeds `ws_heartbeat_timeout_ms` (default `4500ms`) or the socket closes/errors:
-     - Gateway atomically transitions `TransportMode::WsPrimary -> TransportMode::RestFallback`.
-     - Market data switches seamlessly to `SpotRestApi` polling (`rest_poll_interval_ms`) and order execution routes through `SpotRestApi::new_order` / `cancel_order`.
-     - A background reconnect task runs exponential backoff (`1s -> 2s -> 4s ... max 30s`).
-4. **Auto-Promotion**
-   - Once WebSocket receives 3 consecutive healthy frames/heartbeats, `TransportMode` transitions back to `WsPrimary` and REST polling suspends.
+| Venue | Environment | REST Base URL | WebSocket Stream URL |
+| :--- | :--- | :--- | :--- |
+| **Spot** | Testnet | `https://testnet.binance.vision` | `wss://stream.testnet.binance.vision/stream` |
+| **Spot** | Production | `https://api.binance.com` | `wss://stream.binance.com:9443/stream` |
+| **Futures** | Testnet | `https://testnet.binancefuture.com` | `wss://stream.binancefuture.com/stream` |
+| **Futures** | Production | `https://fapi.binance.com` | `wss://fstream.binance.com/stream` |
 
-## 3. Concurrency & Data Ownership
+### Supported Order Types
+- **MARKET**: Immediate execution (`BUY` via `quoteOrderQty` on Spot or rounded `quantity` on Futures).
+- **LIMIT**: Passive resting entry with `GTC`, `IOC`, or `FOK`.
+- **POST-ONLY MAKER**: `LIMIT_MAKER` on Spot; `LIMIT` + `timeInForce = GTX` on USD-M Futures.
+- **OCO / Bracket**:
+  - **Spot**: `/api/v3/orderList/oco` (`aboveType = LIMIT_MAKER`, `belowType = STOP_LOSS_LIMIT`) or entry + protective bracket.
+  - **Futures**: Entry market/limit order paired with `TAKE_PROFIT_MARKET` and `STOP_MARKET` protective triggers.
 
-- **Single Writer, Broadcast Readers**: `bot-engine` owns mutable `Position` and `RiskManager` state inside a dedicated Tokio task (no lock contention on hot paths).
-- **Telemetry Fan-Out**: Every tick, candle close, signal evaluation, or risk event publishes an immutable `EngineSnapshot` over `tokio::sync::broadcast::Sender` to `bot-web` (WebSocket clients) and `bot-desktop` (terminal logs / desktop HUD).
-- **Graceful Shutdown**: On `SIGINT` / `SIGTERM`, `bot-engine` persists daily risk state, optionally cancels resting orders, and cleanly closes WebSocket streams.
+## 3. WebSocket Primary + REST Fallback State Machine
+
+1. **Cold Start Warmup**: `BinanceRestClient` / `BinanceFuturesClient` issues parallel kline requests (`/api/v3/klines` or `/fapi/v1/klines`) to warm up the 200+ candle ring buffer.
+2. **Primary Real-Time Stream (`WsPrimary`)**: Connects to Binance combined WebSocket Stream when `features.ws_primary_feed = true`.
+3. **Heartbeat Watchdog & Automatic Degradation (`RestFallback`)**: When `Instant::now() - last_ws_message_at > ws_heartbeat_timeout_ms` (and `features.rest_fallback = true`), `FailoverGateway` degrades transparently to REST polling and re-attempts WebSocket reconnection with exponential backoff.
+4. **Auto-Promotion**: Once WebSocket frames stabilize, `TransportMode` returns to `WsPrimary`.
+
+## 4. Granular Feature Gating (`FeatureToggles`)
+
+Every subsystem checks `BotConfig.features` before executing:
+- `signal_generator` and individual indicator switches (`ema_trend_filter`, `rsi_momentum_filter`, `adx_strength_filter`, `vwap_bias_filter`) shape `evaluate_entry_signal_with_options`.
+- Exit switches (`atr_dynamic_exits`, `take_profit_ladder`, `break_even_stop`, `trailing_stop`) govern `manage_position_tick`.
+- Execution switches (`automated_trading`, `manual_trading`, `spot_market`, `futures_market`, `circuit_breaker`) gate both `bot-engine` and the React/Express dashboard.
+
+## 5. Sanitized Git Sync & Backup
+
+- `bot_engine::git_sync` and `deploy/git-backup.sh` enforce `.gitignore` exclusions for `.env`, `*.pem`, `*.key`, and `config/bot.toml`.
+- Only sanitized snapshots (`backups/bot-config-backup.json` and `rust-bot/config/bot.synced.toml`) are staged, committed, and optionally pushed to `origin`.
+

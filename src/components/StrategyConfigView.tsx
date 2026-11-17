@@ -5,6 +5,7 @@ import type {
   DirectionPolicy,
   EngineSnapshot,
   ExecutionOrderMethod,
+  PositionSizingMode,
   StrategyMode,
   StrategyProfile,
   Timeframe,
@@ -471,39 +472,61 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
         {/* Execution & Timeframe */}
         <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4">
-          <h3 className="text-sm font-semibold text-slate-100">Execution & Sizing</h3>
+          <h3 className="text-sm font-semibold text-slate-100">Execution & Quantitative Sizing</h3>
 
           <div>
-            <label htmlFor="cfg-timeframe" className="block text-xs font-medium text-slate-400">
-              Primary Candle Timeframe
+            <label htmlFor="cfg-sizing-mode" className="block text-xs font-medium text-slate-400">
+              Position Sizing Model (§5 Kelly / Risk)
             </label>
             <select
-              id="cfg-timeframe"
-              value={config.trading.timeframe}
-              onChange={(e) => updateTrading('timeframe', e.target.value as Timeframe)}
-              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              id="cfg-sizing-mode"
+              value={config.trading.positionSizingMode ?? 'fixed_usdt'}
+              onChange={(e) =>
+                updateTrading('positionSizingMode', e.target.value as PositionSizingMode)
+              }
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-[#7DF2AD] focus:border-[#7DF2AD] focus:outline-none"
             >
-              <option value="1m">1m (High-Frequency Scalp)</option>
-              <option value="3m">3m (Momentum Scalp)</option>
-              <option value="5m">5m (Standard Scalping)</option>
-              <option value="15m">15m (Intraday Trend)</option>
+              <option value="fixed_usdt">Fixed Notional (Auto Size USDT)</option>
+              <option value="fixed_risk_pct">Fixed % Equity Risk (Stop-Distance)</option>
+              <option value="quarter_kelly">Quarter-Kelly (0.25 f* · Conservative)</option>
+              <option value="half_kelly">Half-Kelly (0.50 f* · Systematic Benchmark)</option>
+              <option value="full_kelly">Full Kelly (1.00 f* · Peak Log Growth)</option>
             </select>
           </div>
 
-          <div>
-            <label htmlFor="cfg-risk-trade" className="block text-xs font-medium text-slate-400">
-              Risk Per Trade (% Equity)
-            </label>
-            <input
-              id="cfg-risk-trade"
-              type="number"
-              step="0.1"
-              min="0.1"
-              max="5"
-              value={config.trading.baseRiskPerTradePct}
-              onChange={(e) => updateTrading('baseRiskPerTradePct', Number(e.target.value) || 0.5)}
-              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
-            />
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="cfg-timeframe" className="block text-xs font-medium text-slate-400">
+                Candle Timeframe
+              </label>
+              <select
+                id="cfg-timeframe"
+                value={config.trading.timeframe}
+                onChange={(e) => updateTrading('timeframe', e.target.value as Timeframe)}
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              >
+                <option value="1m">1m (Scalp)</option>
+                <option value="3m">3m (Momentum)</option>
+                <option value="5m">5m (Standard)</option>
+                <option value="15m">15m (Intraday)</option>
+              </select>
+            </div>
+
+            <div>
+              <label htmlFor="cfg-risk-trade" className="block text-xs font-medium text-slate-400">
+                Base Risk (% Eq)
+              </label>
+              <input
+                id="cfg-risk-trade"
+                type="number"
+                step="0.1"
+                min="0.1"
+                max="5"
+                value={config.trading.baseRiskPerTradePct}
+                onChange={(e) => updateTrading('baseRiskPerTradePct', Number(e.target.value) || 0.5)}
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
           </div>
 
           <div>
@@ -526,22 +549,41 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
 
         {/* Technical Indicator Filters */}
         <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4">
-          <h3 className="text-sm font-semibold text-slate-100">Technical Indicators</h3>
+          <h3 className="text-sm font-semibold text-slate-100">Technical Indicators & Volume</h3>
 
-          <div>
-            <label htmlFor="cfg-adx-min" className="block text-xs font-medium text-slate-400">
-              ADX Minimum Trend Strength (Anti-Chop)
-            </label>
-            <input
-              id="cfg-adx-min"
-              type="number"
-              step="1"
-              min="10"
-              max="50"
-              value={config.indicators.adxMinTrend}
-              onChange={(e) => updateIndicators('adxMinTrend', Number(e.target.value) || 25)}
-              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
-            />
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="cfg-adx-min" className="block text-xs font-medium text-slate-400">
+                ADX Min Trend
+              </label>
+              <input
+                id="cfg-adx-min"
+                type="number"
+                step="1"
+                min="10"
+                max="50"
+                value={config.indicators.adxMinTrend}
+                onChange={(e) => updateIndicators('adxMinTrend', Number(e.target.value) || 25)}
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label htmlFor="cfg-vol-mult" className="block text-xs font-medium text-slate-400">
+                Vol Surge (× Avg)
+              </label>
+              <input
+                id="cfg-vol-mult"
+                type="number"
+                step="0.1"
+                min="1.0"
+                max="3.5"
+                value={config.indicators.minVolumeExpansionMult ?? 1.5}
+                onChange={(e) =>
+                  updateIndicators('minVolumeExpansionMult', Number(e.target.value) || 1.5)
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-3">
@@ -595,7 +637,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
 
         {/* ATR Exit Multipliers */}
         <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4">
-          <h3 className="text-sm font-semibold text-slate-100">ATR Exit Multipliers</h3>
+          <h3 className="text-sm font-semibold text-slate-100">ATR Exit & Fee Buffers</h3>
 
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -649,17 +691,17 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               />
             </div>
             <div>
-              <label htmlFor="cfg-tp2" className="block text-xs font-medium text-slate-400">
-                TP2 Runner (× ATR)
+              <label htmlFor="cfg-be-fee" className="block text-xs font-medium text-slate-400">
+                BE Fee Buffer (bps)
               </label>
               <input
-                id="cfg-tp2"
+                id="cfg-be-fee"
                 type="number"
-                step="0.25"
-                min="1.5"
-                max="10"
-                value={config.exits.atrTp2Multiplier}
-                onChange={(e) => updateExits('atrTp2Multiplier', Number(e.target.value) || 3.75)}
+                step="1"
+                min="5"
+                max="100"
+                value={config.exits.breakEvenFeeBufferBps}
+                onChange={(e) => updateExits('breakEvenFeeBufferBps', Number(e.target.value) || 25)}
                 className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
               />
             </div>

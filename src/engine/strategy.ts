@@ -58,6 +58,13 @@ export function evaluateEntrySignal(
   const useRsi = options?.features?.rsiMomentumFilter !== false;
   const useAdx = options?.features?.adxStrengthFilter !== false;
   const useVwap = options?.features?.vwapBiasFilter !== false;
+  const useVolConfirm = options?.features?.volumeConfirmationFilter === true;
+  const minVolMult = indCfg.minVolumeExpansionMult ?? 1.5;
+  const currentVolRatio = ind.volumeRatio ?? 1.0;
+
+  if (useVolConfirm && currentVolRatio < minVolMult) {
+    return null;
+  }
 
   if (profile === 'vwap_reversion') {
     if (
@@ -81,7 +88,7 @@ export function evaluateEntrySignal(
         atr: ind.atr,
         adx: ind.adx,
         rsi: ind.rsi,
-        rationale: `VWAP Reversion Long · Stretch ${(stretch / ind.atr).toFixed(2)}×ATR below anchor · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)}`,
+        rationale: `VWAP Reversion Long · Stretch ${(stretch / ind.atr).toFixed(2)}×ATR below anchor · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)} · Vol ${currentVolRatio.toFixed(2)}×`,
         timestampMs: nowMs,
       };
     }
@@ -98,7 +105,7 @@ export function evaluateEntrySignal(
         atr: ind.atr,
         adx: ind.adx,
         rsi: ind.rsi,
-        rationale: `VWAP Reversion Short · Stretch ${(stretch / ind.atr).toFixed(2)}×ATR above anchor · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)}`,
+        rationale: `VWAP Reversion Short · Stretch ${(stretch / ind.atr).toFixed(2)}×ATR above anchor · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)} · Vol ${currentVolRatio.toFixed(2)}×`,
         timestampMs: nowMs,
       };
     }
@@ -134,7 +141,8 @@ export function evaluateEntrySignal(
       history.length > 0
         ? history.reduce((sum, c) => sum + c.volume, 0) / history.length
         : candle.volume;
-    const volSurgeOk = candle.volume >= avgVol * 1.1;
+    const requiredBreakoutVolMult = useVolConfirm ? Math.max(1.1, minVolMult) : 1.1;
+    const volSurgeOk = candle.volume >= avgVol * requiredBreakoutVolMult;
 
     const emaLongOk = !useEma || (ind.emaFast > ind.emaMid && ind.emaMid > ind.emaSlow);
     const emaShortOk = !useEma || (ind.emaFast < ind.emaMid && ind.emaMid < ind.emaSlow);
@@ -215,7 +223,7 @@ export function evaluateEntrySignal(
       atr: ind.atr,
       adx: ind.adx,
       rsi: ind.rsi,
-      rationale: `EMA Trend Pullback Long · ADX ${ind.adx.toFixed(1)} (+DI > -DI) · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)}`,
+      rationale: `EMA Trend Pullback Long · ADX ${ind.adx.toFixed(1)} (+DI > -DI) · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)} · Vol ${currentVolRatio.toFixed(2)}×`,
       timestampMs: nowMs,
     };
   }
@@ -228,7 +236,7 @@ export function evaluateEntrySignal(
       atr: ind.atr,
       adx: ind.adx,
       rsi: ind.rsi,
-      rationale: `EMA Trend Pullback Short · ADX ${ind.adx.toFixed(1)} (-DI > +DI) · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)}`,
+      rationale: `EMA Trend Pullback Short · ADX ${ind.adx.toFixed(1)} (-DI > +DI) · RSI curl ${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)} · Vol ${currentVolRatio.toFixed(2)}×`,
       timestampMs: nowMs,
     };
   }

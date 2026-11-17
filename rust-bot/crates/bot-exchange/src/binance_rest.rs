@@ -1,23 +1,25 @@
 use binance_sdk::config::ConfigurationRestApi;
 use binance_sdk::spot::{rest_api::KlinesParams, SpotRestApi};
-use bot_core::{BotError, Candle, ExchangeConfig, ExchangeEnvironment, MarketEvent, Result, TransportMode};
+use bot_core::{
+    BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent, Result,
+    TransportMode,
+};
 use chrono::Utc;
 use std::env;
 use tracing::debug;
 
-/// Official Binance Spot REST API wrapper (`binance_sdk::spot::SpotRestApi`)
+/// Official Binance REST API wrapper (`binance_sdk::spot::SpotRestApi`)
 /// used for:
 /// 1. Historical kline warmup at startup (200+ candles for EMA 200 / ADX / ATR)
-/// 2. Automatic fallback market polling & order execution if WebSocket stalls.
+/// 2. Automatic fallback market polling & Spot Market/Limit/OCO order execution if WebSocket stalls.
 pub struct BinanceRestClient {
     cfg: ExchangeConfig,
     http: reqwest::Client,
-    sdk_client: Option<SpotRestApi>,
+    sdk_client: Option<binance_sdk::spot::rest_api::RestApi>,
 }
 
 impl BinanceRestClient {
     pub fn new(cfg: ExchangeConfig) -> Result<Self> {
-        // Initialize official binance-sdk SpotRestApi when API credentials exist
         let sdk_client = match (env::var("BINANCE_API_KEY"), env::var("BINANCE_PRIVATE_KEY_PATH")) {
             (Ok(api_key), Ok(key_path)) if !api_key.is_empty() => {
                 let rest_cfg = ConfigurationRestApi::builder()
@@ -41,26 +43,42 @@ impl BinanceRestClient {
         })
     }
 
-    /// Fetch historical klines via official `SpotRestApi` (or public REST endpoint
-    /// when running unauthenticated paper mode).
-    pub async fn fetch_klines(&self, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Candle>> {
-        if let Some(client) = &self.sdk_client {
-            let params = KlinesParams::builder(symbol.to_string(), interval.to_string())
-                .limit(limit as i32)
-                .build()
-                .map_err(|e| BotError::RestApi(format!("KlinesParams error: {e}")))?;
+    fn effective_base_url(&self) -> &str {
+        match (self.cfg.venue, self.cfg.environment) {
+            (ExchangeVenue::Futures, ExchangeEnvironment::Production) => "https://fapi.binance.com",
+            (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
+                "https://testnet.binancefuture.com"
+            }
+            (ExchangeVenue::Spot, _) => &self.cfg.rest_base_url,
+        }
+    }
 
-            let _resp = client
-                .klines(params)
-                .await
-                .map_err(|e| BotError::RestApi(format!("SpotRestApi::klines failed: {e}")))?;
-            debug!(%symbol, %interval, "Fetched klines via official binance-sdk SpotRestApi");
+    /// Fetch historical klines via official `SpotRestApi` or public REST endpoint
+    /// (automatically selects `/api/v3/klines` for Spot or `/fapi/v1/klines` for USD-M Futures).
+    pub async fn fetch_klines(&self, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Candle>> {
+        if self.cfg.venue == ExchangeVenue::Spot {
+            if let Some(client) = &self.sdk_client {
+                let params = KlinesParams::builder(symbol.to_string(), interval.to_string())
+                    .limit(limit as i32)
+                    .build()
+                    .map_err(|e| BotError::RestApi(format!("KlinesParams error: {e}")))?;
+
+                let _resp = client
+                    .klines(params)
+                    .await
+                    .map_err(|e| BotError::RestApi(format!("SpotRestApi::klines failed: {e}")))?;
+                debug!(%symbol, %interval, "Fetched klines via official binance-sdk SpotRestApi");
+            }
         }
 
-        // Public REST JSON fallback (works both with and without API keys)
+        let kline_path = match self.cfg.venue {
+            ExchangeVenue::Spot => "/api/v3/klines",
+            ExchangeVenue::Futures => "/fapi/v1/klines",
+        };
         let url = format!(
-            "{}/api/v3/klines?symbol={}&interval={}&limit={}",
-            self.cfg.rest_base_url,
+            "{}{}?symbol={}&interval={}&limit={}",
+            self.effective_base_url(),
+            kline_path,
             symbol.to_uppercase(),
             interval,
             limit
@@ -97,6 +115,41 @@ impl BinanceRestClient {
             });
         }
         Ok(candles)
+    }
+
+    /// Construct canonical Spot OCO (`POST /api/v3/orderList/oco`) exit payload
+    /// compliant with official Binance Spot API (replaces deprecated `/api/v3/order/oco`).
+    pub fn build_spot_oco_exit_payload(
+        symbol: &str,
+        quantity: f64,
+        take_profit_price: f64,
+        stop_loss_trigger: f64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": "/api/v3/orderList/oco",
+            "symbol": symbol.to_uppercase(),
+            "side": "SELL",
+            "quantity": format!("{quantity:.6}"),
+            "aboveType": "LIMIT_MAKER",
+            "abovePrice": format!("{take_profit_price:.4}"),
+            "belowType": "STOP_LOSS_LIMIT",
+            "belowStopPrice": format!("{stop_loss_trigger:.4}"),
+            "belowPrice": format!("{:.4}", stop_loss_trigger * 0.998),
+            "belowTimeInForce": "GTC",
+            "newOrderRespType": "RESULT"
+        })
+    }
+
+    /// Construct canonical Spot `GET /api/v3/myTrades` signed query parameters
+    /// for syncing filled entry and exit executions into `TradeHistoryView`.
+    pub fn build_my_trades_query(symbol: &str, limit: u16, recv_window_ms: u64) -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": "/api/v3/myTrades",
+            "symbol": symbol.to_uppercase(),
+            "limit": limit.min(1000),
+            "recvWindow": recv_window_ms,
+            "timestamp": Utc::now().timestamp_millis()
+        })
     }
 
     /// Single fallback poll yielding a `MarketEvent` tagged `TransportMode::RestFallback`.

@@ -3,6 +3,13 @@ import assert from 'node:assert/strict';
 import { RiskManager } from './risk';
 import { DEFAULT_BOT_CONFIG, SimulationRuntime } from './simulator';
 import { buildExitPlan, evaluateEntrySignal, managePositionTick } from './strategy';
+import {
+  calculateQuantitativePositionSizeUsdt,
+  computeExpectancyStats,
+  computeKellySizingAnalytics,
+  computePortfolioCorrelationMatrix,
+  evaluatePreTradeValidation,
+} from './quantAnalytics';
 import type { Candle, IndicatorSnapshot, Position } from './types';
 
 test('evaluateEntrySignal generates Long signal only when EMA, ADX, RSI curl, and VWAP align', () => {
@@ -410,5 +417,324 @@ test('runAutoScanNow increments scan stats and Live mode queues LiveAutoIntent i
   assert.equal(intents[0].kind, 'ENTRY');
   assert.equal(intents[0].orderMethod, 'LIMIT');
 });
+
+test('FeatureToggles independently gate signalGenerator, manualTrading, breakEvenStop, trailingStop, and circuitBreaker', () => {
+  const candle: Candle = {
+    openTimeMs: 1_763_280_000_000,
+    open: 102,
+    high: 103.2,
+    low: 101.8,
+    close: 103,
+    volume: 5000,
+    isClosed: true,
+  };
+  const bullishInd: IndicatorSnapshot = {
+    emaFast: 102.5,
+    emaMid: 101.8,
+    emaSlow: 100.5,
+    emaMacro: 98.0,
+    rsi: 51.2,
+    prevRsi: 47.9,
+    adx: 31.4,
+    plusDi: 28.0,
+    minusDi: 14.0,
+    atr: 1.5,
+    vwap: 102.1,
+  };
+
+  // Disabling signalGenerator blocks signals even on perfect alignment
+  const noSig = evaluateEntrySignal(
+    'SOLUSDT',
+    candle,
+    bullishInd,
+    DEFAULT_BOT_CONFIG.trading,
+    DEFAULT_BOT_CONFIG.indicators,
+    candle.openTimeMs,
+    {
+      features: { signalGenerator: false },
+    }
+  );
+  assert.equal(noSig, null);
+
+  // Disabling breakEvenStop & trailingStop keeps activeStopLoss frozen at initial SL
+  const plan = buildExitPlan('Long', 100, 2.0, DEFAULT_BOT_CONFIG.exits);
+  const pos: Position = {
+    id: 'pos-ft',
+    symbol: 'ETHUSDT',
+    side: 'Long',
+    entryPrice: 100,
+    quantity: 10,
+    remainingQuantity: 10,
+    lockedMarginUsdt: 250,
+    unrealizedPnlUsdt: 0,
+    realizedPnlUsdt: 0,
+    highestFavorablePrice: 100,
+    exitPlan: plan,
+    openedAtMs: 1_763_280_000_000,
+    rationale: 'test',
+  };
+  managePositionTick(pos, 104.5, 2.0, DEFAULT_BOT_CONFIG.exits, {
+    breakEvenStop: false,
+    trailingStop: false,
+  });
+  assert.equal(pos.exitPlan.breakEvenArmed, false);
+  assert.equal(pos.exitPlan.trailingActive, false);
+  assert.equal(pos.exitPlan.activeStopLoss, 97);
+
+  // Disabling manualTrading blocks submitManualOrder
+  const rt = new SimulationRuntime({
+    ...DEFAULT_BOT_CONFIG,
+    features: { ...DEFAULT_BOT_CONFIG.features, manualTrading: false },
+  });
+  const manualBlocked = rt.submitManualOrder({
+    symbol: 'ETHUSDT',
+    orderType: 'MARKET',
+    side: 'Long',
+    usdtAmount: 100,
+    stopLossMode: 'ATR',
+    stopLossPct: 1.5,
+    useBreakEven: true,
+    useTrailingStop: true,
+    targets: [{ pctOffset: 2.5, allocationPct: 100 }],
+  });
+  assert.equal(manualBlocked.ok, false);
+});
+
+test('setVenue switches Spot/Futures endpoints and Futures leverage scales locked margin', () => {
+  const futuresCfg = {
+    ...DEFAULT_BOT_CONFIG,
+    trading: {
+      ...DEFAULT_BOT_CONFIG.trading,
+      venue: 'Futures' as const,
+      leverage: 5,
+      marginType: 'ISOLATED' as const,
+    },
+  };
+  const rt = new SimulationRuntime(futuresCfg);
+  assert.equal(rt.snapshot.transport.venue, 'Futures');
+  assert.match(rt.snapshot.transport.wsEndpoint, /binancefuture\.com/);
+  assert.match(rt.snapshot.transport.restEndpoint, /fapi\/v1/);
+
+  const res = rt.submitManualOrder({
+    symbol: 'ETHUSDT',
+    orderType: 'MARKET',
+    side: 'Short',
+    usdtAmount: 500,
+    stopLossMode: 'ATR',
+    stopLossPct: 1.5,
+    useBreakEven: true,
+    useTrailingStop: true,
+    targets: [{ pctOffset: 2.5, allocationPct: 100 }],
+  });
+  assert.equal(res.ok, true);
+  if (res.ok && res.position) {
+    // At 5x leverage, $500 notional locks ~$100 margin instead of $500
+    assert.ok(res.position.lockedMarginUsdt <= 105);
+    assert.ok(res.position.lockedMarginUsdt >= 95);
+  }
+
+  rt.setVenue('Spot');
+  assert.equal(rt.snapshot.transport.venue, 'Spot');
+  assert.match(rt.snapshot.transport.wsEndpoint, /binance\.vision/);
+});
+
+test('executionHistory tracks filled ENTRY orders, partial TP1 exits, and full EXIT fills with Binance schema fields', () => {
+  const rt = new SimulationRuntime(DEFAULT_BOT_CONFIG);
+  const initialCount = rt.snapshot.executionHistory.length;
+  assert.ok(initialCount >= 7);
+
+  // Submit a manual OCO SELL entry on ETHUSDT
+  const entryRes = rt.submitManualOrder(
+    {
+      symbol: 'ETHUSDT',
+      orderType: 'OCO SELL',
+      side: 'Long',
+      usdtAmount: 300,
+      stopLossMode: 'ATR',
+      stopLossPct: 1.5,
+      useBreakEven: true,
+      useTrailingStop: true,
+      targets: [
+        { pctOffset: 1.5, allocationPct: 50 },
+        { pctOffset: 3.0, allocationPct: 50 },
+      ],
+    },
+    1_763_290_000_000
+  );
+  assert.equal(entryRes.ok, true);
+  assert.equal(rt.snapshot.executionHistory.length, initialCount + 1);
+
+  const entryRec = rt.snapshot.executionHistory[0];
+  assert.equal(entryRec.symbol, 'ETHUSDT');
+  assert.equal(entryRec.lifecycle, 'ENTRY');
+  assert.equal(entryRec.binanceSide, 'BUY');
+  assert.equal(entryRec.execType, 'TRADE');
+  assert.equal(entryRec.orderStatus, 'FILLED');
+  assert.ok(entryRec.orderListId > 0);
+  assert.equal(entryRec.realizedPnlUsdt, null);
+  assert.ok(entryRec.cummulativeQuoteQty > 299 && entryRec.cummulativeQuoteQty <= 301);
+  assert.ok(entryRec.commission > 0);
+
+  // Close ETHUSDT manually and verify EXIT record is logged
+  rt.closePositionBySymbol('ETHUSDT', 1_763_290_060_000);
+  assert.equal(rt.snapshot.executionHistory.length, initialCount + 2);
+  const exitRec = rt.snapshot.executionHistory[0];
+  assert.equal(exitRec.symbol, 'ETHUSDT');
+  assert.equal(exitRec.lifecycle, 'EXIT');
+  assert.equal(exitRec.binanceSide, 'SELL');
+  assert.equal(exitRec.orderStatus, 'FILLED');
+  assert.equal(exitRec.exitReason, 'ManualClose');
+  assert.notEqual(exitRec.realizedPnlUsdt, null);
+});
+
+test('Executive Briefing §5: Fractional Kelly & Stop-Distance Notional Position Sizing matches worked example', () => {
+  // Briefing §5 Worked Example: p = 0.58, q = 0.42, b = 1.5 -> f* = (1.5*0.58 - 0.42)/1.5 = 0.30 (30%)
+  // Half-Kelly = 15%, Quarter-Kelly = 7.5%
+  const expectancy = {
+    sampleCount: 55,
+    isStatisticallySignificant: true,
+    winCount: 32,
+    lossCount: 23,
+    winRateP: 0.58,
+    lossRateQ: 0.42,
+    avgWinUsdt: 150,
+    avgLossUsdt: 100,
+    avgWinR: 1.5,
+    avgLossR: 1.0,
+    payoffRatioB: 1.5,
+    expectancyR: 0.58 * 1.5 - 0.42 * 1.0, // +0.45R
+    expectancyUsdt: 0.58 * 150 - 0.42 * 100, // $45
+    grossProfitUsdt: 4800,
+    grossLossUsdt: 2300,
+    profitFactor: 4800 / 2300,
+    profitFactorRegime: 'StrongEdge' as const,
+    expectedMaxLossStreak500: 7,
+    streak12DrawdownAtCurrentRiskPct: 8.6,
+    streak12DrawdownAt5PctRisk: 46.0,
+    streak12DrawdownAt1PctRisk: 11.4,
+  };
+
+  // Account Equity = $25,000, Entry = $50,000, Stop = $49,000 (2% stop distance = 0.02)
+  const kelly = computeKellySizingAnalytics(expectancy, 25_000, 0.02, 1.5);
+  assert.ok(Math.abs(kelly.rawFullKellyFraction - 0.30) < 1e-6);
+  assert.ok(Math.abs(kelly.fullKellyPct - 30.0) < 1e-4);
+  assert.ok(Math.abs(kelly.halfKellyPct - 15.0) < 1e-4);
+  assert.ok(Math.abs(kelly.quarterKellyPct - 7.5) < 1e-4);
+  assert.equal(kelly.negativeExpectancyWarning, false);
+
+  // At Half-Kelly (15% of $25,000 = $3,750 dollar risk) and 2% stop distance,
+  // theoretical stop-distance notional = $3,750 / 0.02 = $187,500
+  const halfKellyTier = kelly.tiers.find((t) => t.id === 'half_kelly')!;
+  assert.ok(Math.abs(halfKellyTier.capitalRiskPerTradeUsdt - 3_750) < 1e-4);
+  assert.ok(Math.abs(halfKellyTier.notionalPositionUsdt - 187_500) < 1e-2);
+
+  // Verify Negative Kelly filter blocks automated entries when EV <= 0 (e.g. p = 0.35, b = 1.2 -> f* < 0)
+  const negativeExpectancy = {
+    ...expectancy,
+    winRateP: 0.35,
+    lossRateQ: 0.65,
+    payoffRatioB: 1.2,
+    expectancyR: 0.35 * 1.2 - 0.65,
+  };
+  const negKelly = computeKellySizingAnalytics(negativeExpectancy, 25_000, 0.02, 1.5);
+  assert.equal(negKelly.negativeExpectancyWarning, true);
+  assert.equal(negKelly.rawFullKellyFraction < 0, true);
+
+  const blockedSize = calculateQuantitativePositionSizeUsdt({
+    mode: 'half_kelly',
+    fixedUsdt: 250,
+    equityUsdt: 25_000,
+    availableBalanceUsdt: 25_000,
+    baseRiskPerTradePct: 1.5,
+    entryPrice: 50_000,
+    stopLossPrice: 49_000,
+    kelly: negKelly,
+    venue: 'Futures',
+    leverage: 5,
+  });
+  assert.equal(blockedSize.blockedByNegativeKelly, true);
+  assert.equal(blockedSize.notionalUsdt, 0);
+});
+
+test('Executive Briefing §2, §3 & §6: Volume Expansion Confirmation, 9-Step Signal Validation & Portfolio Covariance Kelly Matrix', () => {
+  const candle: Candle = {
+    openTimeMs: 1_763_280_000_000,
+    open: 102,
+    high: 103.2,
+    low: 101.8,
+    close: 103,
+    volume: 5000,
+    isClosed: true,
+  };
+  const lowVolInd: IndicatorSnapshot = {
+    emaFast: 102.5,
+    emaMid: 101.8,
+    emaSlow: 100.5,
+    emaMacro: 98.0,
+    rsi: 51.2,
+    prevRsi: 47.9,
+    adx: 31.4,
+    plusDi: 28.0,
+    minusDi: 14.0,
+    atr: 1.5,
+    vwap: 102.1,
+    volumeSma20: 5000,
+    volumeRatio: 1.0, // 1.0x < 1.5x required surge
+  };
+
+  // When volumeConfirmationFilter is enabled, 1.0x volume ratio is rejected
+  const rejectedLowVol = evaluateEntrySignal(
+    'SOLUSDT',
+    candle,
+    lowVolInd,
+    DEFAULT_BOT_CONFIG.trading,
+    { ...DEFAULT_BOT_CONFIG.indicators, minVolumeExpansionMult: 1.5 },
+    candle.openTimeMs,
+    { features: { ...DEFAULT_BOT_CONFIG.features, volumeConfirmationFilter: true } }
+  );
+  assert.equal(rejectedLowVol, null);
+
+  // When volumeRatio is 1.85x (>= 1.5x), entry signal passes
+  const highVolInd: IndicatorSnapshot = { ...lowVolInd, volumeRatio: 1.85 };
+  const acceptedHighVol = evaluateEntrySignal(
+    'SOLUSDT',
+    candle,
+    highVolInd,
+    DEFAULT_BOT_CONFIG.trading,
+    { ...DEFAULT_BOT_CONFIG.indicators, minVolumeExpansionMult: 1.5 },
+    candle.openTimeMs,
+    { features: { ...DEFAULT_BOT_CONFIG.features, volumeConfirmationFilter: true } }
+  );
+  assert.ok(acceptedHighVol !== null);
+  assert.equal(acceptedHighVol.side, 'Long');
+
+  // Verify Runtime Snapshot works with Expectancy, Kelly, Portfolio Correlation Matrix, and 9-Step Validation
+  const rt = new SimulationRuntime(DEFAULT_BOT_CONFIG);
+  const exp = computeExpectancyStats(rt.snapshot.recentTrades, DEFAULT_BOT_CONFIG.trading.baseRiskPerTradePct);
+  assert.ok(exp.profitFactor > 1.0);
+  const kelly = computeKellySizingAnalytics(exp, rt.snapshot.risk.currentEquity, 0.015, DEFAULT_BOT_CONFIG.trading.baseRiskPerTradePct);
+  assert.ok(kelly.growthCurve.length > 10);
+  const corr = computePortfolioCorrelationMatrix(rt.snapshot.pairs, kelly.halfKellyPct);
+  assert.equal(corr.symbols.length, DEFAULT_BOT_CONFIG.trading.pairs.length);
+  assert.equal(corr.matrix.length, DEFAULT_BOT_CONFIG.trading.pairs.length);
+
+  const solPair = rt.snapshot.pairs.find((p) => p.symbol === 'SOLUSDT')!;
+  const validation = evaluatePreTradeValidation({
+    pair: solPair,
+    side: 'Long',
+    entryPrice: solPair.lastPrice,
+    stopLossPrice: solPair.lastPrice * 0.985,
+    takeProfit1Price: solPair.lastPrice * 1.015,
+    takeProfit2Price: solPair.lastPrice * 1.03,
+    notionalUsdt: 250,
+    equityUsdt: rt.snapshot.risk.currentEquity,
+    config: DEFAULT_BOT_CONFIG,
+  });
+  assert.equal(validation.steps.length, 9);
+  assert.equal(validation.mtfAlignment.length, 4);
+  assert.ok(validation.invalidationPrice > 0);
+});
+
+
 
 

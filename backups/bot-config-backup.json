@@ -1,0 +1,92 @@
+{
+  "backedUpAt": "2026-11-17T10:44:26.055Z",
+  "environment": "Testnet",
+  "venue": "Spot",
+  "leverage": 3,
+  "marginType": "ISOLATED",
+  "config": {
+    "trading": {
+      "venue": "Spot",
+      "leverage": 10,
+      "marginType": "CROSSED",
+      "mode": "scalping",
+      "timeframe": "15m",
+      "pairs": [
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "BNBUSDT",
+        "AVAXUSDT"
+      ],
+      "maxConcurrentPositions": 3,
+      "baseRiskPerTradePct": 0.75,
+      "initialEquityUsdt": 10000,
+      "takerFeeBps": 10
+    },
+    "indicators": {
+      "emaFast": 9,
+      "emaMid": 21,
+      "emaSlow": 50,
+      "emaMacro": 200,
+      "rsiPeriod": 14,
+      "rsiLongPullbackMin": 42,
+      "rsiLongPullbackMax": 58,
+      "rsiShortPullbackMin": 42,
+      "rsiShortPullbackMax": 58,
+      "adxPeriod": 14,
+      "adxMinTrend": 25,
+      "atrPeriod": 14,
+      "requireVwapAlignment": true
+    },
+    "exits": {
+      "atrSlMultiplier": 1.5,
+      "atrTp1Multiplier": 2.25,
+      "atrTp2Multiplier": 3.75,
+      "tp1CloseRatio": 0.5,
+      "breakEvenTriggerR": 1,
+      "breakEvenFeeBufferBps": 12,
+      "trailingActivationR": 1.2,
+      "atrTrailingMultiplier": 1.4
+    },
+    "risk": {
+      "maxDailyDrawdownPct": 3,
+      "maxPairDailyDrawdownPct": 1.25,
+      "maxDailyProfitPct": 5,
+      "maxWinStreak": 5,
+      "maxLoseStreak": 3,
+      "streakCooldownMinutes": 30,
+      "flattenOnCircuitBreaker": true
+    },
+    "automation": {
+      "enabled": true,
+      "strategyProfile": "trend_pullback",
+      "directionPolicy": "both",
+      "orderMethod": "OCO",
+      "limitOffsetBps": 5,
+      "timeInForce": "GTC",
+      "signalCooldownBars": 2,
+      "autoOrderNotionalUsdt": 150,
+      "autoCloseOnExit": true
+    },
+    "features": {
+      "automatedTrading": true,
+      "manualTrading": true,
+      "signalGenerator": true,
+      "wsPrimaryFeed": true,
+      "restFallback": true,
+      "emaTrendFilter": true,
+      "rsiMomentumFilter": true,
+      "adxStrengthFilter": true,
+      "vwapBiasFilter": true,
+      "atrDynamicExits": true,
+      "takeProfitLadder": true,
+      "breakEvenStop": true,
+      "trailingStop": true,
+      "circuitBreaker": true,
+      "spotMarket": true,
+      "futuresMarket": true,
+      "gitAutoBackup": true
+    }
+  },
+  "summary": {}
+}

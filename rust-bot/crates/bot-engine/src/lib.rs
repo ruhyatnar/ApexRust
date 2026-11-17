@@ -2,6 +2,8 @@
 //! Binance WebSocket/REST Failover -> Indicator Pipeline -> Trend Strategy ->
 //! Risk Circuit Breaker -> Position & Exit Execution -> Broadcast Telemetry.
 
+pub mod git_sync;
+
 use bot_core::{
     BotConfig, CircuitBreakerState, ClosedTrade, EngineSnapshot, ExitReason, MarketEvent,
     PairSnapshot, Position, Result, Side,
@@ -9,7 +11,9 @@ use bot_core::{
 use bot_exchange::FailoverGateway;
 use bot_indicators::IndicatorPipeline;
 use bot_risk::RiskManager;
-use bot_strategy::{build_exit_plan, evaluate_entry_signal, manage_position_tick, PositionTickAction};
+use bot_strategy::{
+    build_exit_plan, evaluate_entry_signal_with_options, manage_position_tick, PositionTickAction,
+};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,6 +46,7 @@ impl TradingEngine {
         let risk = RiskManager::new(cfg.risk.clone(), cfg.trading.clone(), Utc::now());
         let initial = EngineSnapshot {
             running: true,
+            venue: cfg.exchange.venue,
             transport_mode: bot_core::TransportMode::WsPrimary,
             failover_count: 0,
             last_ws_age_ms: 0,
@@ -172,13 +177,21 @@ impl TradingEngine {
                                 }
                             }
                         }
-                    } else if running && ev.candle.is_closed {
-                        if let Some(sig) = evaluate_entry_signal(
+                    } else if running
+                        && ev.candle.is_closed
+                        && self.cfg.automation.enabled
+                        && self.cfg.features.automated_trading
+                        && self.cfg.features.signal_generator
+                    {
+                        if let Some(sig) = evaluate_entry_signal_with_options(
                             &ev.symbol,
                             &ev.candle,
                             &ind,
                             &self.cfg.trading,
                             &self.cfg.indicators,
+                            self.cfg.automation.strategy_profile,
+                            self.cfg.automation.direction_policy,
+                            &self.cfg.features,
                             ev.received_at,
                         ) {
                             let plan = build_exit_plan(sig.side, sig.entry_price, sig.atr, &self.cfg.exits);
@@ -228,6 +241,7 @@ impl TradingEngine {
 
                     let snap = EngineSnapshot {
                         running,
+                        venue: self.cfg.exchange.venue,
                         transport_mode: gw_health.mode,
                         failover_count: gw_health.failover_count,
                         last_ws_age_ms: gw_health.last_ws_age_ms,

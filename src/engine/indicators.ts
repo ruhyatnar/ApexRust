@@ -227,6 +227,31 @@ export class SessionVwap {
   }
 }
 
+export class VolumeSma {
+  private readonly period: number;
+  private readonly ring: number[] = [];
+  private sum = 0;
+
+  constructor(period = 20) {
+    this.period = Math.max(1, Math.floor(period));
+  }
+
+  next(volume: number): { sma: number | null; ratio: number | null } {
+    const cleanVol = Math.max(0, Number(volume) || 0);
+    // Compute baseline average from prior bars before including current trigger bar if possible
+    const priorAvg = this.ring.length > 0 ? this.sum / this.ring.length : cleanVol;
+    this.ring.push(cleanVol);
+    this.sum += cleanVol;
+    if (this.ring.length > this.period) {
+      const oldest = this.ring.shift() ?? 0;
+      this.sum -= oldest;
+    }
+    const sma = this.ring.length > 0 ? this.sum / this.ring.length : null;
+    const ratio = priorAvg > 1e-12 ? cleanVol / priorAvg : 1;
+    return { sma, ratio };
+  }
+}
+
 export class IndicatorPipeline {
   private readonly emaFast: Ema;
   private readonly emaMid: Ema;
@@ -236,6 +261,7 @@ export class IndicatorPipeline {
   private readonly atr: Atr;
   private readonly adx: Adx;
   private readonly vwap: SessionVwap;
+  private readonly volSma: VolumeSma;
   private latest: IndicatorSnapshot = {
     emaFast: null,
     emaMid: null,
@@ -248,6 +274,8 @@ export class IndicatorPipeline {
     minusDi: null,
     atr: null,
     vwap: null,
+    volumeSma20: null,
+    volumeRatio: null,
   };
 
   constructor(cfg: IndicatorConfig) {
@@ -259,6 +287,7 @@ export class IndicatorPipeline {
     this.atr = new Atr(cfg.atrPeriod);
     this.adx = new Adx(cfg.adxPeriod);
     this.vwap = new SessionVwap();
+    this.volSma = new VolumeSma(20);
   }
 
   update(candle: Candle): IndicatorSnapshot {
@@ -270,6 +299,7 @@ export class IndicatorPipeline {
     const atr = this.atr.next(candle);
     const { adx, plusDi, minusDi } = this.adx.next(candle);
     const vwap = this.vwap.next(candle);
+    const { sma: volumeSma20, ratio: volumeRatio } = this.volSma.next(candle.volume);
 
     this.latest = {
       emaFast,
@@ -283,6 +313,8 @@ export class IndicatorPipeline {
       minusDi,
       atr,
       vwap,
+      volumeSma20,
+      volumeRatio,
     };
     return this.latest;
   }

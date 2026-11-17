@@ -153,6 +153,7 @@ pub struct PairSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineSnapshot {
     pub running: bool,
+    pub venue: crate::ExchangeVenue,
     pub transport_mode: TransportMode,
     pub failover_count: u64,
     pub last_ws_age_ms: u64,

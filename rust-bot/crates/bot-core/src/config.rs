@@ -9,6 +9,12 @@ pub struct BotConfig {
     pub indicators: IndicatorConfig,
     pub exits: ExitConfig,
     pub risk: RiskConfig,
+    #[serde(default)]
+    pub automation: AutomationConfig,
+    #[serde(default)]
+    pub features: FeatureToggles,
+    #[serde(default)]
+    pub git_backup: GitBackupConfig,
     pub web: WebConfig,
 }
 
@@ -45,6 +51,22 @@ pub enum ExchangeEnvironment {
     Production,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExchangeVenue {
+    #[default]
+    Spot,
+    Futures,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum MarginType {
+    #[default]
+    Isolated,
+    Crossed,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthMethod {
@@ -67,6 +89,12 @@ pub struct LiveCredentialsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeConfig {
     pub environment: ExchangeEnvironment,
+    #[serde(default)]
+    pub venue: ExchangeVenue,
+    #[serde(default = "default_leverage")]
+    pub leverage: u8,
+    #[serde(default)]
+    pub margin_type: MarginType,
     pub paper_trading: bool,
     pub credentials: Option<LiveCredentialsConfig>,
     pub ws_stream_url: String,
@@ -79,11 +107,136 @@ pub struct ExchangeConfig {
     pub max_consecutive_rest_failures: u32,
 }
 
+fn default_leverage() -> u8 {
+    3
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StrategyMode {
     Scalping,
     Intraday,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyProfile {
+    #[default]
+    TrendPullback,
+    EmaBreakout,
+    VwapReversion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectionPolicy {
+    #[default]
+    LongOnly,
+    Both,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum OrderExecutionMethod {
+    #[default]
+    Market,
+    Limit,
+    LimitMaker,
+    Oco,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationConfig {
+    pub enabled: bool,
+    pub strategy_profile: StrategyProfile,
+    pub direction_policy: DirectionPolicy,
+    pub order_method: OrderExecutionMethod,
+    pub limit_offset_bps: f64,
+    pub signal_cooldown_bars: u32,
+    pub auto_order_notional_usdt: f64,
+    pub auto_close_on_exit: bool,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            strategy_profile: StrategyProfile::TrendPullback,
+            direction_policy: DirectionPolicy::LongOnly,
+            order_method: OrderExecutionMethod::Market,
+            limit_offset_bps: 5.0,
+            signal_cooldown_bars: 2,
+            auto_order_notional_usdt: 150.0,
+            auto_close_on_exit: true,
+        }
+    }
+}
+
+/// Granular runtime feature toggles enabling operators to switch any subsystem independently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureToggles {
+    pub automated_trading: bool,
+    pub manual_trading: bool,
+    pub signal_generator: bool,
+    pub ws_primary_feed: bool,
+    pub rest_fallback: bool,
+    pub ema_trend_filter: bool,
+    pub rsi_momentum_filter: bool,
+    pub adx_strength_filter: bool,
+    pub vwap_bias_filter: bool,
+    pub atr_dynamic_exits: bool,
+    pub take_profit_ladder: bool,
+    pub break_even_stop: bool,
+    pub trailing_stop: bool,
+    pub circuit_breaker: bool,
+    pub spot_market: bool,
+    pub futures_market: bool,
+    pub git_auto_backup: bool,
+}
+
+impl Default for FeatureToggles {
+    fn default() -> Self {
+        Self {
+            automated_trading: true,
+            manual_trading: true,
+            signal_generator: true,
+            ws_primary_feed: true,
+            rest_fallback: true,
+            ema_trend_filter: true,
+            rsi_momentum_filter: true,
+            adx_strength_filter: true,
+            vwap_bias_filter: true,
+            atr_dynamic_exits: true,
+            take_profit_ladder: true,
+            break_even_stop: true,
+            trailing_stop: true,
+            circuit_breaker: true,
+            spot_market: true,
+            futures_market: true,
+            git_auto_backup: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitBackupConfig {
+    pub enabled: bool,
+    pub remote_name: String,
+    pub branch: String,
+    pub auto_push: bool,
+    pub backup_dir: String,
+}
+
+impl Default for GitBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            remote_name: "origin".into(),
+            branch: "main".into(),
+            auto_push: false,
+            backup_dir: "backups".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

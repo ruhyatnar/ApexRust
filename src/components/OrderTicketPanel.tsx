@@ -1,12 +1,22 @@
 import React, { useMemo, useState } from 'react';
-import { ChevronDown, Plus, Save, Sliders, X, Zap } from 'lucide-react';
+import { CheckCircle2, ChevronDown, Plus, Save, ShieldCheck, Sliders, X, XCircle, Zap } from 'lucide-react';
+import {
+  calculateQuantitativePositionSizeUsdt,
+  computeExpectancyStats,
+  computeKellySizingAnalytics,
+  computePortfolioCorrelationMatrix,
+  evaluatePreTradeValidation,
+} from '../engine/quantAnalytics';
 import type {
   BotConfig,
   EngineSnapshot,
+  ExchangeVenue,
   LiveCredentialStatus,
   ManualOrderInput,
+  MarginType,
   OrderType,
   PairRuntimeState,
+  PositionSizingMode,
   Side,
 } from '../engine/types';
 
@@ -19,6 +29,8 @@ interface OrderTicketPanelProps {
   onSubmitOrder: (input: ManualOrderInput) => Promise<{ ok: true } | { ok: false; reason: string }>;
   onToggleFeedSource: (source: 'Simulated' | 'BinanceLive') => void;
   onOpenLiveCredentials: () => void;
+  onUpdateVenue: (venue: ExchangeVenue) => void;
+  onUpdateFuturesSettings: (leverage: number, marginType: MarginType) => void;
 }
 
 interface TpDraft {
@@ -36,6 +48,8 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   onSubmitOrder,
   onToggleFeedSource,
   onOpenLiveCredentials,
+  onUpdateVenue,
+  onUpdateFuturesSettings,
 }) => {
   const [orderType, setOrderType] = useState<OrderType>('OCO SELL');
   const [side, setSide] = useState<Side>('Long');
@@ -43,6 +57,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   const [usdtAmount, setUsdtAmount] = useState<number>(250);
   const [allocPct, setAllocPct] = useState<number>(25);
   const [limitPriceInput, setLimitPriceInput] = useState<string>('');
+  const [isCustomLimitPrice, setIsCustomLimitPrice] = useState<boolean>(false);
   const [timeInForce, setTimeInForce] = useState<'GTC' | 'IOC' | 'FOK'>('GTC');
 
   const [stopLossMode, setStopLossMode] = useState<'ATR' | 'MARKET' | 'LIMIT'>('ATR');
@@ -56,6 +71,10 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
     { id: 't2', pctOffset: 3.6, allocationPct: 50 },
   ]);
 
+  const [sizingMode, setSizingMode] = useState<PositionSizingMode>(
+    config.trading.positionSizingMode ?? 'fixed_usdt'
+  );
+  const [showNineStepChecklist, setShowNineStepChecklist] = useState(false);
   const [triggerRef, setTriggerRef] = useState<'LAST' | 'MARK'>('LAST');
   const [showAdvance, setShowAdvance] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
@@ -89,35 +108,138 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
 
   const last = activePair.lastPrice;
   const priceDecimals = last >= 100 ? 2 : 4;
-  const spread = last * 0.00025;
+  const spread = last * 0.0025;
   const bid = last - spread;
   const ask = last + spread;
 
   const isLimitOrderType = orderType === 'LIMIT' || orderType === 'LIMIT MAKER';
+  const defaultLimitStr = (side === 'Long' ? bid : ask).toFixed(priceDecimals);
+  const displayedLimitPrice = isCustomLimitPrice ? limitPriceInput : defaultLimitStr;
 
+  // Reset custom limit price flag when symbol changes
   React.useEffect(() => {
-    if (isLimitOrderType && !limitPriceInput) {
-      const defaultLimit = side === 'Long' ? bid : ask;
-      setLimitPriceInput(defaultLimit.toFixed(priceDecimals));
-    }
-  }, [isLimitOrderType, limitPriceInput, side, bid, ask, priceDecimals]);
-
-  // Reset suggested limit price when symbol changes
-  React.useEffect(() => {
-    if (isLimitOrderType) {
-      const suggested = side === 'Long' ? bid : ask;
-      setLimitPriceInput(suggested.toFixed(priceDecimals));
-    } else {
-      setLimitPriceInput('');
-    }
+    setIsCustomLimitPrice(false);
   }, [activePair.symbol]);
 
-  const effectiveUsdt = useMemo(() => {
+  const entryReferencePrice = useMemo(() => {
+    const parsedLim = Number(displayedLimitPrice);
+    if (isLimitOrderType && Number.isFinite(parsedLim) && parsedLim > 0) {
+      return parsedLim;
+    }
+    return last;
+  }, [displayedLimitPrice, isLimitOrderType, last]);
+
+  const computedStopLossPrice = useMemo(() => {
+    const atr = activePair.indicators.atr ?? entryReferencePrice * 0.01;
+    const dist =
+      stopLossMode === 'ATR'
+        ? atr * config.exits.atrSlMultiplier
+        : entryReferencePrice * (Math.max(0.2, stopLossPct) / 100);
+    return side === 'Long'
+      ? Math.max(0.0001, entryReferencePrice - dist)
+      : entryReferencePrice + dist;
+  }, [activePair.indicators.atr, config.exits.atrSlMultiplier, entryReferencePrice, side, stopLossMode, stopLossPct]);
+
+  const expectancyStats = useMemo(
+    () => computeExpectancyStats(snapshot.recentTrades, config.trading.baseRiskPerTradePct),
+    [snapshot.recentTrades, config.trading.baseRiskPerTradePct]
+  );
+
+  const stopDistFrac = useMemo(
+    () =>
+      entryReferencePrice > 0
+        ? Math.max(0.002, Math.abs(entryReferencePrice - computedStopLossPrice) / entryReferencePrice)
+        : 0.015,
+    [entryReferencePrice, computedStopLossPrice]
+  );
+
+  const kellyStats = useMemo(
+    () =>
+      computeKellySizingAnalytics(
+        expectancyStats,
+        snapshot.risk.currentEquity,
+        stopDistFrac,
+        config.trading.baseRiskPerTradePct
+      ),
+    [expectancyStats, snapshot.risk.currentEquity, stopDistFrac, config.trading.baseRiskPerTradePct]
+  );
+
+  const portfolioCorr = useMemo(
+    () => computePortfolioCorrelationMatrix(snapshot.pairs, kellyStats.halfKellyPct),
+    [snapshot.pairs, kellyStats.halfKellyPct]
+  );
+
+  const manualBaseUsdt = useMemo(() => {
     if (amountUnit === '%') {
       return Number(((snapshot.availableBalanceUsdt * allocPct) / 100).toFixed(2));
     }
     return usdtAmount;
   }, [amountUnit, allocPct, usdtAmount, snapshot.availableBalanceUsdt]);
+
+  const quantPositionSize = useMemo(
+    () =>
+      calculateQuantitativePositionSizeUsdt({
+        mode: sizingMode,
+        fixedUsdt: manualBaseUsdt,
+        equityUsdt: snapshot.risk.currentEquity,
+        availableBalanceUsdt: snapshot.availableBalanceUsdt,
+        baseRiskPerTradePct: config.trading.baseRiskPerTradePct,
+        entryPrice: entryReferencePrice,
+        stopLossPrice: computedStopLossPrice,
+        kelly: kellyStats,
+        venue: config.trading.venue,
+        leverage: config.trading.leverage,
+        diversificationMultiplier: portfolioCorr.diversificationMultiplier,
+      }),
+    [
+      sizingMode,
+      manualBaseUsdt,
+      snapshot.risk.currentEquity,
+      snapshot.availableBalanceUsdt,
+      config.trading.baseRiskPerTradePct,
+      entryReferencePrice,
+      computedStopLossPrice,
+      kellyStats,
+      config.trading.venue,
+      config.trading.leverage,
+      portfolioCorr.diversificationMultiplier,
+    ]
+  );
+
+  const effectiveUsdt = quantPositionSize.notionalUsdt;
+
+  const preTradeValidation = useMemo(() => {
+    const tp1Pct = targets[0]?.pctOffset ?? 2.5;
+    const tp2Pct = targets[targets.length - 1]?.pctOffset ?? 3.6;
+    const tp1Price =
+      side === 'Long'
+        ? entryReferencePrice * (1 + tp1Pct / 100)
+        : entryReferencePrice * (1 - tp1Pct / 100);
+    const tp2Price =
+      side === 'Long'
+        ? entryReferencePrice * (1 + tp2Pct / 100)
+        : entryReferencePrice * (1 - tp2Pct / 100);
+    return evaluatePreTradeValidation({
+      pair: activePair,
+      side,
+      entryPrice: entryReferencePrice,
+      stopLossPrice: computedStopLossPrice,
+      takeProfit1Price: tp1Price,
+      takeProfit2Price: tp2Price,
+      notionalUsdt: effectiveUsdt,
+      equityUsdt: snapshot.risk.currentEquity,
+      config,
+    });
+  }, [
+    targets,
+    side,
+    entryReferencePrice,
+    activePair,
+    computedStopLossPrice,
+    effectiveUsdt,
+    snapshot.risk.currentEquity,
+    config,
+  ]);
 
   const handleSliderPct = (pct: number) => {
     setAllocPct(pct);
@@ -148,7 +270,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   };
 
   const handleSubmit = async () => {
-    const parsedLimit = Number(limitPriceInput);
+    const parsedLimit = Number(displayedLimitPrice);
     const res = await onSubmitOrder({
       symbol: activePair.symbol,
       orderType,
@@ -206,6 +328,14 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   };
 
   const coinCode = activePair.symbol.replace('USDT', '');
+  const activeVenue = config.trading.venue;
+  const leverage = config.trading.leverage;
+  const marginType = config.trading.marginType;
+  const requiredMargin =
+    activeVenue === 'Futures' ? effectiveUsdt / Math.max(1, leverage) : effectiveUsdt;
+  const manualAllowed =
+    config.features.manualTrading &&
+    (activeVenue === 'Spot' ? config.features.spotMarket : config.features.futuresMarket);
 
   return (
     <section
@@ -241,6 +371,76 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
           )}
         </div>
 
+        {/* Binance Spot vs USD-M Futures Venue Switcher */}
+        <div className="space-y-2">
+          <div
+            className="grid grid-cols-2 rounded-lg border border-white/[0.08] bg-[#0D1015] p-0.5"
+            role="group"
+            aria-label="Binance exchange venue"
+          >
+            <button
+              type="button"
+              onClick={() => onUpdateVenue('Spot')}
+              disabled={!config.features.spotMarket}
+              className={`rounded-md py-1.5 text-xs font-semibold transition whitespace-nowrap disabled:opacity-40 ${
+                activeVenue === 'Spot'
+                  ? 'bg-[#7DF2AD] text-[#0B0F17]'
+                  : 'text-slate-400 hover:text-slate-100'
+              }`}
+            >
+              Binance Spot
+            </button>
+            <button
+              type="button"
+              onClick={() => onUpdateVenue('Futures')}
+              disabled={!config.features.futuresMarket}
+              className={`rounded-md py-1.5 text-xs font-semibold transition whitespace-nowrap disabled:opacity-40 ${
+                activeVenue === 'Futures'
+                  ? 'bg-amber-400 text-[#0B0F17]'
+                  : 'text-slate-400 hover:text-slate-100'
+              }`}
+            >
+              USD-M Futures
+            </button>
+          </div>
+
+          {activeVenue === 'Futures' && (
+            <div className="grid grid-cols-2 gap-2">
+              <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-2.5 py-1.5">
+                <label htmlFor="ticket-leverage" className="text-[11px] text-slate-400">
+                  Leverage
+                </label>
+                <select
+                  id="ticket-leverage"
+                  value={leverage}
+                  onChange={(e) => onUpdateFuturesSettings(Number(e.target.value), marginType)}
+                  className="bg-transparent font-mono text-xs font-semibold text-amber-300 focus:outline-none"
+                >
+                  {[1, 2, 3, 5, 10, 15, 20].map((lv) => (
+                    <option key={lv} value={lv} className="bg-[#141820]">
+                      {lv}x
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-2.5 py-1.5">
+                <label htmlFor="ticket-margin-type" className="text-[11px] text-slate-400">
+                  Margin
+                </label>
+                <select
+                  id="ticket-margin-type"
+                  value={marginType}
+                  onChange={(e) => onUpdateFuturesSettings(leverage, e.target.value as MarginType)}
+                  className="bg-transparent font-mono text-xs font-semibold text-slate-100 focus:outline-none"
+                >
+                  <option value="ISOLATED" className="bg-[#141820]">ISOLATED</option>
+                  <option value="CROSSED" className="bg-[#141820]">CROSSED</option>
+                </select>
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Order Type Row */}
         <div className="flex items-center justify-between gap-2 rounded-lg border border-white/[0.06] bg-[#0D1015] px-3 py-2">
           <label htmlFor="ticket-order-type" className="text-xs text-slate-400">
@@ -256,6 +456,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
                 const nextSide =
                   next === 'OCO SELL' ? 'Long' : next === 'OCO BUY' ? 'Short' : side;
                 setSide(nextSide);
+                setIsCustomLimitPrice(false);
                 if (next === 'LIMIT' || next === 'LIMIT MAKER') {
                   const defaultPx = nextSide === 'Long' ? bid : ask;
                   setLimitPriceInput(defaultPx.toFixed(priceDecimals));
@@ -272,7 +473,15 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
             </select>
             <button
               type="button"
-              onClick={() => setSide((s) => (s === 'Long' ? 'Short' : 'Long'))}
+              onClick={() => {
+                const nextSide = side === 'Long' ? 'Short' : 'Long';
+                setSide(nextSide);
+                setIsCustomLimitPrice(false);
+                if (isLimitOrderType) {
+                  const defaultPx = nextSide === 'Long' ? bid : ask;
+                  setLimitPriceInput(defaultPx.toFixed(priceDecimals));
+                }
+              }}
               className={`rounded px-2 py-0.5 font-mono text-[10px] font-bold transition ${
                 side === 'Long'
                   ? 'bg-emerald-500/20 text-emerald-300'
@@ -294,21 +503,30 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
               <div className="flex items-center gap-1 font-mono text-[10px]">
                 <button
                   type="button"
-                  onClick={() => setLimitPriceInput(bid.toFixed(priceDecimals))}
+                  onClick={() => {
+                    setIsCustomLimitPrice(true);
+                    setLimitPriceInput(bid.toFixed(priceDecimals));
+                  }}
                   className="rounded border border-white/[0.08] px-1.5 py-0.5 text-emerald-300 hover:border-emerald-400/50"
                 >
                   Bid
                 </button>
                 <button
                   type="button"
-                  onClick={() => setLimitPriceInput(last.toFixed(priceDecimals))}
+                  onClick={() => {
+                    setIsCustomLimitPrice(true);
+                    setLimitPriceInput(last.toFixed(priceDecimals));
+                  }}
                   className="rounded border border-white/[0.08] px-1.5 py-0.5 text-slate-300 hover:border-white/30"
                 >
                   Last
                 </button>
                 <button
                   type="button"
-                  onClick={() => setLimitPriceInput(ask.toFixed(priceDecimals))}
+                  onClick={() => {
+                    setIsCustomLimitPrice(true);
+                    setLimitPriceInput(ask.toFixed(priceDecimals));
+                  }}
                   className="rounded border border-white/[0.08] px-1.5 py-0.5 text-sky-300 hover:border-sky-400/50"
                 >
                   Ask
@@ -321,8 +539,11 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
                 type="number"
                 step={last >= 100 ? '0.01' : '0.0001'}
                 min="0"
-                value={limitPriceInput}
-                onChange={(e) => setLimitPriceInput(e.target.value)}
+                value={displayedLimitPrice}
+                onChange={(e) => {
+                  setIsCustomLimitPrice(true);
+                  setLimitPriceInput(e.target.value);
+                }}
                 className="w-full rounded border border-white/[0.08] bg-[#141820] px-2.5 py-1.5 font-mono text-xs font-semibold tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
               />
               {orderType === 'LIMIT' ? (
@@ -370,11 +591,53 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
           </div>
         </div>
 
+        {/* Quantitative Position Sizing Mode Selector (§5 Briefing) */}
+        <div className="space-y-1.5 rounded-lg border border-white/[0.06] bg-[#0D1015] p-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor="ticket-sizing-mode" className="text-[11px] font-medium text-slate-400">
+              Position Sizing Model
+            </label>
+            <select
+              id="ticket-sizing-mode"
+              value={sizingMode}
+              onChange={(e) => setSizingMode(e.target.value as PositionSizingMode)}
+              className="bg-transparent font-mono text-[11px] font-semibold text-[#7DF2AD] focus:outline-none"
+            >
+              <option value="fixed_usdt" className="bg-[#141820]">Manual USDT / %</option>
+              <option value="fixed_risk_pct" className="bg-[#141820]">
+                Fixed Risk ({config.trading.baseRiskPerTradePct}% Equity)
+              </option>
+              <option value="quarter_kelly" className="bg-[#141820]">
+                Quarter-Kelly (0.25f* · {kellyStats.quarterKellyPct.toFixed(1)}%)
+              </option>
+              <option value="half_kelly" className="bg-[#141820]">
+                Half-Kelly (0.50f* · {kellyStats.halfKellyPct.toFixed(1)}%)
+              </option>
+              <option value="full_kelly" className="bg-[#141820]">
+                Full Kelly (1.00f* · {kellyStats.fullKellyPct.toFixed(1)}%)
+              </option>
+            </select>
+          </div>
+          {sizingMode !== 'fixed_usdt' && (
+            <div className="flex items-center justify-between border-t border-white/[0.05] pt-1.5 font-mono text-[10px] text-slate-400">
+              <span>
+                Dollar Risk: <strong className="text-amber-300">${quantPositionSize.dollarRiskUsdt.toFixed(2)}</strong> ({quantPositionSize.riskFractionPct.toFixed(2)}%)
+              </span>
+              <span>
+                SL Dist: <strong className="text-slate-200">{quantPositionSize.stopDistancePct.toFixed(2)}%</strong>
+              </span>
+            </div>
+          )}
+        </div>
+
         {/* Amount Input + Mint % Toggle */}
         <div className="flex items-stretch overflow-hidden rounded-lg border border-white/[0.06] bg-[#0D1015]">
           <button
             type="button"
-            onClick={() => setAmountUnit((u) => (u === 'USDT' ? '%' : 'USDT'))}
+            onClick={() => {
+              setSizingMode('fixed_usdt');
+              setAmountUnit((u) => (u === 'USDT' ? '%' : 'USDT'));
+            }}
             className="flex items-center border-r border-white/[0.06] px-3 text-xs font-medium text-slate-300 transition hover:text-white"
           >
             <span>{amountUnit === 'USDT' ? 'USDT' : `${coinCode} %`}</span>
@@ -388,9 +651,10 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
             type="number"
             min="10"
             step="10"
-            value={amountUnit === 'USDT' ? usdtAmount : allocPct}
+            value={sizingMode === 'fixed_usdt' ? (amountUnit === 'USDT' ? usdtAmount : allocPct) : effectiveUsdt}
             onChange={(e) => {
               const v = Math.max(0, Number(e.target.value) || 0);
+              setSizingMode('fixed_usdt');
               if (amountUnit === 'USDT') setUsdtAmount(v);
               else setAllocPct(Math.min(100, v));
             }}
@@ -398,11 +662,14 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
           />
           <button
             type="button"
-            onClick={() => setAmountUnit((u) => (u === 'USDT' ? '%' : 'USDT'))}
+            onClick={() => {
+              setSizingMode('fixed_usdt');
+              setAmountUnit((u) => (u === 'USDT' ? '%' : 'USDT'));
+            }}
             aria-label="Toggle allocation unit"
             className="bg-[#7DF2AD] px-3 font-mono text-xs font-bold text-[#0B0F17] transition hover:bg-[#9AF7BF]"
           >
-            {amountUnit === '%' ? '%' : 'USDT'}
+            {sizingMode === 'fixed_usdt' && amountUnit === '%' ? '%' : 'USDT'}
           </button>
         </div>
 
@@ -617,7 +884,16 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
             Avbl <strong className="text-slate-100">${snapshot.availableBalanceUsdt.toFixed(2)}</strong>
           </span>
           <span>
-            Cost <strong className="text-slate-100">${effectiveUsdt.toFixed(2)}</strong>
+            {activeVenue === 'Futures' ? (
+              <>
+                Margin <strong className="text-amber-300">${requiredMargin.toFixed(2)}</strong>{' '}
+                <span className="text-slate-500">(${effectiveUsdt.toFixed(0)} @ {leverage}x)</span>
+              </>
+            ) : (
+              <>
+                Cost <strong className="text-slate-100">${effectiveUsdt.toFixed(2)}</strong>
+              </>
+            )}
           </span>
         </div>
 
@@ -685,7 +961,9 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
             </div>
             <div className="flex justify-between">
               <span className="text-slate-400">Break-Even Trigger</span>
-              <span className="font-mono text-emerald-300">+{config.exits.breakEvenTriggerR}R</span>
+              <span className="font-mono text-emerald-300">
+                +{config.exits.breakEvenTriggerR}R (+{config.exits.breakEvenFeeBufferBps} bps fee buffer)
+              </span>
             </div>
             <div className="flex justify-between">
               <span className="text-slate-400">Max Pair Drawdown</span>
@@ -693,6 +971,89 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
             </div>
           </div>
         )}
+
+        {/* Pre-Trade Mandatory Checklist & 9-Step Signal Validation Protocol (§3 & Operational Takeaway) */}
+        <div className="rounded-lg border border-white/[0.08] bg-[#0D1015] p-2.5 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <ShieldCheck
+                className={`h-3.5 w-3.5 ${
+                  preTradeValidation.allMandatoryPassed ? 'text-[#7DF2AD]' : 'text-amber-400'
+                }`}
+                aria-hidden="true"
+              />
+              <span className="text-[11px] font-semibold text-slate-200">
+                Pre-Trade Checklist ({preTradeValidation.passedCount}/9 Steps)
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowNineStepChecklist((v) => !v)}
+              className="font-mono text-[10px] font-medium text-[#7DF2AD] hover:underline"
+            >
+              {showNineStepChecklist ? 'Hide 9-Step Audit' : '9-Step Audit'}
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-1.5 font-mono text-[10px] tabular-nums">
+            <div className="rounded border border-white/[0.05] bg-[#141820] px-2 py-1">
+              <div className="text-slate-500">1. Invalidation Price</div>
+              <div className="font-semibold text-rose-300">
+                ${computedStopLossPrice.toFixed(priceDecimals)}
+              </div>
+            </div>
+            <div className="rounded border border-white/[0.05] bg-[#141820] px-2 py-1">
+              <div className="text-slate-500">2. Calc Position Size</div>
+              <div className="font-semibold text-emerald-300">
+                ${effectiveUsdt.toFixed(2)} ({preTradeValidation.rewardToRiskRatio.toFixed(2)}R)
+              </div>
+            </div>
+          </div>
+
+          {showNineStepChecklist && (
+            <div className="space-y-1.5 border-t border-white/[0.06] pt-2 text-[10px]">
+              <div className="rounded bg-[#141820] p-2 font-mono text-[10px] text-slate-300 space-y-0.5">
+                <div className="text-[9px] font-semibold uppercase tracking-wider text-[#7DF2AD]">
+                  Trade Plan Hierarchy
+                </div>
+                <div className="truncate text-slate-400">
+                  <strong className="text-slate-200">Signal:</strong> {preTradeValidation.hierarchy.signalLayer}
+                </div>
+                <div className="truncate text-slate-400">
+                  <strong className="text-slate-200">Rec:</strong> {preTradeValidation.hierarchy.recommendationLayer}
+                </div>
+                <div className="truncate text-slate-300">
+                  <strong className="text-[#7DF2AD]">Plan:</strong> {preTradeValidation.hierarchy.tradePlanLayer}
+                </div>
+              </div>
+
+              <div className="max-h-44 space-y-1 overflow-y-auto pr-1">
+                {preTradeValidation.steps.map((st) => (
+                  <div
+                    key={st.step}
+                    className="flex items-start justify-between gap-2 rounded bg-[#141820]/70 px-2 py-1"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-medium text-slate-200">
+                        {st.step}. {st.title}
+                      </div>
+                      <div className="truncate font-mono text-[9px] text-slate-400">{st.detail}</div>
+                    </div>
+                    {st.passed ? (
+                      <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                    ) : (
+                      <XCircle
+                        className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${
+                          st.mandatory ? 'text-rose-400' : 'text-amber-400'
+                        }`}
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
 
         {feedback && (
           <div
@@ -708,6 +1069,17 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
         )}
       </div>
 
+      {!manualAllowed && (
+        <div
+          role="status"
+          className="mt-3 rounded-lg border border-amber-500/30 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-200"
+        >
+          {!config.features.manualTrading
+            ? 'Manual Trading is currently toggled OFF in Bot -> Feature Toggles.'
+            : `${activeVenue} market venue is disabled in Feature Toggles.`}
+        </div>
+      )}
+
       {/* Save + Mint Submit Order CTA */}
       <div className="mt-4 grid grid-cols-12 gap-2">
         <button
@@ -721,13 +1093,16 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
         <button
           type="button"
           onClick={handleSubmit}
-          className={`col-span-8 rounded-lg py-2.5 text-xs font-bold transition ${
+          disabled={!manualAllowed}
+          className={`col-span-8 rounded-lg py-2.5 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-40 ${
             snapshot.accountMode === 'Live'
               ? 'bg-amber-400 text-[#0B0F17] hover:bg-amber-300'
               : 'bg-[#7DF2AD] text-[#0B0F17] hover:bg-[#9AF7BF]'
           }`}
         >
-          {snapshot.accountMode === 'Live' ? 'Submit Live Order' : 'Submit Paper Order'}
+          {snapshot.accountMode === 'Live'
+            ? `Submit Live ${activeVenue} Order`
+            : `Submit Paper ${activeVenue} Order`}
         </button>
       </div>
     </section>

@@ -1,6 +1,11 @@
-import React from 'react';
-import { RotateCcw, ShieldAlert, ShieldCheck } from 'lucide-react';
-import type { BotConfig, EngineSnapshot } from '../engine/types';
+import React, { useMemo } from 'react';
+import { AlertTriangle, RotateCcw, ShieldAlert, ShieldCheck, TrendingUp } from 'lucide-react';
+import {
+  computeExpectancyStats,
+  computeKellySizingAnalytics,
+  computePortfolioCorrelationMatrix,
+} from '../engine/quantAnalytics';
+import type { BotConfig, EngineSnapshot, PositionSizingMode } from '../engine/types';
 
 interface RiskCircuitBreakerViewProps {
   snapshot: EngineSnapshot;
@@ -31,12 +36,92 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
     });
   };
 
+  const updateSizingMode = (mode: PositionSizingMode) => {
+    onUpdateConfig({
+      ...config,
+      trading: { ...config.trading, positionSizingMode: mode },
+    });
+  };
+
   const ddUsedPct = Math.max(0, -risk.cumulativeDailyPnlPct);
   const ddRatio = Math.min(100, (ddUsedPct / Math.max(config.risk.maxDailyDrawdownPct, 0.1)) * 100);
   const profitRatio = Math.min(
     100,
     (Math.max(0, risk.cumulativeDailyPnlPct) / Math.max(config.risk.maxDailyProfitPct, 0.1)) * 100
   );
+
+  const expectancy = useMemo(
+    () => computeExpectancyStats(snapshot.recentTrades, config.trading.baseRiskPerTradePct),
+    [snapshot.recentTrades, config.trading.baseRiskPerTradePct]
+  );
+
+  const primaryPair = snapshot.pairs[0];
+  const primaryStopFrac = useMemo(() => {
+    if (!primaryPair || primaryPair.lastPrice <= 0) return 0.015;
+    const atr = primaryPair.indicators.atr ?? primaryPair.lastPrice * 0.01;
+    return Math.max(0.002, (atr * config.exits.atrSlMultiplier) / primaryPair.lastPrice);
+  }, [primaryPair, config.exits.atrSlMultiplier]);
+
+  const kelly = useMemo(
+    () =>
+      computeKellySizingAnalytics(
+        expectancy,
+        risk.currentEquity,
+        primaryStopFrac,
+        config.trading.baseRiskPerTradePct
+      ),
+    [expectancy, risk.currentEquity, primaryStopFrac, config.trading.baseRiskPerTradePct]
+  );
+
+  const portfolioCorr = useMemo(
+    () => computePortfolioCorrelationMatrix(snapshot.pairs, kelly.halfKellyPct),
+    [snapshot.pairs, kelly.halfKellyPct]
+  );
+
+  const growthSvg = useMemo(() => {
+    const pts = kelly.growthCurve;
+    const w = 440;
+    const h = 130;
+    const maxF = Math.max(...pts.map((p) => p.fractionPct), 10);
+    const minG = Math.min(...pts.map((p) => p.logGrowthBps), -20);
+    const maxG = Math.max(...pts.map((p) => p.logGrowthBps), 40);
+    const spanG = Math.max(maxG - minG, 10);
+
+    const toCoord = (fPct: number, gBps: number) => {
+      const x = 28 + (fPct / maxF) * (w - 48);
+      const y = h - 22 - ((gBps - minG) / spanG) * (h - 38);
+      return { x, y };
+    };
+
+    const zeroY = toCoord(0, 0).y;
+    const pathD = pts
+      .map((pt, idx) => {
+        const c = toCoord(pt.fractionPct, pt.logGrowthBps);
+        return `${idx === 0 ? 'M' : 'L'}${c.x.toFixed(1)},${c.y.toFixed(1)}`;
+      })
+      .join(' ');
+
+    const fullPt = toCoord(
+      kelly.fullKellyPct,
+      kelly.tiers.find((t) => t.id === 'full_kelly')
+        ? kelly.tiers.find((t) => t.id === 'full_kelly')!.logGrowthRateG * 10_000
+        : 0
+    );
+    const halfPt = toCoord(
+      kelly.halfKellyPct,
+      kelly.tiers.find((t) => t.id === 'half_kelly')
+        ? kelly.tiers.find((t) => t.id === 'half_kelly')!.logGrowthRateG * 10_000
+        : 0
+    );
+    const quarterPt = toCoord(
+      kelly.quarterKellyPct,
+      kelly.tiers.find((t) => t.id === 'quarter_kelly')
+        ? kelly.tiers.find((t) => t.id === 'quarter_kelly')!.logGrowthRateG * 10_000
+        : 0
+    );
+
+    return { w, h, zeroY, pathD, fullPt, halfPt, quarterPt };
+  }, [kelly]);
 
   return (
     <div className="space-y-6">
@@ -300,6 +385,309 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
                   </tr>
                 );
               })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* §5 & §6 Executive Briefing: Kelly Criterion, G(f) Growth Curve & Expectancy (R) */}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
+        {/* Strategy Expectancy (R) & Profit Factor Card (§6) */}
+        <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4 lg:col-span-5">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-100">
+                Strategy Expectancy (R) &amp; Profit Factor
+              </h3>
+              <p className="text-xs text-slate-400">
+                E(R) = (p × Avg Win) − (q × Avg Loss) · Viable PF target 1.3–2.0
+              </p>
+            </div>
+            <span
+              className={`rounded px-2 py-0.5 font-mono text-[11px] font-semibold ${
+                expectancy.expectancyR > 0
+                  ? 'bg-emerald-500/15 text-[#7DF2AD]'
+                  : 'bg-rose-500/20 text-rose-300'
+              }`}
+            >
+              {expectancy.expectancyR >= 0 ? '+' : ''}
+              {expectancy.expectancyR.toFixed(2)}R / Trade
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 font-mono text-xs tabular-nums">
+            <div className="rounded-md border border-white/[0.06] bg-[#0D1015] p-3">
+              <div className="font-sans text-[11px] text-slate-400">Win Rate (p) / Loss (q)</div>
+              <div className="mt-1 text-base font-bold text-slate-100">
+                {(expectancy.winRateP * 100).toFixed(1)}% / {(expectancy.lossRateQ * 100).toFixed(1)}%
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">
+                {expectancy.sampleCount} closed trades ({expectancy.isStatisticallySignificant ? '≥50 valid' : '<50 warmup'})
+              </div>
+            </div>
+
+            <div className="rounded-md border border-white/[0.06] bg-[#0D1015] p-3">
+              <div className="font-sans text-[11px] text-slate-400">Profit Factor (GP / GL)</div>
+              <div
+                className={`mt-1 text-base font-bold ${
+                  expectancy.profitFactor >= 1.3 ? 'text-emerald-400' : 'text-amber-300'
+                }`}
+              >
+                {expectancy.profitFactor.toFixed(2)}
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-400">
+                Regime: {expectancy.profitFactorRegime}
+              </div>
+            </div>
+
+            <div className="rounded-md border border-white/[0.06] bg-[#0D1015] p-3">
+              <div className="font-sans text-[11px] text-slate-400">Payoff Ratio (b)</div>
+              <div className="mt-1 text-base font-bold text-sky-300">
+                {expectancy.payoffRatioB.toFixed(2)} : 1
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">
+                +{expectancy.avgWinR.toFixed(2)}R vs -{expectancy.avgLossR.toFixed(2)}R
+              </div>
+            </div>
+
+            <div className="rounded-md border border-white/[0.06] bg-[#0D1015] p-3">
+              <div className="font-sans text-[11px] text-slate-400">500-Trade Max Loss Run</div>
+              <div className="mt-1 text-base font-bold text-amber-300">
+                {expectancy.expectedMaxLossStreak500} Losses
+              </div>
+              <div className="mt-0.5 text-[10px] text-slate-500">
+                12L DD @ {config.trading.baseRiskPerTradePct}%: -{expectancy.streak12DrawdownAtCurrentRiskPct.toFixed(1)}%
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-white/[0.06] bg-[#0D1015] p-3 text-xs text-slate-300 space-y-1">
+            <div className="font-semibold text-slate-200">
+              12-Consecutive-Loss Tail Stress Comparison (§6)
+            </div>
+            <div className="flex justify-between font-mono text-[11px]">
+              <span className="text-slate-400">1.0% Quarter-Kelly Limit:</span>
+              <span className="text-emerald-400">-{expectancy.streak12DrawdownAt1PctRisk.toFixed(1)}% Peak-to-Trough</span>
+            </div>
+            <div className="flex justify-between font-mono text-[11px]">
+              <span className="text-slate-400">Current ({config.trading.baseRiskPerTradePct}% Equity Risk):</span>
+              <span className="text-sky-300">-{expectancy.streak12DrawdownAtCurrentRiskPct.toFixed(1)}% Peak-to-Trough</span>
+            </div>
+            <div className="flex justify-between font-mono text-[11px]">
+              <span className="text-slate-400">5.0% Over-Allocated Risk:</span>
+              <span className="text-rose-400">-{expectancy.streak12DrawdownAt5PctRisk.toFixed(1)}% Account Decline</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Expected Logarithmic Growth Curve G(f) & Fractional Kelly Selector (§5) */}
+        <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4 lg:col-span-7">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-semibold text-slate-100">
+                Kelly Criterion &amp; Expected Logarithmic Utility G(f)
+              </h3>
+              <p className="text-xs text-slate-400">
+                f* = (b·p − q) / b = <strong className="font-mono text-[#7DF2AD]">{kelly.fullKellyPct.toFixed(2)}%</strong> · Half-Kelly (0.5f* = <strong className="font-mono text-sky-300">{kelly.halfKellyPct.toFixed(2)}%</strong>) captures ~75% growth with 50% less drawdown
+              </p>
+            </div>
+            <div className="flex items-center gap-1 rounded-lg border border-white/[0.08] bg-[#0D1015] p-1">
+              {(
+                [
+                  { id: 'fixed_usdt', label: 'Fixed $' },
+                  { id: 'fixed_risk_pct', label: 'Fixed %' },
+                  { id: 'quarter_kelly', label: '1/4 Kelly' },
+                  { id: 'half_kelly', label: '1/2 Kelly' },
+                  { id: 'full_kelly', label: 'Full Kelly' },
+                ] as Array<{ id: PositionSizingMode; label: string }>
+              ).map((m) => {
+                const active = (config.trading.positionSizingMode ?? 'fixed_usdt') === m.id;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => updateSizingMode(m.id)}
+                    className={`rounded px-2 py-1 font-mono text-[10px] font-semibold transition ${
+                      active
+                        ? 'bg-[#7DF2AD] text-[#0B0F17]'
+                        : 'text-slate-400 hover:text-slate-100'
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {kelly.negativeExpectancyWarning && (
+            <div className="flex items-center gap-2 rounded-md border border-rose-500/40 bg-rose-950/35 px-3 py-2 text-xs text-rose-200">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-rose-400" />
+              <span>
+                Negative Kelly Warning (f* ≤ 0, EV &lt; 0): Automated Kelly entries are systematically blocked until expectancy recovers.
+              </span>
+            </div>
+          )}
+
+          {/* SVG Expected Logarithmic Growth Curve G(f) */}
+          <div className="rounded-lg border border-white/[0.06] bg-[#0D1015] p-3">
+            <svg
+              viewBox={`0 0 ${growthSvg.w} ${growthSvg.h}`}
+              className="h-32 w-full overflow-visible"
+              aria-label="Expected logarithmic growth curve G(f)"
+            >
+              <line
+                x1="28"
+                y1={growthSvg.zeroY}
+                x2={growthSvg.w - 20}
+                y2={growthSvg.zeroY}
+                stroke="#334155"
+                strokeDasharray="3 3"
+                strokeWidth="1"
+              />
+              <path d={growthSvg.pathD} fill="none" stroke="#7DF2AD" strokeWidth="2.2" />
+              {/* Quarter-Kelly Marker */}
+              <circle cx={growthSvg.quarterPt.x} cy={growthSvg.quarterPt.y} r="4" fill="#38BDF8" />
+              <text
+                x={growthSvg.quarterPt.x}
+                y={Math.max(12, growthSvg.quarterPt.y - 8)}
+                textAnchor="middle"
+                className="fill-sky-300 font-mono text-[9px]"
+              >
+                0.25f*
+              </text>
+              {/* Half-Kelly Marker */}
+              <circle cx={growthSvg.halfPt.x} cy={growthSvg.halfPt.y} r="4.5" fill="#7DF2AD" />
+              <text
+                x={growthSvg.halfPt.x}
+                y={Math.max(12, growthSvg.halfPt.y - 8)}
+                textAnchor="middle"
+                className="fill-[#7DF2AD] font-mono text-[9px] font-bold"
+              >
+                0.50f* (Half)
+              </text>
+              {/* Full Kelly Peak Marker */}
+              <circle cx={growthSvg.fullPt.x} cy={growthSvg.fullPt.y} r="4.5" fill="#FBBF24" />
+              <text
+                x={growthSvg.fullPt.x}
+                y={Math.max(12, growthSvg.fullPt.y - 8)}
+                textAnchor="middle"
+                className="fill-amber-300 font-mono text-[9px] font-bold"
+              >
+                f* (Peak)
+              </text>
+            </svg>
+          </div>
+
+          {/* Comparative Sizing Strategy Matrix (§5 Table) */}
+          <div className="overflow-x-auto rounded-lg border border-white/[0.06] bg-[#0D1015]">
+            <table className="w-full text-left text-[11px]">
+              <thead>
+                <tr className="border-b border-slate-800 text-slate-400">
+                  <th className="px-3 py-2 font-medium">Sizing Tier</th>
+                  <th className="px-3 py-2 text-right font-medium">Equity Risk %</th>
+                  <th className="px-3 py-2 text-right font-medium">Dollar Risk</th>
+                  <th className="px-3 py-2 text-right font-medium">Stop-Dist Notional</th>
+                  <th className="px-3 py-2 text-right font-medium">100-Trade Ending Eq</th>
+                  <th className="px-3 py-2 text-right font-medium">Est. Max DD</th>
+                  <th className="px-3 py-2 text-right font-medium">Ruin Prob</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-white/[0.05] font-mono tabular-nums">
+                {kelly.tiers.map((tier) => {
+                  const isCurrent = (config.trading.positionSizingMode ?? 'fixed_usdt') === tier.id;
+                  return (
+                    <tr
+                      key={tier.id}
+                      className={isCurrent ? 'bg-[#7DF2AD]/10' : 'hover:bg-white/[0.02]'}
+                    >
+                      <td className="px-3 py-2 font-sans font-semibold text-slate-100">
+                        {tier.label}
+                      </td>
+                      <td className="px-3 py-2 text-right text-[#7DF2AD]">
+                        {tier.riskFractionPct.toFixed(2)}%
+                      </td>
+                      <td className="px-3 py-2 text-right text-slate-200">
+                        ${tier.capitalRiskPerTradeUsdt.toFixed(2)}
+                      </td>
+                      <td className="px-3 py-2 text-right text-sky-300">
+                        ${tier.notionalPositionUsdt.toFixed(0)} ({tier.requiredLeverage.toFixed(1)}×)
+                      </td>
+                      <td className="px-3 py-2 text-right text-emerald-400">
+                        ${tier.projectedEndingEquity100TradesUsdt.toFixed(0)}
+                      </td>
+                      <td className="px-3 py-2 text-right text-amber-300">
+                        ~{tier.estimatedMaxDrawdownPct.toFixed(1)}%
+                      </td>
+                      <td className="px-3 py-2 text-right text-rose-300">
+                        {tier.probabilityOfRuinPct.toFixed(2)}%
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {/* §5 Portfolio Covariance Kelly Matrix for Correlated Crypto Assets (f* = C^-1 * mu) */}
+      <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <TrendingUp className="h-4 w-4 text-[#7DF2AD]" aria-hidden="true" />
+            <h3 className="text-sm font-semibold text-slate-100">
+              Multi-Asset Portfolio Covariance Kelly Matrix (f* = C⁻¹ · μ)
+            </h3>
+          </div>
+          <div className="font-mono text-xs text-slate-400">
+            Avg Pairwise ρ:{' '}
+            <strong className="text-amber-300">{portfolioCorr.avgPairwiseCorrelation.toFixed(2)}</strong> ·
+            C⁻¹ Diversification Scale:{' '}
+            <strong className="text-[#7DF2AD]">
+              {(portfolioCorr.diversificationMultiplier * 100).toFixed(1)}%
+            </strong>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left font-mono text-xs tabular-nums">
+            <thead>
+              <tr className="border-b border-slate-800 text-slate-400">
+                <th className="px-3 py-2 font-sans font-medium">Asset</th>
+                {portfolioCorr.symbols.map((sym) => (
+                  <th key={sym} className="px-3 py-2 text-right font-medium">
+                    {sym.replace('USDT', '')}
+                  </th>
+                ))}
+                <th className="px-3 py-2 text-right font-sans font-medium text-[#7DF2AD]">
+                  Corr-Adjusted Half-Kelly
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-white/[0.05]">
+              {portfolioCorr.symbols.map((rowSym, rIdx) => (
+                <tr key={rowSym} className="hover:bg-white/[0.02]">
+                  <td className="px-3 py-2 font-sans font-semibold text-slate-100">{rowSym}</td>
+                  {portfolioCorr.matrix[rIdx].map((val, cIdx) => (
+                    <td
+                      key={`${rowSym}-${cIdx}`}
+                      className={`px-3 py-2 text-right ${
+                        rIdx === cIdx
+                          ? 'text-slate-500'
+                          : val >= 0.7
+                            ? 'text-amber-300'
+                            : 'text-slate-300'
+                      }`}
+                    >
+                      {val.toFixed(2)}
+                    </td>
+                  ))}
+                  <td className="px-3 py-2 text-right font-semibold text-[#7DF2AD]">
+                    {(portfolioCorr.adjustedHalfKellyBySymbol[rowSym] ?? 0).toFixed(2)}% Equity
+                  </td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>

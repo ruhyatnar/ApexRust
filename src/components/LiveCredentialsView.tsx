@@ -11,13 +11,22 @@ import {
   Trash2,
   Zap,
 } from 'lucide-react';
-import type { BinanceAuthMethod, ExecutionAccountMode, LiveCredentialStatus } from '../engine/types';
+import type {
+  BinanceAuthMethod,
+  ExchangeVenue,
+  ExecutionAccountMode,
+  LiveCredentialStatus,
+  MarginType,
+} from '../engine/types';
 
 interface LiveCredentialsViewProps {
   liveStatus: LiveCredentialStatus;
   accountMode: ExecutionAccountMode;
   onSaveCredentials: (payload: {
     environment: 'Testnet' | 'Production';
+    venue: ExchangeVenue;
+    leverage: number;
+    marginType: MarginType;
     authMethod: BinanceAuthMethod;
     apiKey: string;
     apiSecret: string;
@@ -43,6 +52,9 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
   onSwitchAccountMode,
 }) => {
   const [environment, setEnvironment] = useState<'Testnet' | 'Production'>(liveStatus.environment);
+  const [venue, setVenue] = useState<ExchangeVenue>(liveStatus.venue ?? 'Spot');
+  const [leverage, setLeverage] = useState<number>(liveStatus.leverage ?? 3);
+  const [marginType, setMarginType] = useState<MarginType>(liveStatus.marginType ?? 'ISOLATED');
   const [authMethod, setAuthMethod] = useState<BinanceAuthMethod>(liveStatus.authMethod);
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
@@ -60,6 +72,9 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
     setFeedback(null);
     const res = await onSaveCredentials({
       environment,
+      venue,
+      leverage,
+      marginType,
       authMethod,
       apiKey,
       apiSecret,
@@ -121,7 +136,7 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
             Live Trading Credentials & Execution Isolation
           </h2>
           <p className="mt-0.5 text-sm text-slate-400">
-            Configure Binance Spot API credentials on the server-side signing proxy. Paper and Live runtimes remain strictly isolated.
+            Configure Binance Spot or USD-M Futures API credentials on the server-side signing proxy. Paper and Live runtimes remain strictly isolated.
           </p>
         </div>
 
@@ -188,7 +203,7 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
             <div className="flex items-center gap-2">
               <KeyRound className="h-4 w-4 text-[#7DF2AD]" aria-hidden="true" />
               <h3 className="text-sm font-semibold text-slate-100">
-                Binance Spot Credential Vault
+                Binance {venue} Credential Vault
               </h3>
             </div>
             {liveStatus.apiKeyMasked && (
@@ -198,10 +213,25 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
             )}
           </div>
 
-          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-3">
+            <div>
+              <label htmlFor="live-venue-select" className="block text-xs font-medium text-slate-400">
+                Exchange Market Venue
+              </label>
+              <select
+                id="live-venue-select"
+                value={venue}
+                onChange={(e) => setVenue(e.target.value as ExchangeVenue)}
+                className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              >
+                <option value="Spot">Binance Spot (/api/v3)</option>
+                <option value="Futures">USD-M Futures (/fapi/v1)</option>
+              </select>
+            </div>
+
             <div>
               <label htmlFor="live-env-select" className="block text-xs font-medium text-slate-400">
-                Target Exchange Environment
+                Target Environment
               </label>
               <select
                 id="live-env-select"
@@ -209,14 +239,22 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
                 onChange={(e) => setEnvironment(e.target.value as 'Testnet' | 'Production')}
                 className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
               >
-                <option value="Testnet">Binance Spot Testnet (testnet.binance.vision)</option>
-                <option value="Production">Binance Spot Production (api.binance.com)</option>
+                <option value="Testnet">
+                  {venue === 'Futures'
+                    ? 'Futures Testnet (testnet.binancefuture.com)'
+                    : 'Spot Testnet (testnet.binance.vision)'}
+                </option>
+                <option value="Production">
+                  {venue === 'Futures'
+                    ? 'Futures Production (fapi.binance.com)'
+                    : 'Spot Production (api.binance.com)'}
+                </option>
               </select>
             </div>
 
             <div>
               <label htmlFor="live-auth-method" className="block text-xs font-medium text-slate-400">
-                Request Signing Algorithm
+                Request Signing
               </label>
               <select
                 id="live-auth-method"
@@ -224,11 +262,45 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
                 onChange={(e) => setAuthMethod(e.target.value as BinanceAuthMethod)}
                 className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
               >
-                <option value="HMAC-SHA256">HMAC-SHA256 (API Key + Secret)</option>
-                <option value="Ed25519">Ed25519 (API Key + PEM Private Key)</option>
+                <option value="HMAC-SHA256">HMAC-SHA256</option>
+                <option value="Ed25519">Ed25519 PEM</option>
               </select>
             </div>
           </div>
+
+          {venue === 'Futures' && (
+            <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2">
+              <div>
+                <label htmlFor="live-leverage-select" className="block text-xs font-medium text-slate-400">
+                  Futures Default Leverage
+                </label>
+                <select
+                  id="live-leverage-select"
+                  value={leverage}
+                  onChange={(e) => setLeverage(Number(e.target.value))}
+                  className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-amber-300 focus:border-[#7DF2AD] focus:outline-none"
+                >
+                  {[1, 2, 3, 5, 10, 15, 20].map((lv) => (
+                    <option key={lv} value={lv}>{lv}x</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="live-margin-select" className="block text-xs font-medium text-slate-400">
+                  Futures Margin Mode
+                </label>
+                <select
+                  id="live-margin-select"
+                  value={marginType}
+                  onChange={(e) => setMarginType(e.target.value as MarginType)}
+                  className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                >
+                  <option value="ISOLATED">ISOLATED</option>
+                  <option value="CROSSED">CROSSED</option>
+                </select>
+              </div>
+            </div>
+          )}
 
           <div>
             <label htmlFor="live-api-key" className="block text-xs font-medium text-slate-400">
@@ -329,7 +401,9 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
           </div>
 
           <label className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-3 py-2.5 text-xs text-slate-300">
-            <span>Require signed /api/v3/order/test preflight before live fills</span>
+            <span>
+              Require signed {venue === 'Futures' ? '/fapi/v1/order/test' : '/api/v3/order/test'} preflight before live fills
+            </span>
             <input
               type="checkbox"
               checked={requirePreflight}
@@ -435,7 +509,9 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
                 </span>
               </div>
               <div className="flex justify-between">
-                <span className="text-slate-400">Spot Trade Permission</span>
+                <span className="text-slate-400">
+                  {liveStatus.venue === 'Futures' ? 'Futures Trade Permission' : 'Spot Trade Permission'}
+                </span>
                 <span className="font-mono text-slate-100">
                   {liveStatus.canTrade ? 'Enabled' : 'Unverified'}
                 </span>
@@ -463,7 +539,7 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
                   className="mt-0.5 h-3.5 w-3.5"
                 />
                 <span>
-                  I acknowledge Production mode dispatches real spot orders using real account funds up to ${liveStatus.maxOrderNotionalUsdt.toFixed(2)} per order.
+                  I acknowledge Production mode dispatches real {liveStatus.venue} orders using real account funds up to ${liveStatus.maxOrderNotionalUsdt.toFixed(2)} per order.
                 </span>
               </label>
             )}
@@ -484,13 +560,15 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
 
           <div className="rounded-xl border border-white/[0.06] bg-[#141820] p-5 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-slate-100">Synced Spot Account Balances</h3>
+              <h3 className="text-sm font-semibold text-slate-100">
+                Synced {liveStatus.venue} Account Balances
+              </h3>
               <span className="font-mono text-[11px] text-slate-400">{liveStatus.environment}</span>
             </div>
 
             {liveStatus.syncedBalances.length === 0 ? (
               <div className="rounded-lg border border-white/[0.06] bg-[#0D1015] px-4 py-5 text-center text-xs text-slate-400">
-                Verify credentials to pull live Spot wallet balances into the isolated Live runtime.
+                Verify credentials to pull live {liveStatus.venue} wallet balances into the isolated Live runtime.
               </div>
             ) : (
               <div className="overflow-x-auto">

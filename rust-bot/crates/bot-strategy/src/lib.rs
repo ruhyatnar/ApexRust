@@ -2,12 +2,13 @@
 //! position exit lifecycle (Initial SL, TP1 partial, Break-Even, ATR Trailing Stop).
 
 use bot_core::{
-    Candle, EntrySignal, ExitConfig, ExitPlan, ExitReason, IndicatorConfig, IndicatorSnapshot,
-    Position, Side, StrategyMode, TradingConfig,
+    Candle, DirectionPolicy, EntrySignal, ExitConfig, ExitPlan, ExitReason, FeatureToggles,
+    IndicatorConfig, IndicatorSnapshot, Position, Side, StrategyMode, StrategyProfile,
+    TradingConfig,
 };
 use chrono::{DateTime, Utc};
 
-/// Evaluates whether a symbol exhibits a valid trend-following pullback entry.
+/// Evaluates whether a symbol exhibits a valid trend-following pullback entry using default toggles.
 pub fn evaluate_entry_signal(
     symbol: &str,
     candle: &Candle,
@@ -16,6 +17,36 @@ pub fn evaluate_entry_signal(
     ind_cfg: &IndicatorConfig,
     now: DateTime<Utc>,
 ) -> Option<EntrySignal> {
+    evaluate_entry_signal_with_options(
+        symbol,
+        candle,
+        ind,
+        trading_cfg,
+        ind_cfg,
+        StrategyProfile::TrendPullback,
+        DirectionPolicy::Both,
+        &FeatureToggles::default(),
+        now,
+    )
+}
+
+/// Evaluates entry signals honoring `StrategyProfile`, `DirectionPolicy`, and `FeatureToggles`.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_entry_signal_with_options(
+    symbol: &str,
+    candle: &Candle,
+    ind: &IndicatorSnapshot,
+    trading_cfg: &TradingConfig,
+    ind_cfg: &IndicatorConfig,
+    profile: StrategyProfile,
+    direction_policy: DirectionPolicy,
+    features: &FeatureToggles,
+    now: DateTime<Utc>,
+) -> Option<EntrySignal> {
+    if !features.signal_generator {
+        return None;
+    }
+
     let (Some(ema_fast), Some(ema_mid), Some(ema_slow), Some(adx), Some(pdi), Some(mdi), Some(rsi), Some(prev_rsi), Some(atr)) = (
         ind.ema_fast,
         ind.ema_mid,
@@ -30,35 +61,101 @@ pub fn evaluate_entry_signal(
         return None;
     };
 
+    if atr <= 0.0 {
+        return None;
+    }
+
+    let allow_short = matches!(direction_policy, DirectionPolicy::Both);
+
+    if matches!(profile, StrategyProfile::VwapReversion) {
+        let anchor = if features.vwap_bias_filter {
+            ind.vwap.unwrap_or(ema_mid)
+        } else {
+            ema_mid
+        };
+        if features.adx_strength_filter && adx > (ind_cfg.adx_min_trend + 12.0).max(38.0) {
+            return None;
+        }
+        let min_stretch = atr * 1.1;
+        if candle.close <= anchor - min_stretch
+            && (!features.rsi_momentum_filter || (rsi <= 38.0 && rsi > prev_rsi))
+        {
+            return Some(EntrySignal {
+                symbol: symbol.to_string(),
+                side: Side::Long,
+                entry_price: candle.close,
+                atr,
+                adx,
+                rsi,
+                rationale: format!("VWAP Reversion Long · RSI curl {prev_rsi:.1}->{rsi:.1}"),
+                timestamp: now,
+            });
+        }
+        if allow_short
+            && candle.close >= anchor + min_stretch
+            && (!features.rsi_momentum_filter || (rsi >= 62.0 && rsi < prev_rsi))
+        {
+            return Some(EntrySignal {
+                symbol: symbol.to_string(),
+                side: Side::Short,
+                entry_price: candle.close,
+                atr,
+                adx,
+                rsi,
+                rationale: format!("VWAP Reversion Short · RSI curl {prev_rsi:.1}->{rsi:.1}"),
+                timestamp: now,
+            });
+        }
+        return None;
+    }
+
     // 1. Trend strength anti-chop gate
-    if adx < ind_cfg.adx_min_trend || atr <= 0.0 {
+    if features.adx_strength_filter && adx < ind_cfg.adx_min_trend {
         return None;
     }
 
     // Optional macro EMA 200 filter for Intraday mode
-    let macro_long_ok = match (trading_cfg.mode, ind.ema_macro) {
-        (StrategyMode::Intraday, Some(ema200)) => candle.close > ema200,
-        _ => true,
+    let macro_long_ok = if !features.ema_trend_filter {
+        true
+    } else {
+        match (trading_cfg.mode, ind.ema_macro) {
+            (StrategyMode::Intraday, Some(ema200)) => candle.close > ema200,
+            _ => true,
+        }
     };
-    let macro_short_ok = match (trading_cfg.mode, ind.ema_macro) {
-        (StrategyMode::Intraday, Some(ema200)) => candle.close < ema200,
-        _ => true,
+    let macro_short_ok = if !features.ema_trend_filter {
+        true
+    } else {
+        match (trading_cfg.mode, ind.ema_macro) {
+            (StrategyMode::Intraday, Some(ema200)) => candle.close < ema200,
+            _ => true,
+        }
     };
 
-    let vwap_long_ok = !ind_cfg.require_vwap_alignment || ind.vwap.map_or(true, |v| candle.close >= v);
-    let vwap_short_ok = !ind_cfg.require_vwap_alignment || ind.vwap.map_or(true, |v| candle.close <= v);
+    let vwap_long_ok = !features.vwap_bias_filter
+        || !ind_cfg.require_vwap_alignment
+        || ind.vwap.map_or(true, |v| candle.close >= v);
+    let vwap_short_ok = !features.vwap_bias_filter
+        || !ind_cfg.require_vwap_alignment
+        || ind.vwap.map_or(true, |v| candle.close <= v);
 
-    // 2. LONG Trend-Following Pullback Setup
-    if candle.close > ema_mid
-        && ema_fast >= ema_mid
-        && ema_mid > ema_slow
-        && macro_long_ok
-        && pdi > mdi
-        && rsi >= ind_cfg.rsi_long_pullback_min
-        && rsi <= ind_cfg.rsi_long_pullback_max
-        && rsi > prev_rsi
-        && vwap_long_ok
-    {
+    let ema_long_ok = !features.ema_trend_filter
+        || (candle.close > ema_mid && ema_fast >= ema_mid && ema_mid > ema_slow);
+    let ema_short_ok = !features.ema_trend_filter
+        || (candle.close < ema_mid && ema_fast <= ema_mid && ema_mid < ema_slow);
+    let di_long_ok = !features.adx_strength_filter || pdi > mdi;
+    let di_short_ok = !features.adx_strength_filter || mdi > pdi;
+    let rsi_long_ok = !features.rsi_momentum_filter
+        || (rsi >= ind_cfg.rsi_long_pullback_min
+            && rsi <= ind_cfg.rsi_long_pullback_max
+            && rsi > prev_rsi);
+    let rsi_short_ok = !features.rsi_momentum_filter
+        || (rsi >= ind_cfg.rsi_short_pullback_min
+            && rsi <= ind_cfg.rsi_short_pullback_max
+            && rsi < prev_rsi);
+
+    // 2. LONG Trend-Following Setup
+    if ema_long_ok && macro_long_ok && di_long_ok && rsi_long_ok && vwap_long_ok {
         return Some(EntrySignal {
             symbol: symbol.to_string(),
             side: Side::Long,
@@ -67,24 +164,14 @@ pub fn evaluate_entry_signal(
             adx,
             rsi,
             rationale: format!(
-                "EMA stack bullish (9>{:.2}, 21>{:.2}, 50>{:.2}), ADX {:.1} (+DI>{:.1}), RSI curl {:.1}->{:.1}",
-                ema_fast, ema_mid, ema_slow, adx, pdi, prev_rsi, rsi
+                "{profile:?} Long (9>{ema_fast:.2}, 21>{ema_mid:.2}, 50>{ema_slow:.2}), ADX {adx:.1}, RSI {prev_rsi:.1}->{rsi:.1}"
             ),
             timestamp: now,
         });
     }
 
-    // 3. SHORT Trend-Following Pullback Setup
-    if candle.close < ema_mid
-        && ema_fast <= ema_mid
-        && ema_mid < ema_slow
-        && macro_short_ok
-        && mdi > pdi
-        && rsi >= ind_cfg.rsi_short_pullback_min
-        && rsi <= ind_cfg.rsi_short_pullback_max
-        && rsi < prev_rsi
-        && vwap_short_ok
-    {
+    // 3. SHORT Trend-Following Setup
+    if allow_short && ema_short_ok && macro_short_ok && di_short_ok && rsi_short_ok && vwap_short_ok {
         return Some(EntrySignal {
             symbol: symbol.to_string(),
             side: Side::Short,
@@ -93,8 +180,7 @@ pub fn evaluate_entry_signal(
             adx,
             rsi,
             rationale: format!(
-                "EMA stack bearish, ADX {:.1} (-DI>{:.1}), RSI curl {:.1}->{:.1}",
-                adx, mdi, prev_rsi, rsi
+                "{profile:?} Short, ADX {adx:.1}, RSI {prev_rsi:.1}->{rsi:.1}"
             ),
             timestamp: now,
         });

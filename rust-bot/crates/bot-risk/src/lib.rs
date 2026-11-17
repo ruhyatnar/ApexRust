@@ -228,3 +228,71 @@ impl RiskManager {
         }
     }
 }
+
+/// Calculates the optimal Full Kelly fraction `f* = (b * p - q) / b`.
+/// Returns a negative value when mathematical expectancy is negative (`EV < 0`),
+/// which acts as a mandatory systematic filter to block trade execution.
+pub fn compute_kelly_fraction(win_rate_p: f64, payoff_ratio_b: f64) -> f64 {
+    if payoff_ratio_b <= f64::EPSILON {
+        return -1.0;
+    }
+    let p = win_rate_p.clamp(0.0, 1.0);
+    let q = 1.0 - p;
+    (payoff_ratio_b * p - q) / payoff_ratio_b
+}
+
+/// Calculates expected logarithmic utility growth rate per trade:
+/// `G(f) = p * ln(1 + b * f) + q * ln(1 - f)`
+pub fn compute_log_growth_rate(win_rate_p: f64, payoff_ratio_b: f64, fraction_f: f64) -> f64 {
+    let f = fraction_f.clamp(0.0, 0.99);
+    if f <= 0.0 || payoff_ratio_b <= 0.0 {
+        return 0.0;
+    }
+    let p = win_rate_p.clamp(0.01, 0.99);
+    let q = 1.0 - p;
+    p * (1.0 + payoff_ratio_b * f).ln() + q * (1.0 - f).ln()
+}
+
+/// Converts an account risk fraction `f` (e.g. Half-Kelly `0.5 * f*` or Quarter-Kelly `0.25 * f*`)
+/// into notional position size (`USDT`) using the structural stop-loss distance:
+/// `Dollar Risk = Equity * f`
+/// `Notional Position Size = Dollar Risk / (|Entry - StopLoss| / Entry)`
+pub fn compute_stop_distance_notional(
+    account_equity_usdt: f64,
+    risk_fraction_f: f64,
+    entry_price: f64,
+    stop_loss_price: f64,
+) -> Result<f64> {
+    if risk_fraction_f <= 0.0 {
+        return Err(BotError::RiskRejected(
+            "Negative or zero Kelly risk fraction (EV <= 0) — systematic filter blocked trade".into(),
+        ));
+    }
+    if entry_price <= f64::EPSILON {
+        return Err(BotError::RiskRejected("Invalid entry price".into()));
+    }
+    let stop_dist_dec = ((entry_price - stop_loss_price).abs() / entry_price).max(0.0005);
+    let dollar_risk = account_equity_usdt.max(0.0) * risk_fraction_f;
+    Ok(dollar_risk / stop_dist_dec)
+}
+
+/// Computes strategy mathematical Expectancy `(p * avg_win) - (q * avg_loss)`
+/// and Profit Factor `gross_profit / gross_loss`.
+pub fn compute_expectancy_and_profit_factor(
+    win_rate_p: f64,
+    avg_win_r: f64,
+    avg_loss_r: f64,
+    gross_profit_usdt: f64,
+    gross_loss_usdt: f64,
+) -> (f64, f64) {
+    let p = win_rate_p.clamp(0.0, 1.0);
+    let q = 1.0 - p;
+    let expectancy_r = (p * avg_win_r) - (q * avg_loss_r.abs());
+    let profit_factor = if gross_loss_usdt.abs() > f64::EPSILON {
+        gross_profit_usdt / gross_loss_usdt.abs()
+    } else {
+        0.0
+    };
+    (expectancy_r, profit_factor)
+}
+

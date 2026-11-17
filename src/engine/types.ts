@@ -90,7 +90,16 @@ export interface IndicatorSnapshot {
   minusDi: number | null;
   atr: number | null;
   vwap: number | null;
+  volumeSma20?: number | null;
+  volumeRatio?: number | null;
 }
+
+export type PositionSizingMode =
+  | 'fixed_usdt'
+  | 'fixed_risk_pct'
+  | 'quarter_kelly'
+  | 'half_kelly'
+  | 'full_kelly';
 
 export interface ExitPlan {
   initialStopLoss: number;
@@ -134,6 +143,53 @@ export interface ClosedTrade {
   closedAtMs: number;
 }
 
+/**
+ * Official Binance Spot (/api/v3/myTrades + executionReport) and
+ * USD-M Futures (/fapi/v1/userTrades + ORDER_TRADE_UPDATE) execution fill record.
+ */
+export interface BinanceExecutionRecord {
+  id: string;
+  tradeId: number;
+  orderId: number;
+  orderListId: number; // -1 when not part of an OCO order list
+  clientOrderId: string;
+  symbol: string;
+  venue: ExchangeVenue;
+  environment: 'Testnet' | 'Production';
+  accountMode: ExecutionAccountMode;
+  lifecycle: 'ENTRY' | 'EXIT';
+  side: Side;
+  binanceSide: 'BUY' | 'SELL';
+  positionSide: 'BOTH' | 'LONG' | 'SHORT';
+  orderType:
+    | 'MARKET'
+    | 'LIMIT'
+    | 'LIMIT_MAKER'
+    | 'STOP_LOSS_LIMIT'
+    | 'TAKE_PROFIT_LIMIT'
+    | 'STOP_MARKET'
+    | 'TAKE_PROFIT_MARKET';
+  uiOrderType: OrderType;
+  execType: 'TRADE';
+  orderStatus: 'FILLED' | 'PARTIALLY_FILLED';
+  timeInForce: TimeInForce | 'GTX';
+  price: number;
+  entryPrice: number;
+  origQty: number;
+  executedQty: number;
+  cummulativeQuoteQty: number;
+  commission: number;
+  commissionAsset: string;
+  isMaker: boolean;
+  leverage: number;
+  marginType: MarginType;
+  realizedPnlUsdt: number | null;
+  rMultiple: number | null;
+  exitReason: ExitReason | null;
+  strategyRationale: string;
+  transactTime: number;
+}
+
 export interface EntrySignal {
   symbol: string;
   side: Side;
@@ -154,6 +210,7 @@ export interface TradingConfig {
   pairs: string[];
   maxConcurrentPositions: number;
   baseRiskPerTradePct: number;
+  positionSizingMode?: PositionSizingMode;
   initialEquityUsdt: number;
   takerFeeBps: number;
 }
@@ -172,6 +229,7 @@ export interface IndicatorConfig {
   adxMinTrend: number;
   atrPeriod: number;
   requireVwapAlignment: boolean;
+  minVolumeExpansionMult?: number;
 }
 
 export interface ExitConfig {
@@ -217,6 +275,7 @@ export interface FeatureToggles {
   rsiMomentumFilter: boolean;
   adxStrengthFilter: boolean;
   vwapBiasFilter: boolean;
+  volumeConfirmationFilter?: boolean;
   atrDynamicExits: boolean;
   takeProfitLadder: boolean;
   breakEvenStop: boolean;
@@ -344,6 +403,7 @@ export interface EngineSnapshot {
   pairs: PairRuntimeState[];
   pendingOrders: PendingOrder[];
   recentTrades: ClosedTrade[];
+  executionHistory: BinanceExecutionRecord[];
   autoStats: AutoTradingStats;
   eventLog: Array<{ id: string; timestampMs: number; level: 'info' | 'warn' | 'alert'; message: string }>;
 }

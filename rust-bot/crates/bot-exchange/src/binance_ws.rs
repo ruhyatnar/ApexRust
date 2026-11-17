@@ -1,4 +1,7 @@
-use bot_core::{BotError, Candle, ExchangeConfig, MarketEvent, Result, TransportMode};
+use bot_core::{
+    BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent, Result,
+    TransportMode,
+};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -6,8 +9,8 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
-/// Binance combined WebSocket stream wrapper (`<symbol>@kline_<tf>`).
-/// Designed to interoperate with `binance-sdk` SpotWsStreams & SpotWsApi.
+/// Binance combined WebSocket stream wrapper (`<symbol>@kline_<tf>`) for Spot and USD-M Futures.
+/// Designed to interoperate with `binance-sdk` SpotWsStreams & DerivativesTradingUsdsFuturesWsStreams.
 pub struct BinanceWsDriver {
     cfg: ExchangeConfig,
     pairs: Vec<String>,
@@ -56,13 +59,22 @@ impl BinanceWsDriver {
     }
 
     pub fn build_combined_stream_url(&self) -> String {
+        let base = match (self.cfg.venue, self.cfg.environment) {
+            (ExchangeVenue::Futures, ExchangeEnvironment::Production) => {
+                "wss://fstream.binance.com/stream"
+            }
+            (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
+                "wss://stream.binancefuture.com/stream"
+            }
+            (ExchangeVenue::Spot, _) => self.cfg.ws_stream_url.as_str(),
+        };
         let streams = self
             .pairs
             .iter()
             .map(|p| format!("{}@kline_{}", p.to_lowercase(), self.timeframe))
             .collect::<Vec<_>>()
             .join("/");
-        format!("{}?streams={}", self.cfg.ws_stream_url, streams)
+        format!("{}?streams={}", base, streams)
     }
 
     /// Connect to Binance WebSocket Streams and forward parsed `MarketEvent`s

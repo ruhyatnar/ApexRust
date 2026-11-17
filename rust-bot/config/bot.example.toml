@@ -3,6 +3,9 @@
 
 [exchange]
 environment = "testnet" # "testnet" | "production"
+venue = "spot"          # "spot" | "futures"
+leverage = 3            # Used when venue = "futures" (1..=20)
+margin_type = "ISOLATED"# "ISOLATED" | "CROSSED"
 paper_trading = true    # Isolated virtual paper sandbox when true; live signed orders require credentials + armed_for_live_orders
 ws_stream_url = "wss://stream.testnet.binance.vision/stream"
 ws_api_url = "wss://ws-api.testnet.binance.vision/ws-api/v3"
@@ -32,6 +35,34 @@ max_concurrent_positions = 3
 base_risk_per_trade_pct = 0.75
 initial_equity_usdt = 10000.0
 taker_fee_bps = 10.0
+
+[automation]
+enabled = true
+strategy_profile = "trend_pullback" # "trend_pullback" | "ema_breakout" | "vwap_reversion"
+direction_policy = "long_only"      # "long_only" (Spot safe) | "both" (Futures Long/Short)
+order_method = "MARKET"             # "MARKET" | "LIMIT" | "LIMIT_MAKER" | "OCO"
+limit_offset_bps = 8.0
+auto_order_notional_usdt = 250.0
+cooldown_bars_between_trades = 2
+
+[features]
+automated_trading = true
+manual_trading = true
+signal_generator = true
+ws_primary_feed = true
+rest_fallback = true
+ema_trend_filter = true
+rsi_momentum_filter = true
+adx_strength_filter = true
+vwap_bias_filter = true
+atr_dynamic_exits = true
+take_profit_ladder = true
+break_even_stop = true
+trailing_stop = true
+circuit_breaker = true
+spot_market = true
+futures_market = true
+git_auto_backup = false
 
 [indicators]
 ema_fast = 9
@@ -66,6 +97,13 @@ max_win_streak = 5
 max_lose_streak = 3
 streak_cooldown_minutes = 30
 flatten_on_circuit_breaker = true
+
+[git_backup]
+enabled = true
+remote_name = "origin"
+branch = "main"
+auto_push = false
+commit_prefix = "chore(backup):"
 
 [web]
 bind_addr = "127.0.0.1:8080"

@@ -12,6 +12,8 @@ import {
   TrendingUp,
   X,
 } from 'lucide-react';
+import { FeatureTogglesView } from './components/FeatureTogglesView';
+import { GitBackupView } from './components/GitBackupView';
 import { LiveCredentialsView } from './components/LiveCredentialsView';
 import { MarketsView, SignalsView } from './components/MarketsAndSignalsView';
 import { RiskCircuitBreakerView } from './components/RiskCircuitBreakerView';
@@ -21,18 +23,21 @@ import { TradingDeskView } from './components/TradingDeskView';
 import { DEFAULT_BOT_CONFIG, SimulationRuntime } from './engine/simulator';
 import type {
   BinanceAuthMethod,
+  BinanceExecutionRecord,
   BotConfig,
   Candle,
   EngineSnapshot,
+  ExchangeVenue,
   ExecutionAccountMode,
   LiveCredentialStatus,
   ManualOrderInput,
+  MarginType,
   Timeframe,
   TransportMode,
 } from './engine/types';
 
 type ActiveSection = 'trade' | 'markets' | 'bot' | 'signal' | 'rust';
-type BotSubTab = 'strategy' | 'risk' | 'credentials';
+type BotSubTab = 'strategy' | 'features' | 'risk' | 'credentials' | 'git';
 
 const NAV_ITEMS: Array<{
   id: ActiveSection;
@@ -49,6 +54,9 @@ const NAV_ITEMS: Array<{
 const INITIAL_LIVE_STATUS: LiveCredentialStatus = {
   configured: false,
   environment: 'Testnet',
+  venue: 'Spot',
+  leverage: 3,
+  marginType: 'ISOLATED',
   authMethod: 'HMAC-SHA256',
   apiKeyMasked: null,
   recvWindowMs: 5000,
@@ -114,6 +122,13 @@ export default function App() {
     }
   }, []);
 
+  const activeVenue = config.trading.venue;
+  const activeVenueRef = useRef<ExchangeVenue>(activeVenue);
+  activeVenueRef.current = activeVenue;
+  const activeLeverageRef = useRef<number>(config.trading.leverage);
+  activeLeverageRef.current = config.trading.leverage;
+  const gitBackupTimerRef = useRef<number | null>(null);
+
   const drainLiveIntents = useCallback(async () => {
     const rt = liveRuntimeRef.current;
     if (!rt || inflightLiveIntentsRef.current) return;
@@ -125,11 +140,14 @@ export default function App() {
       return;
     }
 
+    const venue = activeVenueRef.current;
+    const leverage = activeLeverageRef.current;
+
     inflightLiveIntentsRef.current = true;
     try {
       for (const intent of intents) {
         if (intent.kind === 'EXIT') {
-          if (intent.binanceSide !== 'SELL') {
+          if (venue === 'Spot' && intent.binanceSide !== 'SELL') {
             continue;
           }
           const resp = await fetch('/api/live/order', {
@@ -137,7 +155,9 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               symbol: intent.symbol,
-              side: 'SELL',
+              venue,
+              leverage,
+              side: intent.binanceSide,
               type: 'MARKET',
               quantity: intent.quantity,
               preflightOnly: false,
@@ -169,34 +189,52 @@ export default function App() {
                 | 'TakeProfit2'
                 | 'CircuitBreakerFlatten'
                 | 'ManualClose',
-              `[AUTO LIVE EXIT] ${intent.symbol} ${intent.reason} @ $${exitPx.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+              `[AUTO LIVE EXIT ${venue}] ${intent.symbol} ${intent.reason} @ $${exitPx.toFixed(2)} (${data.latencyMs ?? 0}ms)`
             );
           } else {
             rt.snapshot.autoStats.lastActionSummary = `Live EXIT failed: ${data.error ?? 'Rejected'}`;
           }
         } else {
           // Automated ENTRY
-          if (intent.binanceSide === 'SELL') {
+          if (venue === 'Spot' && intent.binanceSide === 'SELL') {
             // Binance Spot API cannot open unhedged Short positions via spot SELL without inventory
-            rt.snapshot.autoStats.lastActionSummary = `Skipped Spot Short ${intent.symbol} (set Spot Long Only)`;
+            rt.snapshot.autoStats.lastActionSummary = `Skipped Spot Short ${intent.symbol} (switch to USD-M Futures or Spot Long)`;
             continue;
           }
           const binanceType =
-            intent.orderMethod === 'LIMIT_MAKER'
-              ? 'LIMIT_MAKER'
-              : intent.orderMethod === 'LIMIT'
-                ? 'LIMIT'
-                : 'MARKET';
+            intent.orderMethod === 'OCO'
+              ? 'OCO'
+              : intent.orderMethod === 'LIMIT_MAKER'
+                ? 'LIMIT_MAKER'
+                : intent.orderMethod === 'LIMIT'
+                  ? 'LIMIT'
+                  : 'MARKET';
+          const pair = rt.snapshot.pairs.find((p) => p.symbol === intent.symbol);
+          const refPx = pair?.lastPrice ?? 0;
+          const isLong = intent.binanceSide === 'BUY';
+          const tpPx =
+            binanceType === 'OCO' && refPx > 0
+              ? refPx * (isLong ? 1.025 : 0.975)
+              : undefined;
+          const slPx =
+            binanceType === 'OCO' && refPx > 0
+              ? refPx * (isLong ? 0.985 : 1.015)
+              : undefined;
+
           const resp = await fetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               symbol: intent.symbol,
+              venue,
+              leverage,
               side: intent.binanceSide,
               type: binanceType,
               quoteOrderQty: intent.usdtAmount,
               price: intent.limitPrice,
               timeInForce: intent.timeInForce,
+              takeProfitPrice: tpPx,
+              stopLossPrice: slPx,
               preflightOnly: false,
             }),
           });
@@ -205,6 +243,7 @@ export default function App() {
             orderId?: string;
             orderStatus?: string;
             avgPrice?: number;
+            ocoNote?: string;
             latencyMs?: number;
             error?: string;
           };
@@ -214,12 +253,12 @@ export default function App() {
                 intent.input,
                 intent.limitPrice,
                 data.orderId,
-                `[AUTO LIVE] Resting ${binanceType} ${intent.symbol} @ $${intent.limitPrice.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+                `[AUTO LIVE ${venue}] Resting ${binanceType} ${intent.symbol} @ $${intent.limitPrice.toFixed(2)} (${data.latencyMs ?? 0}ms)`
               );
             } else {
               rt.recordExternalLiveOrder(
                 intent.input,
-                `[AUTO LIVE] Filled ${binanceType} ${intent.symbol} $${intent.usdtAmount.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+                `[AUTO LIVE ${venue}] Filled ${binanceType} ${intent.symbol} $${intent.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`
               );
             }
           } else {
@@ -300,12 +339,21 @@ export default function App() {
     let ws: WebSocket | null = null;
     let restTimer: number | null = null;
     const isTestnet = snapshot.transport.environment === 'Testnet';
-    const wsBase = isTestnet
-      ? 'wss://stream.testnet.binance.vision/stream'
-      : 'wss://stream.binance.com:9443/stream';
-    const restBase = isTestnet
-      ? 'https://testnet.binance.vision/api/v3'
-      : 'https://api.binance.com/api/v3';
+    const isFutures = config.trading.venue === 'Futures';
+    const wsBase = isFutures
+      ? isTestnet
+        ? 'wss://stream.binancefuture.com/stream'
+        : 'wss://fstream.binance.com/stream'
+      : isTestnet
+        ? 'wss://stream.testnet.binance.vision/stream'
+        : 'wss://stream.binance.com:9443/stream';
+    const restBase = isFutures
+      ? isTestnet
+        ? 'https://testnet.binancefuture.com/fapi/v1'
+        : 'https://fapi.binance.com/fapi/v1'
+      : isTestnet
+        ? 'https://testnet.binance.vision/api/v3'
+        : 'https://api.binance.com/api/v3';
 
     const streams = config.trading.pairs
       .map((p) => `${p.toLowerCase()}@kline_${config.trading.timeframe}`)
@@ -313,6 +361,7 @@ export default function App() {
     const wsUrl = `${wsBase}?streams=${streams}`;
 
     const pollRestFallback = async () => {
+      if (!config.features.restFallback) return;
       for (const symbol of config.trading.pairs) {
         if (cancelled) return;
         try {
@@ -343,11 +392,36 @@ export default function App() {
       }
     };
 
+    if (!config.features.wsPrimaryFeed) {
+      if (config.features.restFallback) {
+        rt.setTransportMode(
+          'RestFallback',
+          `WS Primary toggled OFF — polling Binance ${config.trading.venue} REST fallback`
+        );
+        syncSnapshots();
+        void pollRestFallback();
+        restTimer = window.setInterval(pollRestFallback, 3000);
+      } else {
+        rt.setTransportMode(
+          'Reconnecting',
+          'Both WebSocket Primary and REST Fallback are disabled in Feature Toggles'
+        );
+        syncSnapshots();
+      }
+      return () => {
+        cancelled = true;
+        if (restTimer !== null) window.clearInterval(restTimer);
+      };
+    }
+
     try {
       ws = new WebSocket(wsUrl);
       ws.onopen = () => {
         if (!cancelled) {
-          rt.setTransportMode('WsPrimary', 'Connected to live Binance WebSocket stream');
+          rt.setTransportMode(
+            'WsPrimary',
+            `Connected to live Binance ${config.trading.venue} WebSocket stream`
+          );
           syncSnapshots();
         }
       };
@@ -378,7 +452,7 @@ export default function App() {
         }
       };
       ws.onerror = () => {
-        if (!cancelled) {
+        if (!cancelled && config.features.restFallback) {
           rt.setTransportMode('RestFallback', 'Binance WS unavailable — switching to REST fallback');
           syncSnapshots();
           if (restTimer === null) {
@@ -387,7 +461,7 @@ export default function App() {
         }
       };
       ws.onclose = () => {
-        if (!cancelled) {
+        if (!cancelled && config.features.restFallback) {
           rt.setTransportMode('RestFallback', 'Binance WS closed — polling REST fallback');
           syncSnapshots();
           if (restTimer === null) {
@@ -396,9 +470,11 @@ export default function App() {
         }
       };
     } catch {
-      rt.setTransportMode('RestFallback', 'WebSocket init failed — polling REST fallback');
-      syncSnapshots();
-      restTimer = window.setInterval(pollRestFallback, 3000);
+      if (config.features.restFallback) {
+        rt.setTransportMode('RestFallback', 'WebSocket init failed — polling REST fallback');
+        syncSnapshots();
+        restTimer = window.setInterval(pollRestFallback, 3000);
+      }
     }
 
     return () => {
@@ -411,8 +487,11 @@ export default function App() {
     activeRuntimeRef,
     snapshot.transport.feedSource,
     snapshot.transport.environment,
+    config.trading.venue,
     config.trading.pairs,
     config.trading.timeframe,
+    config.features.wsPrimaryFeed,
+    config.features.restFallback,
     syncSnapshots,
     drainLiveIntents,
   ]);
@@ -422,6 +501,51 @@ export default function App() {
     paperRuntimeRef.current?.updateConfig(next);
     liveRuntimeRef.current?.updateConfig(next);
     syncSnapshots();
+
+    if (next.features.gitAutoBackup) {
+      if (gitBackupTimerRef.current !== null) {
+        window.clearTimeout(gitBackupTimerRef.current);
+      }
+      gitBackupTimerRef.current = window.setTimeout(() => {
+        void fetch('/api/git/backup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            commitMessage: `chore(backup): auto-sync ${next.trading.venue} config`,
+            push: false,
+            config: next,
+          }),
+        }).catch(() => undefined);
+      }, 1500);
+    }
+  };
+
+  const handleUpdateVenue = (venue: ExchangeVenue) => {
+    if (venue === 'Spot' && !config.features.spotMarket) return;
+    if (venue === 'Futures' && !config.features.futuresMarket) return;
+    const nextDirection =
+      venue === 'Futures' ? 'both' : config.automation.directionPolicy;
+    const nextConfig: BotConfig = {
+      ...config,
+      trading: { ...config.trading, venue },
+      automation: { ...config.automation, directionPolicy: nextDirection },
+    };
+    paperRuntimeRef.current?.setVenue(venue);
+    liveRuntimeRef.current?.setVenue(venue);
+    handleUpdateConfig(nextConfig);
+  };
+
+  const handleUpdateFuturesSettings = (leverage: number, marginType: MarginType) => {
+    const safeLeverage = Math.min(20, Math.max(1, leverage));
+    const nextConfig: BotConfig = {
+      ...config,
+      trading: {
+        ...config.trading,
+        leverage: safeLeverage,
+        marginType,
+      },
+    };
+    handleUpdateConfig(nextConfig);
   };
 
   const handleToggleAutomation = () => {
@@ -510,6 +634,17 @@ export default function App() {
     const rt = activeRuntimeRef.current;
     if (!rt) return { ok: false, reason: 'Engine uninitialized' };
 
+    if (!config.features.manualTrading) {
+      return { ok: false, reason: 'Manual Trading is disabled in Feature Toggles.' };
+    }
+    const venue = config.trading.venue;
+    if (venue === 'Spot' && !config.features.spotMarket) {
+      return { ok: false, reason: 'Binance Spot market is disabled in Feature Toggles.' };
+    }
+    if (venue === 'Futures' && !config.features.futuresMarket) {
+      return { ok: false, reason: 'Binance USD-M Futures market is disabled in Feature Toggles.' };
+    }
+
     if (accountMode === 'Live') {
       if (!liveStatus.configured) {
         return {
@@ -523,23 +658,52 @@ export default function App() {
           reason: 'Live execution is disarmed. Arm Live Order Execution in Live Credentials first.',
         };
       }
+      if (venue === 'Spot' && input.side === 'Short') {
+        return {
+          ok: false,
+          reason: 'Live Short opening requires USD-M Futures. Switch venue to Futures first.',
+        };
+      }
+
       const binanceType =
-        input.orderType === 'LIMIT MAKER'
-          ? 'LIMIT_MAKER'
-          : input.orderType === 'LIMIT'
-            ? 'LIMIT'
-            : 'MARKET';
+        input.orderType === 'OCO SELL' ||
+        input.orderType === 'OCO BUY' ||
+        input.orderType === 'ATR SCALP'
+          ? 'OCO'
+          : input.orderType === 'LIMIT MAKER'
+            ? 'LIMIT_MAKER'
+            : input.orderType === 'LIMIT'
+              ? 'LIMIT'
+              : 'MARKET';
+
+      const pair = rt.snapshot.pairs.find((p) => p.symbol === input.symbol);
+      const refPx = pair?.lastPrice ?? 0;
+      const primaryTpPct = input.targets[0]?.pctOffset ?? 2.5;
+      const isLong = input.side === 'Long';
+      const tpPx =
+        binanceType === 'OCO' && refPx > 0
+          ? refPx * (1 + (isLong ? 1 : -1) * (primaryTpPct / 100))
+          : undefined;
+      const slPx =
+        binanceType === 'OCO' && refPx > 0
+          ? refPx * (1 - (isLong ? 1 : -1) * (input.stopLossPct / 100))
+          : undefined;
+
       try {
         const resp = await fetch('/api/live/order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             symbol: input.symbol,
-            side: input.side === 'Long' ? 'BUY' : 'SELL',
+            venue,
+            leverage: config.trading.leverage,
+            side: isLong ? 'BUY' : 'SELL',
             type: binanceType,
             quoteOrderQty: input.usdtAmount,
             price: input.limitPrice,
             timeInForce: input.timeInForce ?? 'GTC',
+            takeProfitPrice: tpPx,
+            stopLossPrice: slPx,
             preflightOnly: false,
           }),
         });
@@ -549,6 +713,7 @@ export default function App() {
           latencyMs?: number;
           orderId?: string;
           orderStatus?: string;
+          ocoNote?: string;
         };
         if (!resp.ok || !data.ok) {
           return { ok: false, reason: data.error ?? 'Binance live order rejected' };
@@ -558,12 +723,12 @@ export default function App() {
             input,
             input.limitPrice,
             data.orderId,
-            `Live ${liveStatus.environment} resting ${binanceType} ${input.symbol} @ $${input.limitPrice.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+            `Live ${liveStatus.environment} ${venue} resting ${binanceType} ${input.symbol} @ $${input.limitPrice.toFixed(2)} (${data.latencyMs ?? 0}ms)`
           );
         } else {
           rt.recordExternalLiveOrder(
             input,
-            `Live ${liveStatus.environment} ${binanceType} ${input.side} ${input.symbol} $${input.usdtAmount.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+            `Live ${liveStatus.environment} ${venue} ${binanceType} ${input.side} ${input.symbol} $${input.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`
           );
         }
         syncSnapshots();
@@ -587,18 +752,26 @@ export default function App() {
   const handleClosePosition = async (symbol: string) => {
     const rt = activeRuntimeRef.current;
     if (!rt) return;
+    const venue = config.trading.venue;
 
     if (accountMode === 'Live') {
       const pair = rt.snapshot.pairs.find((p) => p.symbol === symbol);
       const pos = pair?.openPosition;
-      if (pos && liveStatus.configured && liveStatus.armedForLiveOrders && pos.side === 'Long') {
+      if (
+        pos &&
+        liveStatus.configured &&
+        liveStatus.armedForLiveOrders &&
+        (pos.side === 'Long' || venue === 'Futures')
+      ) {
+        const closeSide = pos.side === 'Long' ? 'SELL' : 'BUY';
         try {
           const resp = await fetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               symbol,
-              side: 'SELL',
+              venue,
+              side: closeSide,
               type: 'MARKET',
               quantity: pos.remainingQuantity,
               preflightOnly: false,
@@ -612,7 +785,7 @@ export default function App() {
               1,
               exitPx,
               'ManualClose',
-              `Live SELL exit ${symbol} @ $${exitPx.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+              `Live ${venue} ${closeSide} exit ${symbol} @ $${exitPx.toFixed(2)} (${data.latencyMs ?? 0}ms)`
             );
             syncSnapshots();
             return;
@@ -630,9 +803,12 @@ export default function App() {
   const handleFlattenAll = async () => {
     const rt = activeRuntimeRef.current;
     if (!rt) return;
+    const venue = config.trading.venue;
 
     if (accountMode === 'Live' && liveStatus.configured && liveStatus.armedForLiveOrders) {
-      const openPairs = rt.snapshot.pairs.filter((p) => p.openPosition?.side === 'Long');
+      const openPairs = rt.snapshot.pairs.filter(
+        (p) => p.openPosition && (p.openPosition.side === 'Long' || venue === 'Futures')
+      );
       for (const p of openPairs) {
         try {
           await fetch('/api/live/order', {
@@ -640,7 +816,8 @@ export default function App() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               symbol: p.symbol,
-              side: 'SELL',
+              venue,
+              side: p.openPosition!.side === 'Long' ? 'SELL' : 'BUY',
               type: 'MARKET',
               quantity: p.openPosition!.remainingQuantity,
               preflightOnly: false,
@@ -672,6 +849,7 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             symbol: ord.symbol,
+            venue: config.trading.venue,
             orderId: ord.exchangeOrderId,
           }),
         });
@@ -713,9 +891,60 @@ export default function App() {
     setBotSubTab('strategy');
   };
 
+  const handleOpenFeatureToggles = () => {
+    setSection('bot');
+    setBotSubTab('features');
+  };
+
+  const handleSyncLiveTrades = async (
+    symbol: string
+  ): Promise<{ ok: boolean; added: number; latencyMs?: number; message: string }> => {
+    try {
+      const resp = await fetch(
+        `/api/live/trades?symbol=${encodeURIComponent(symbol)}&venue=${encodeURIComponent(config.trading.venue)}&limit=25`
+      );
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        configured?: boolean;
+        latencyMs?: number;
+        endpoint?: string;
+        error?: string;
+        trades?: BinanceExecutionRecord[];
+      };
+      if (!data.ok) {
+        return {
+          ok: false,
+          added: 0,
+          latencyMs: data.latencyMs,
+          message:
+            data.error ??
+            'Live credentials not configured in server vault — showing local & simulated execution fills.',
+        };
+      }
+      const list = Array.isArray(data.trades) ? data.trades : [];
+      const added = activeRuntimeRef.current?.syncExternalLiveTrades(list) ?? 0;
+      syncSnapshots();
+      return {
+        ok: true,
+        added,
+        latencyMs: data.latencyMs,
+        message: `Synced ${list.length} trade(s) (${added} new) from Binance ${config.trading.venue} ${data.endpoint ?? ''} for ${symbol}`,
+      };
+    } catch (err) {
+      return {
+        ok: false,
+        added: 0,
+        message: err instanceof Error ? err.message : 'Unable to reach /api/live/trades',
+      };
+    }
+  };
+
   // Server-Side Live Credential Vault Actions
   const handleSaveCredentials = async (payload: {
     environment: 'Testnet' | 'Production';
+    venue: ExchangeVenue;
+    leverage: number;
+    marginType: MarginType;
     authMethod: BinanceAuthMethod;
     apiKey: string;
     apiSecret: string;
@@ -738,9 +967,14 @@ export default function App() {
       if (!resp.ok || !data.ok) {
         return { ok: false, message: data.error ?? 'Failed to save credentials' };
       }
+      // Keep active venue / leverage aligned with vault selection
+      handleUpdateFuturesSettings(payload.leverage, payload.marginType);
+      if (payload.venue !== config.trading.venue) {
+        handleUpdateVenue(payload.venue);
+      }
       return {
         ok: true,
-        message: `Credentials stored in server vault (${payload.environment} · ${payload.authMethod}).`,
+        message: `Credentials stored in server vault (${payload.venue} · ${payload.environment} · ${payload.authMethod}).`,
       };
     } catch (err) {
       return {
@@ -1086,8 +1320,12 @@ export default function App() {
               onToggleAutomation={handleToggleAutomation}
               onRunAutoScan={handleRunAutoScan}
               onOpenStrategyConfig={handleOpenStrategyConfig}
+              onOpenFeatureToggles={handleOpenFeatureToggles}
+              onUpdateVenue={handleUpdateVenue}
+              onUpdateFuturesSettings={handleUpdateFuturesSettings}
               onResetCircuitBreaker={handleResetCB}
               onOpenLiveCredentials={handleOpenLiveCredentials}
+              onSyncLiveTrades={handleSyncLiveTrades}
             />
           )}
 
@@ -1125,6 +1363,19 @@ export default function App() {
                   <button
                     type="button"
                     role="tab"
+                    aria-selected={botSubTab === 'features'}
+                    onClick={() => setBotSubTab('features')}
+                    className={`rounded-md px-4 py-1.5 text-xs font-semibold transition whitespace-nowrap ${
+                      botSubTab === 'features'
+                        ? 'bg-[#7DF2AD] text-[#0B0F17]'
+                        : 'text-slate-400 hover:text-slate-100'
+                    }`}
+                  >
+                    Feature Toggles
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
                     aria-selected={botSubTab === 'risk'}
                     onClick={() => setBotSubTab('risk')}
                     className={`rounded-md px-4 py-1.5 text-xs font-semibold transition whitespace-nowrap ${
@@ -1148,12 +1399,29 @@ export default function App() {
                   >
                     Live Credentials
                   </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={botSubTab === 'git'}
+                    onClick={() => setBotSubTab('git')}
+                    className={`rounded-md px-4 py-1.5 text-xs font-semibold transition whitespace-nowrap ${
+                      botSubTab === 'git'
+                        ? 'bg-[#7DF2AD] text-[#0B0F17]'
+                        : 'text-slate-400 hover:text-slate-100'
+                    }`}
+                  >
+                    Git Backup
+                  </button>
                 </div>
 
                 <span className="font-mono text-xs text-slate-400">
                   Account:{' '}
                   <span className={accountMode === 'Live' ? 'text-amber-300' : 'text-[#7DF2AD]'}>
                     {accountMode}
+                  </span>{' '}
+                  · Venue:{' '}
+                  <span className={config.trading.venue === 'Futures' ? 'text-amber-300' : 'text-slate-200'}>
+                    {config.trading.venue}
                   </span>{' '}
                   · Risk:{' '}
                   <span
@@ -1180,6 +1448,13 @@ export default function App() {
                 />
               )}
 
+              {botSubTab === 'features' && (
+                <FeatureTogglesView
+                  config={config}
+                  onUpdateConfig={handleUpdateConfig}
+                />
+              )}
+
               {botSubTab === 'risk' && (
                 <RiskCircuitBreakerView
                   snapshot={snapshot}
@@ -1202,6 +1477,10 @@ export default function App() {
                   onRevokeCredentials={handleRevokeCredentials}
                   onSwitchAccountMode={setAccountMode}
                 />
+              )}
+
+              {botSubTab === 'git' && (
+                <GitBackupView config={config} snapshot={snapshot} />
               )}
             </div>
           )}
