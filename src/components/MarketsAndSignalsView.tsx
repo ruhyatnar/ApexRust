@@ -184,7 +184,7 @@ export const MarketsView: React.FC<MarketsViewProps> = ({
                     {volRatio.toFixed(2)}×
                   </td>
                   <td className="px-4 py-3 text-right text-slate-200">
-                    {ind.atr !== null ? `$${ind.atr.toFixed(2)}` : '—'}
+                    {ind.atr !== null ? `$${ind.atr.toFixed(p.lastPrice >= 100 ? 2 : 4)}` : '—'}
                   </td>
                   <td
                     className={`px-4 py-3 text-right ${

@@ -88,6 +88,13 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!liveStatus.configured && (!apiKey.trim() || !apiSecret.trim())) {
+      setFeedback({
+        type: 'err',
+        text: 'Both API Key and Secret / Private Key are required for initial setup.',
+      });
+      return;
+    }
     setBusyAction('save');
     setFeedback(null);
     const res = await onSaveCredentials({

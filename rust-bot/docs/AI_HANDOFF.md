@@ -96,4 +96,7 @@ npx --yes tsx --test \
 
 # Rust workspace tests & clippy
 cd rust-bot && cargo test --workspace && cargo clippy --workspace
+
+# Installer & lifecycle CLI unit tests
+npm run test:installer
 ```

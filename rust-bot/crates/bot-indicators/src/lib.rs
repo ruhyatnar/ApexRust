@@ -42,6 +42,7 @@ impl Ema {
         self.value
     }
 
+    #[cfg(test)]
     pub fn current(&self) -> Option<f64> {
         self.value
     }
@@ -361,7 +362,6 @@ pub struct IndicatorPipeline {
     adx: Adx,
     vwap: SessionVwap,
     volume_sma_20: RollingVolumeSma,
-    prev_atr: Option<f64>,
     latest: IndicatorSnapshot,
 }
 
@@ -377,7 +377,6 @@ impl IndicatorPipeline {
             adx: Adx::new(cfg.adx_period),
             vwap: SessionVwap::default(),
             volume_sma_20: RollingVolumeSma::new(20),
-            prev_atr: None,
             latest: IndicatorSnapshot::default(),
         }
     }
@@ -393,7 +392,6 @@ impl IndicatorPipeline {
         let (adx, plus_di, minus_di) = self.adx.next(candle);
         let vwap = self.vwap.next(candle);
         let (avg_volume_20, volume_ratio) = self.volume_sma_20.next(candle.volume);
-        self.prev_atr = prev_atr;
 
         self.latest = IndicatorSnapshot {
             ema_fast,
@@ -406,7 +404,7 @@ impl IndicatorPipeline {
             plus_di,
             minus_di,
             atr,
-            prev_atr: self.prev_atr,
+            prev_atr,
             vwap,
             avg_volume_20,
             volume_ratio,

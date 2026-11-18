@@ -34,11 +34,33 @@ impl BotConfig {
         if self.trading.pairs.is_empty() {
             return Err(crate::BotError::Config("trading.pairs must not be empty".into()));
         }
+        if self.trading.initial_equity_usdt <= 0.0 || !self.trading.initial_equity_usdt.is_finite() {
+            return Err(crate::BotError::Config("trading.initial_equity_usdt must be > 0".into()));
+        }
+        if self.trading.max_concurrent_positions == 0 {
+            return Err(crate::BotError::Config("trading.max_concurrent_positions must be > 0".into()));
+        }
         if self.exits.atr_sl_multiplier <= 0.0 {
             return Err(crate::BotError::Config("exits.atr_sl_multiplier must be > 0".into()));
         }
+        if !(0.0..=1.0).contains(&self.exits.tp1_close_ratio) || self.exits.tp1_close_ratio <= 0.0 {
+            return Err(crate::BotError::Config("exits.tp1_close_ratio must be in (0, 1]".into()));
+        }
         if self.risk.max_daily_drawdown_pct <= 0.0 || self.risk.max_pair_daily_drawdown_pct <= 0.0 {
             return Err(crate::BotError::Config("Drawdown limits must be positive".into()));
+        }
+        if self.exchange.rest_poll_interval_ms == 0 || self.exchange.ws_reconnect_initial_ms == 0 {
+            return Err(crate::BotError::Config("Exchange poll and reconnect intervals must be > 0 ms".into()));
+        }
+        for win in &self.automation.session_windows {
+            if parse_utc_hhmm_minutes(&win.start_utc).is_none()
+                || parse_utc_hhmm_minutes(&win.end_utc).is_none()
+            {
+                return Err(crate::BotError::Config(format!(
+                    "Invalid HH:MM UTC session window '{}' ({}-{})",
+                    win.id, win.start_utc, win.end_utc
+                )));
+            }
         }
         Ok(())
     }
@@ -141,6 +163,7 @@ pub enum OrderExecutionMethod {
     #[default]
     Market,
     Limit,
+    #[serde(rename = "LIMIT_MAKER", alias = "LIMITMAKER")]
     LimitMaker,
     Oco,
 }
@@ -425,4 +448,50 @@ pub struct RiskConfig {
 pub struct WebConfig {
     pub bind_addr: String,
     pub allowed_origin: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limit_maker_serde_and_config_validation() {
+        assert_eq!(
+            serde_json::to_string(&OrderExecutionMethod::LimitMaker).unwrap(),
+            "\"LIMIT_MAKER\""
+        );
+        assert_eq!(
+            serde_json::from_str::<OrderExecutionMethod>("\"LIMIT_MAKER\"").unwrap(),
+            OrderExecutionMethod::LimitMaker
+        );
+        assert_eq!(
+            serde_json::from_str::<OrderExecutionMethod>("\"LIMITMAKER\"").unwrap(),
+            OrderExecutionMethod::LimitMaker
+        );
+
+        let base = BotConfig::from_toml_file("../../config/bot.example.toml").unwrap();
+        assert!(base.validate().is_ok());
+
+        let mut bad_eq = base.clone();
+        bad_eq.trading.initial_equity_usdt = 0.0;
+        assert!(bad_eq.validate().is_err());
+
+        let mut bad_pos = base.clone();
+        bad_pos.trading.max_concurrent_positions = 0;
+        assert!(bad_pos.validate().is_err());
+
+        let mut bad_tp = base.clone();
+        bad_tp.exits.tp1_close_ratio = 0.0;
+        assert!(bad_tp.validate().is_err());
+
+        let mut bad_win = base;
+        bad_win.automation.session_windows.push(UtcSessionWindow {
+            id: "bad".into(),
+            label: "bad".into(),
+            start_utc: "25:99".into(),
+            end_utc: "23:59".into(),
+            enabled: true,
+        });
+        assert!(bad_win.validate().is_err());
+    }
 }

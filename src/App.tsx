@@ -241,10 +241,15 @@ export default function App() {
   const activeLeverageRef = useRef<number>(config.trading.leverage);
   activeLeverageRef.current = config.trading.leverage;
   const gitBackupTimerRef = useRef<number | null>(null);
+  const pendingLiveDrainRef = useRef<boolean>(false);
 
   const drainLiveIntents = useCallback(async () => {
     const rt = liveRuntimeRef.current;
-    if (!rt || inflightLiveIntentsRef.current) return;
+    if (!rt) return;
+    if (inflightLiveIntentsRef.current) {
+      pendingLiveDrainRef.current = true;
+      return;
+    }
     const intents = rt.consumeLiveIntents();
     if (intents.length === 0) return;
 
@@ -307,6 +312,7 @@ export default function App() {
           const data = (await resp.json()) as {
             ok?: boolean;
             orderId?: string;
+            executedQty?: number;
             avgPrice?: number;
             latencyMs?: number;
             error?: string;
@@ -315,9 +321,11 @@ export default function App() {
             const pair = rt.snapshot.pairs.find((p) => p.symbol === intent.symbol);
             const exitPx = data.avgPrice && data.avgPrice > 0 ? data.avgPrice : pair?.lastPrice ?? 0;
             const pos = pair?.openPosition;
+            const actualExecQty =
+              data.executedQty && data.executedQty > 0 ? data.executedQty : intent.quantity;
             const ratio =
-              pos && intent.quantity && pos.remainingQuantity > 0
-                ? Math.min(1, intent.quantity / pos.remainingQuantity)
+              pos && actualExecQty && pos.remainingQuantity > 0
+                ? Math.min(1, actualExecQty / pos.remainingQuantity)
                 : 1;
             rt.recordExternalLiveExit(
               intent.symbol,
@@ -333,7 +341,8 @@ export default function App() {
                 | 'ManualClose',
               `[AUTO LIVE EXIT ${venue}] ${intent.symbol} ${intent.reason} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
               Date.now(),
-              data.orderId
+              data.orderId,
+              data.executedQty
             );
           } else {
             rt.reportLiveAutoRejected(`Live EXIT failed (${intent.symbol}): ${data.error ?? 'Rejected'}`);
@@ -359,15 +368,26 @@ export default function App() {
           const refPx =
             intent.limitPrice && intent.limitPrice > 0 ? intent.limitPrice : pair?.lastPrice ?? 0;
           const isLong = intent.binanceSide === 'BUY';
-          const tpPct = intent.input?.targets?.[0]?.pctOffset ?? 2.5;
-          const slPct = intent.input?.stopLossPct ?? 1.5;
+          const autoTargets = intent.input?.targets ?? [];
+          const bracketTarget =
+            venue === 'Futures' && autoTargets.length > 1
+              ? autoTargets[autoTargets.length - 1]
+              : autoTargets[0];
+          const tpPct = bracketTarget?.pctOffset ?? 2.5;
+          const atrVal = pair?.indicators.atr ?? refPx * 0.01;
+          const slDist =
+            intent.input?.stopLossMode === 'ATR' && config.features.atrDynamicExits
+              ? atrVal * config.exits.atrSlMultiplier
+              : refPx * ((intent.input?.stopLossPct ?? 1.5) / 100);
           const tpPx =
             binanceType === 'OCO' && refPx > 0
               ? refPx * (1 + (isLong ? 1 : -1) * (tpPct / 100))
               : undefined;
           const slPx =
             binanceType === 'OCO' && refPx > 0
-              ? refPx * (1 - (isLong ? 1 : -1) * (slPct / 100))
+              ? isLong
+                ? refPx - slDist
+                : refPx + slDist
               : undefined;
 
           const resp = await fetch('/api/live/order', {
@@ -437,8 +457,12 @@ export default function App() {
       syncSnapshots();
     } finally {
       inflightLiveIntentsRef.current = false;
+      if (pendingLiveDrainRef.current) {
+        pendingLiveDrainRef.current = false;
+        void drainLiveIntents();
+      }
     }
-  }, [syncSnapshots]);
+  }, [syncSnapshots, config.exits.atrSlMultiplier, config.features.atrDynamicExits]);
 
   const applyLiveStatusToRuntime = useCallback(
     (status: LiveCredentialStatus) => {
@@ -999,6 +1023,16 @@ export default function App() {
     paperRuntimeRef.current?.setVenue(venue);
     liveRuntimeRef.current?.setVenue(venue);
     handleUpdateConfig(nextConfig);
+    void fetch('/api/live/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ venue }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { status?: LiveCredentialStatus } | null) => {
+        if (data?.status) applyLiveStatusToRuntime(data.status);
+      })
+      .catch(() => undefined);
   };
 
   const handleUpdateFuturesSettings = (leverage: number, marginType: MarginType) => {
@@ -1012,6 +1046,16 @@ export default function App() {
       },
     };
     handleUpdateConfig(nextConfig);
+    void fetch('/api/live/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ leverage: safeLeverage, marginType }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { status?: LiveCredentialStatus } | null) => {
+        if (data?.status) applyLiveStatusToRuntime(data.status);
+      })
+      .catch(() => undefined);
   };
 
   const handleToggleAutomation = () => {
@@ -1103,7 +1147,8 @@ export default function App() {
   const handleEnvironmentToggle = () => {
     const nextEnv =
       snapshot.transport.environment === 'Testnet' ? 'Production' : 'Testnet';
-    activeRuntimeRef.current?.setEnvironment(nextEnv);
+    paperRuntimeRef.current?.setEnvironment(nextEnv);
+    liveRuntimeRef.current?.setEnvironment(nextEnv);
     syncSnapshots();
     void fetch('/api/live/config', {
       method: 'POST',
@@ -1170,15 +1215,31 @@ export default function App() {
       const pair = rt.snapshot.pairs.find((p) => p.symbol === input.symbol);
       const refPx =
         input.limitPrice && input.limitPrice > 0 ? input.limitPrice : pair?.lastPrice ?? 0;
-      const primaryTpPct = input.targets[0]?.pctOffset ?? 2.5;
       const isLong = input.side === 'Long';
+      const atrVal = pair?.indicators.atr ?? refPx * 0.01;
+      const slDist =
+        input.stopLossMode === 'ATR' && config.features.atrDynamicExits
+          ? atrVal * config.exits.atrSlMultiplier
+          : refPx * (Math.max(0.2, input.stopLossPct) / 100);
+      const riskSlPx = refPx > 0 ? (isLong ? refPx - slDist : refPx + slDist) : 0;
+
+      const authCheck = rt.authorizeManualEntry(input.symbol, refPx, riskSlPx, Date.now());
+      if (!authCheck.ok) {
+        return authCheck;
+      }
+
+      const selectedTarget =
+        venue === 'Futures' && input.targets.length > 1
+          ? input.targets[input.targets.length - 1]
+          : input.targets[0];
+      const primaryTpPct = selectedTarget?.pctOffset ?? 2.5;
       const tpPx =
         binanceType === 'OCO' && refPx > 0
           ? refPx * (1 + (isLong ? 1 : -1) * (primaryTpPct / 100))
           : undefined;
       const slPx =
         binanceType === 'OCO' && refPx > 0
-          ? refPx * (1 - (isLong ? 1 : -1) * (input.stopLossPct / 100))
+          ? riskSlPx
           : undefined;
 
       try {
@@ -1310,8 +1371,10 @@ export default function App() {
           const data = (await resp.json()) as {
             ok?: boolean;
             orderId?: string;
+            executedQty?: number;
             avgPrice?: number;
             latencyMs?: number;
+            error?: string;
           };
           if (resp.ok && data.ok) {
             const exitPx = data.avgPrice && data.avgPrice > 0 ? data.avgPrice : pair.lastPrice;
@@ -1322,15 +1385,28 @@ export default function App() {
               'ManualClose',
               `Live ${venue} ${closeSide} exit ${symbol} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
               Date.now(),
-              data.orderId
+              data.orderId,
+              data.executedQty
             );
             syncSnapshots();
             return;
           }
-        } catch {
-          // Fall through to local sync if Binance unreachable
+          rt.reportLiveAutoRejected(
+            `Live close failed (${symbol}): ${data.error ?? `HTTP ${resp.status}`} — position kept open locally.`
+          );
+          syncSnapshots();
+          return;
+        } catch (err) {
+          rt.reportLiveAutoRejected(
+            `Live close error (${symbol}): ${err instanceof Error ? err.message : 'Network error'} — position kept open locally.`
+          );
+          syncSnapshots();
+          return;
         }
       }
+      rt.reportLiveAutoRejected(`Live close blocked (${symbol}): verify credentials and arm Live execution first.`);
+      syncSnapshots();
+      return;
     }
 
     rt.closePositionBySymbol(symbol, Date.now());
@@ -1342,7 +1418,12 @@ export default function App() {
     if (!rt) return;
     const venue = config.trading.venue;
 
-    if (accountMode === 'Live' && liveStatus.configured && liveStatus.armedForLiveOrders) {
+    if (accountMode === 'Live') {
+      if (!liveStatus.configured || !liveStatus.armedForLiveOrders) {
+        rt.reportLiveAutoRejected('Live Flatten All blocked: credentials not configured or disarmed.');
+        syncSnapshots();
+        return;
+      }
       const openPairs = rt.snapshot.pairs.filter(
         (p) => p.openPosition && (p.openPosition.side === 'Long' || venue === 'Futures')
       );
@@ -1368,7 +1449,7 @@ export default function App() {
           }
         }
         try {
-          await fetch('/api/live/order', {
+          const resp = await fetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1382,10 +1463,39 @@ export default function App() {
               preflightOnly: false,
             }),
           });
-        } catch {
-          // Continue flattening remaining pairs
+          const data = (await resp.json()) as {
+            ok?: boolean;
+            orderId?: string;
+            executedQty?: number;
+            avgPrice?: number;
+            latencyMs?: number;
+            error?: string;
+          };
+          if (resp.ok && data.ok) {
+            const exitPx = data.avgPrice && data.avgPrice > 0 ? data.avgPrice : p.lastPrice;
+            rt.recordExternalLiveExit(
+              p.symbol,
+              1,
+              exitPx,
+              'CircuitBreakerFlatten',
+              `Live Flatten ${venue} ${p.symbol} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
+              Date.now(),
+              data.orderId,
+              data.executedQty
+            );
+          } else {
+            rt.reportLiveAutoRejected(
+              `Live Flatten failed (${p.symbol}): ${data.error ?? `HTTP ${resp.status}`} — position kept open.`
+            );
+          }
+        } catch (err) {
+          rt.reportLiveAutoRejected(
+            `Live Flatten error (${p.symbol}): ${err instanceof Error ? err.message : 'Network error'}`
+          );
         }
       }
+      syncSnapshots();
+      return;
     }
 
     rt.flattenAllPositions();

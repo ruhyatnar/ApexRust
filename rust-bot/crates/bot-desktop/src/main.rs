@@ -35,8 +35,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let default_cfg = PathBuf::from("config/bot.example.toml");
     let config_path = if !cli.config.exists()
-        && cli.config == PathBuf::from("config/bot.example.toml")
+        && cli.config == default_cfg
         && PathBuf::from("rust-bot/config/bot.example.toml").exists()
     {
         PathBuf::from("rust-bot/config/bot.example.toml")
@@ -91,8 +92,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for Linux SIGINT / SIGTERM for graceful shutdown
     tokio::signal::ctrl_c().await?;
-    info!("Shutdown signal received; flattening/halting cleanly");
+    info!("Shutdown signal received; pausing engine and halting cleanly");
     let _ = cmd_tx.send(EngineCommand::Pause).await;
+    drop(cmd_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::task::yield_now().await;
+    })
+    .await;
     engine_task.abort();
 
     Ok(())

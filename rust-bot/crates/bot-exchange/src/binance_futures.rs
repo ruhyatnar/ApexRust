@@ -1,12 +1,16 @@
-use crate::{build_sdk_rest_config, to_binance_decimal, validate_live_safety, LiveOrderAck, LiveOrderRequest};
+use crate::{
+    build_sdk_rest_config, get_or_fetch_symbol_filters, to_binance_step_decimal,
+    validate_live_safety, LiveOrderAck, LiveOrderRequest, SymbolFilters,
+};
 use binance_sdk::derivatives_trading_usds_futures::rest_api::{
-    CancelAllAlgoOpenOrdersParams, ChangeInitialLeverageParams, ChangeMarginTypeMarginTypeEnum,
-    ChangeMarginTypeParams, NewAlgoOrderAlgoTypeEnum, NewAlgoOrderClosePositionEnum,
-    NewAlgoOrderParams, NewAlgoOrderPriceProtectEnum, NewAlgoOrderSideEnum, NewAlgoOrderTypeEnum,
-    NewAlgoOrderWorkingTypeEnum, NewOrderNewOrderRespTypeEnum, NewOrderParams,
-    NewOrderReduceOnlyEnum, NewOrderSideEnum, NewOrderTimeInForceEnum, NewOrderTypeEnum,
-    TestOrderNewOrderRespTypeEnum, TestOrderParams, TestOrderReduceOnlyEnum, TestOrderSideEnum,
-    TestOrderTimeInForceEnum, TestOrderTypeEnum,
+    CancelAlgoOrderParams, CancelAllAlgoOpenOrdersParams, ChangeInitialLeverageParams,
+    ChangeMarginTypeMarginTypeEnum, ChangeMarginTypeParams, NewAlgoOrderAlgoTypeEnum,
+    NewAlgoOrderClosePositionEnum, NewAlgoOrderParams, NewAlgoOrderPriceProtectEnum,
+    NewAlgoOrderSideEnum, NewAlgoOrderTypeEnum, NewAlgoOrderWorkingTypeEnum,
+    NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderReduceOnlyEnum, NewOrderSideEnum,
+    NewOrderTimeInForceEnum, NewOrderTypeEnum, QueryOrderParams, TestOrderNewOrderRespTypeEnum,
+    TestOrderParams, TestOrderReduceOnlyEnum, TestOrderSideEnum, TestOrderTimeInForceEnum,
+    TestOrderTypeEnum,
 };
 use binance_sdk::derivatives_trading_usds_futures::DerivativesTradingUsdsFuturesRestApi;
 use bot_core::{
@@ -14,7 +18,10 @@ use bot_core::{
     OrderExecutionMethod, Result, Side, TransportMode,
 };
 use chrono::Utc;
-use tracing::debug;
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 /// Official Binance USD-M Futures client built on top of
 /// `binance_sdk::derivatives_trading_usds_futures::DerivativesTradingUsdsFuturesRestApi`
@@ -29,6 +36,7 @@ pub struct BinanceFuturesClient {
     cfg: ExchangeConfig,
     http: reqwest::Client,
     sdk_client: Option<binance_sdk::derivatives_trading_usds_futures::rest_api::RestApi>,
+    filter_cache: RwLock<HashMap<String, SymbolFilters>>,
 }
 
 impl BinanceFuturesClient {
@@ -47,10 +55,17 @@ impl BinanceFuturesClient {
             None
         };
 
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Failed to build Futures HTTP client: {e}")))?;
+
         Ok(Self {
             cfg,
-            http: reqwest::Client::new(),
+            http,
             sdk_client,
+            filter_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -134,7 +149,12 @@ impl BinanceFuturesClient {
     /// Execute a live USD-M Futures order (and optional `/fapi/v1/algoOrder` TP/SL brackets)
     /// via `binance-sdk`. Skips margin/leverage updates on `reduce_only` exits to prevent `-4048`.
     pub async fn execute_futures_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
-        validate_live_safety(&self.cfg, ExchangeVenue::Futures, req)?;
+        let ref_px = req
+            .limit_price
+            .filter(|&p| p > 0.0)
+            .or_else(|| req.quote_order_qty.map(|q| q / req.quantity.max(1e-9)))
+            .unwrap_or(100.0);
+        validate_live_safety(&self.cfg, ExchangeVenue::Futures, req, ref_px)?;
         let sdk = self
             .sdk_client
             .as_ref()
@@ -152,11 +172,25 @@ impl BinanceFuturesClient {
             .is_some_and(|c| c.require_preflight_test_order);
 
         let sym = req.symbol.to_uppercase();
+        let filters = get_or_fetch_symbol_filters(
+            &self.http,
+            &self.filter_cache,
+            self.rest_base_url(),
+            ExchangeVenue::Futures,
+            &sym,
+            ref_px,
+        )
+        .await;
         let entry_buy = match req.side {
             Side::Long => !req.reduce_only,
             Side::Short => req.reduce_only,
         };
-        let qty_dec = to_binance_decimal(req.quantity, 3)?;
+        let (step, dec) = if matches!(req.order_method, OrderExecutionMethod::Market | OrderExecutionMethod::Oco) {
+            (filters.market_step_size, filters.market_step_decimals)
+        } else {
+            (filters.step_size, filters.step_decimals)
+        };
+        let qty_dec = to_binance_step_decimal(req.quantity, step, dec)?;
 
         if !req.reduce_only {
             let margin_enum = match self.cfg.margin_type {
@@ -168,7 +202,7 @@ impl BinanceFuturesClient {
             if let Ok(m_params) = m_builder.build() {
                 if let Err(err) = sdk.change_margin_type(m_params).await {
                     let msg = err.to_string();
-                    if !msg.contains("-4046") {
+                    if !msg.contains("-4046") && !msg.contains("-4048") {
                         return Err(BotError::RestApi(format!("Futures marginType error: {msg}")));
                     }
                 }
@@ -216,7 +250,11 @@ impl BinanceFuturesClient {
                     .limit_price
                     .ok_or_else(|| BotError::RestApi("Futures LIMIT order missing price".into()))?;
                 tb = tb
-                    .price(to_binance_decimal(px, 4)?)
+                    .price(to_binance_step_decimal(
+                        px,
+                        filters.tick_size,
+                        filters.tick_decimals,
+                    )?)
                     .time_in_force(if req.order_method == OrderExecutionMethod::LimitMaker {
                         TestOrderTimeInForceEnum::Gtx
                     } else {
@@ -259,7 +297,11 @@ impl BinanceFuturesClient {
                 .limit_price
                 .ok_or_else(|| BotError::RestApi("Futures LIMIT order missing price".into()))?;
             ob = ob
-                .price(to_binance_decimal(px, 4)?)
+                .price(to_binance_step_decimal(
+                    px,
+                    filters.tick_size,
+                    filters.tick_decimals,
+                )?)
                 .time_in_force(if req.order_method == OrderExecutionMethod::LimitMaker {
                     NewOrderTimeInForceEnum::Gtx
                 } else {
@@ -287,14 +329,47 @@ impl BinanceFuturesClient {
             .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(req.quantity);
-        let avg_price: f64 = resp
+        let mut avg_price: f64 = resp
             .price
             .as_deref()
             .and_then(|s| s.parse().ok())
             .filter(|&p| p > 0.0)
-            .unwrap_or_else(|| req.limit_price.unwrap_or(0.0));
+            .unwrap_or(0.0);
+
+        if avg_price <= 0.0 && exec_qty > 0.0 {
+            if let Some(oid) = resp.order_id {
+                if let Ok(q_params) = QueryOrderParams::builder(sym.clone())
+                    .order_id(oid)
+                    .recv_window(recv_window)
+                    .build()
+                {
+                    if let Ok(q_resp) = sdk.query_order(q_params).await {
+                        if let Ok(q_data) = q_resp.data().await {
+                            let queried_avg = q_data
+                                .avg_price
+                                .as_deref()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .filter(|&p| p > 0.0);
+                            let cum_avg = q_data
+                                .cum_quote
+                                .as_deref()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .filter(|&c| c > 0.0)
+                                .map(|c| c / exec_qty);
+                            if let Some(p) = queried_avg.or(cum_avg) {
+                                avg_price = p;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if avg_price <= 0.0 {
+            avg_price = req.limit_price.unwrap_or(0.0);
+        }
 
         let mut algo_order_ids = Vec::new();
+        let mut bracket_warning = None;
         if req.order_method == OrderExecutionMethod::Oco && exec_qty > 0.0 {
             let exit_side = if entry_buy {
                 NewAlgoOrderSideEnum::Sell
@@ -302,55 +377,97 @@ impl BinanceFuturesClient {
                 NewAlgoOrderSideEnum::Buy
             };
             if let Some(tp) = req.take_profit_price {
-                let tp_b = NewAlgoOrderParams::builder(
-                    NewAlgoOrderAlgoTypeEnum::Conditional,
-                    sym.clone(),
-                    exit_side.clone(),
-                    NewAlgoOrderTypeEnum::TakeProfitMarket,
-                )
-                .trigger_price(to_binance_decimal(tp, 4)?)
-                .close_position(NewAlgoOrderClosePositionEnum::True)
-                .working_type(NewAlgoOrderWorkingTypeEnum::MarkPrice)
-                .price_protect(NewAlgoOrderPriceProtectEnum::True)
-                .recv_window(recv_window);
-                if let Ok(tp_params) = tp_b.build() {
-                    if let Ok(tp_resp) = sdk.new_algo_order(tp_params).await {
-                        if let Ok(tp_data) = tp_resp.data().await {
-                            if let Some(id) = tp_data.algo_id {
-                                algo_order_ids.push(id);
+                match to_binance_step_decimal(tp, filters.tick_size, filters.tick_decimals)
+                    .and_then(|tp_dec| {
+                        NewAlgoOrderParams::builder(
+                            NewAlgoOrderAlgoTypeEnum::Conditional,
+                            sym.clone(),
+                            exit_side.clone(),
+                            NewAlgoOrderTypeEnum::TakeProfitMarket,
+                        )
+                        .trigger_price(tp_dec)
+                        .close_position(NewAlgoOrderClosePositionEnum::True)
+                        .working_type(NewAlgoOrderWorkingTypeEnum::MarkPrice)
+                        .price_protect(NewAlgoOrderPriceProtectEnum::True)
+                        .recv_window(recv_window)
+                        .build()
+                        .map_err(|e| BotError::RestApi(format!("Futures TP algoOrder params error: {e}")))
+                    }) {
+                    Ok(tp_params) => match sdk.new_algo_order(tp_params).await {
+                        Ok(r) => match r.data().await {
+                            Ok(tp_data) => {
+                                if let Some(id) = tp_data.algo_id {
+                                    algo_order_ids.push(id);
+                                }
                             }
-                        }
-                    }
+                            Err(e) => bracket_warning = Some(format!("Futures TP algoOrder decode failed: {e}")),
+                        },
+                        Err(e) => bracket_warning = Some(format!("Futures TP algoOrder failed: {e}")),
+                    },
+                    Err(e) => bracket_warning = Some(e.to_string()),
                 }
             }
             if let Some(sl) = req.stop_loss_price {
-                let sl_b = NewAlgoOrderParams::builder(
-                    NewAlgoOrderAlgoTypeEnum::Conditional,
-                    sym,
-                    exit_side,
-                    NewAlgoOrderTypeEnum::StopMarket,
-                )
-                .trigger_price(to_binance_decimal(sl, 4)?)
-                .close_position(NewAlgoOrderClosePositionEnum::True)
-                .working_type(NewAlgoOrderWorkingTypeEnum::MarkPrice)
-                .price_protect(NewAlgoOrderPriceProtectEnum::True)
-                .recv_window(recv_window);
-                if let Ok(sl_params) = sl_b.build() {
-                    if let Ok(sl_resp) = sdk.new_algo_order(sl_params).await {
-                        if let Ok(sl_data) = sl_resp.data().await {
-                            if let Some(id) = sl_data.algo_id {
-                                algo_order_ids.push(id);
+                match to_binance_step_decimal(sl, filters.tick_size, filters.tick_decimals)
+                    .and_then(|sl_dec| {
+                        NewAlgoOrderParams::builder(
+                            NewAlgoOrderAlgoTypeEnum::Conditional,
+                            sym.clone(),
+                            exit_side,
+                            NewAlgoOrderTypeEnum::StopMarket,
+                        )
+                        .trigger_price(sl_dec)
+                        .close_position(NewAlgoOrderClosePositionEnum::True)
+                        .working_type(NewAlgoOrderWorkingTypeEnum::MarkPrice)
+                        .price_protect(NewAlgoOrderPriceProtectEnum::True)
+                        .recv_window(recv_window)
+                        .build()
+                        .map_err(|e| BotError::RestApi(format!("Futures SL algoOrder params error: {e}")))
+                    }) {
+                    Ok(sl_params) => match sdk.new_algo_order(sl_params).await {
+                        Ok(r) => match r.data().await {
+                            Ok(sl_data) => {
+                                if let Some(id) = sl_data.algo_id {
+                                    algo_order_ids.push(id);
+                                }
+                            }
+                            Err(e) => {
+                                bracket_warning = Some(format!("Futures SL algoOrder decode failed: {e}"));
+                            }
+                        },
+                        Err(e) => {
+                            bracket_warning = Some(format!("Futures SL algoOrder failed: {e}"));
+                        }
+                    },
+                    Err(e) => {
+                        bracket_warning = Some(e.to_string());
+                    }
+                }
+                if bracket_warning.is_some() && !algo_order_ids.is_empty() {
+                    // Roll back the TP algo order so no unpaired closePosition trigger lingers
+                    for id in algo_order_ids.drain(..) {
+                        if let Ok(c_params) = CancelAlgoOrderParams::builder()
+                            .algo_id(id)
+                            .recv_window(recv_window)
+                            .build()
+                        {
+                            if let Err(cancel_err) = sdk.cancel_algo_order(c_params).await {
+                                warn!(algo_id = id, %cancel_err, "Failed to roll back TP algoOrder after SL error");
                             }
                         }
                     }
                 }
             }
         }
+        if let Some(ref w) = bracket_warning {
+            warn!(%w, "Futures entry filled; local exit engine still manages stops/targets");
+        }
 
         Ok(LiveOrderAck {
             order_id: resp.order_id.map(|id| id.to_string()),
             order_list_id: None,
             algo_order_ids,
+            bracket_warning,
             executed_qty: exec_qty,
             avg_price,
         })
@@ -360,7 +477,14 @@ impl BinanceFuturesClient {
         let Some(sdk) = self.sdk_client.as_ref() else {
             return Ok(());
         };
+        let recv_window = self
+            .cfg
+            .credentials
+            .as_ref()
+            .map(|c| c.recv_window_ms as i64)
+            .unwrap_or(5000);
         let params = CancelAllAlgoOpenOrdersParams::builder(symbol.to_uppercase())
+            .recv_window(recv_window)
             .build()
             .map_err(|e| BotError::RestApi(format!("Cancel algo params error: {e}")))?;
         sdk.cancel_all_algo_open_orders(params)

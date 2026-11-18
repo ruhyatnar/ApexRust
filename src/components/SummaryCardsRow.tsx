@@ -178,16 +178,18 @@ export const SummaryCardsRow: React.FC<SummaryCardsRowProps> = ({ snapshot, conf
                   strokeWidth="7"
                 />
               )}
-              <circle
-                cx="50"
-                cy="50"
-                r={radius}
-                fill="none"
-                stroke="#7DF2AD"
-                strokeWidth="7"
-                strokeDasharray={`${winStroke} ${circumference}`}
-                strokeLinecap="round"
-              />
+              {displayWins > 0 && (
+                <circle
+                  cx="50"
+                  cy="50"
+                  r={radius}
+                  fill="none"
+                  stroke="#7DF2AD"
+                  strokeWidth="7"
+                  strokeDasharray={`${winStroke} ${circumference}`}
+                  strokeLinecap="round"
+                />
+              )}
             </svg>
             <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
               <span className="text-[10px] text-slate-400">Total Trades</span>

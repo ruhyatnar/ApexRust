@@ -49,14 +49,20 @@ pub struct ControlRequest {
 
 pub fn router(state: WebState) -> Router {
     let origin_raw = state.engine.config().web.allowed_origin.trim().to_string();
+    let origins: Vec<HeaderValue> = origin_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| HeaderValue::from_str(s).ok())
+        .collect();
     let cors = if origin_raw.is_empty() || origin_raw == "*" {
         CorsLayer::new()
             .allow_origin(AllowOrigin::any())
             .allow_methods([Method::GET, Method::POST])
             .allow_headers([CONTENT_TYPE])
-    } else if let Ok(hv) = HeaderValue::from_str(&origin_raw) {
+    } else if !origins.is_empty() {
         CorsLayer::new()
-            .allow_origin(AllowOrigin::exact(hv))
+            .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::POST])
             .allow_headers([CONTENT_TYPE])
     } else {
@@ -101,6 +107,24 @@ async fn control_handler(
     State(state): State<WebState>,
     Json(req): Json<ControlRequest>,
 ) -> Json<serde_json::Value> {
+    if matches!(req.action, ControlAction::ManualOrder) {
+        if let Some(n) = req.notional_usdt {
+            if !n.is_finite() || n <= 0.0 {
+                return Json(serde_json::json!({
+                    "accepted": false,
+                    "error": "notional_usdt must be finite and > 0"
+                }));
+            }
+        }
+        if let Some(lp) = req.limit_price {
+            if !lp.is_finite() || lp <= 0.0 {
+                return Json(serde_json::json!({
+                    "accepted": false,
+                    "error": "limit_price must be finite and > 0"
+                }));
+            }
+        }
+    }
     let cmd = match req.action {
         ControlAction::Pause => EngineCommand::Pause,
         ControlAction::Resume => EngineCommand::Resume,
@@ -130,14 +154,25 @@ async fn handle_ws(mut socket: WebSocket, state: WebState) {
     let mut rx = state.engine.subscribe();
     let initial = state.engine.latest_snapshot_handle().read().await.clone();
     if let Ok(json) = serde_json::to_string(&initial) {
-        let _ = socket.send(Message::Text(json.into())).await;
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
     }
 
-    while let Ok(snap) = rx.recv().await {
-        if let Ok(json) = serde_json::to_string(&snap) {
-            if socket.send(Message::Text(json.into())).await.is_err() {
-                break;
+    loop {
+        match rx.recv().await {
+            Ok(snap) => {
+                if let Ok(json) = serde_json::to_string(&snap) {
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // Skip missed intermediate snapshots without disconnecting the WebSocket client
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }

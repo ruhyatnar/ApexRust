@@ -6,16 +6,147 @@ A full-stack quantitative cryptocurrency trading platform combining an interacti
 
 ## Table of Contents
 
-1. [System Architecture](#system-architecture)
-2. [Project Structure](#project-structure)
-3. [Core Trading & Quantitative Capabilities](#core-trading--quantitative-capabilities)
-4. [Web Command Center & Desktop PWA](#web-command-center--desktop-pwa)
-5. [Backend Proxy API (`server.ts`)](#backend-proxy-api-serverts)
-6. [Configuration, Persistence & Secret Hygiene](#configuration-persistence--secret-hygiene)
-7. [Rust Workspace (`rust-bot/`) & Headless Deployment](#rust-workspace-rust-bot--headless-deployment)
-8. [Quick Start & Environment Variables](#quick-start--environment-variables)
-9. [Verification & Test Suite](#verification--test-suite)
-10. [Additional Documentation](#additional-documentation)
+1. [Installation](#installation)
+2. [System Architecture](#system-architecture)
+3. [Project Structure](#project-structure)
+4. [Core Trading & Quantitative Capabilities](#core-trading--quantitative-capabilities)
+5. [Web Command Center & Desktop PWA](#web-command-center--desktop-pwa)
+6. [Backend Proxy API (`server.ts`)](#backend-proxy-api-serverts)
+7. [Configuration, Persistence & Secret Hygiene](#configuration-persistence--secret-hygiene)
+8. [Rust Workspace (`rust-bot/`) & Headless Deployment](#rust-workspace-rust-bot--headless-deployment)
+9. [Environment Variables (`server.ts`)](#environment-variables-serverts)
+10. [Verification & Test Suite](#verification--test-suite)
+11. [Additional Documentation](#additional-documentation)
+
+---
+
+## Installation
+
+### Quick Guided Installer (Recommended — Linux, macOS, Windows)
+
+Clone the repository and run the cross-platform installer. It checks/installs missing prerequisites (`Node.js ^20.19.0 || >=22.12.0`, Rust `>= 1.85.0`, and C/OpenSSL build headers) using user-local toolchains by default (prompting before any `sudo` call), builds the WebApp and/or Rust daemon, writes `.env` and a safe `paper_trading = true` `rust-bot/config/bot.toml`, and optionally registers auto-start services.
+
+```bash
+git clone <your-repo-url> ApexRust
+cd ApexRust
+
+# Linux / macOS:
+./install.sh
+
+# Windows (PowerShell — or double-click install.cmd):
+.\install.ps1
+```
+
+Once installed, manage everything with the bundled CLI (`./apexrust` on Linux/macOS, `.\apexrust.cmd` on Windows):
+
+```bash
+./apexrust start | stop | restart | status | logs -f | doctor | update
+./apexrust service install   # systemd --user (with optional --linger) / launchd / Scheduled Tasks
+./apexrust uninstall         # add --purge to remove .env, bot.toml, node_modules, dist & rust-bot/target
+```
+
+For unattended CI / server setup:
+
+```bash
+./install.sh --yes --non-interactive --components web --env testnet --venue spot --no-service
+```
+
+---
+
+### Manual Installation
+
+#### Prerequisites
+
+| Component | Requirement | Notes |
+| :--- | :--- | :--- |
+| **Node.js & npm** | Node `^20.19.0 \|\| >=22.12.0` & `npm` | Required for Web Command Center, Vite build & Express proxy |
+| **Rust Toolchain** | Rust `1.85+` (`cargo`, `rustc`) | Required for `rust-bot/` native trading daemon (install via [rustup.rs](https://rustup.rs)) |
+| **Linux Build Deps** | `build-essential`, `pkg-config`, `libssl-dev` | Required on Debian/Ubuntu when compiling Rust `openssl-sys` |
+| **Git** | `git 2.30+` | Used for repository cloning and sanitized Git config backups |
+
+### Step 1 — Clone the Repository
+
+```bash
+git clone <your-repo-url> ApexRust
+cd ApexRust
+```
+
+### Step 2 — Install WebApp & Proxy Dependencies
+
+```bash
+npm install
+```
+
+*(For production-only servers where you only need to serve a prebuilt `dist/` via `npm start`, `tsx` is included in `dependencies`, so `npm install --omit=dev` also works after `dist/` is built.)*
+
+### Step 3 — Configure & Build the Rust Desktop Engine (`rust-bot/`)
+
+```bash
+cd rust-bot
+cp config/bot.example.toml config/bot.toml
+cargo build --release -p bot-desktop
+cd ..
+```
+
+*(The compiled binary is output to `rust-bot/target/release/bot-desktop`. Keep `rust-bot/config/bot.toml` local—it is gitignored.)*
+
+### Step 4 — Configure API Credentials (Optional Pre-Load)
+
+You can configure Binance Spot / USD-M Futures credentials directly in the UI (**Bot → Live Credentials**), or pre-load them via a root `.env` file (gitignored) or shell environment variables:
+
+```bash
+# Example .env at repository root (optional; Paper Sandbox works with zero keys)
+PORT=3000
+BINANCE_ENVIRONMENT=Testnet
+BINANCE_VENUE=Spot
+BINANCE_AUTH_METHOD=HMAC-SHA256
+BINANCE_API_KEY=your_api_key
+BINANCE_API_SECRET=your_api_secret
+# Optional shared token protecting mutating /api/live/*, /api/orders/*, /api/git/* routes
+# APEXRUST_PROXY_TOKEN=your_local_secret_token
+```
+
+### Step 5 — Run the Application
+
+#### Option A: Development Mode (Express + Vite Middleware)
+
+```bash
+npm run dev
+# Serves WebApp & Proxy at http://localhost:3000
+```
+
+#### Option B: Production Mode (Built `dist/` + Express Proxy)
+
+```bash
+npm run lint
+npm run build
+npm start
+# Serves production bundle + PWA at http://localhost:3000
+```
+
+#### Option C: Native Rust Desktop / Headless Daemon
+
+```bash
+# Run from repo root or rust-bot/
+./rust-bot/target/release/bot-desktop --config rust-bot/config/bot.toml --web-port 8080
+# Serves Rust Axum telemetry API & WebSocket at http://127.0.0.1:8080
+```
+
+#### Verify Running Services
+
+```bash
+curl -s http://127.0.0.1:3000/api/health
+curl -s http://127.0.0.1:8080/api/health
+```
+
+#### Optional: Install Desktop PWA & OS Auto-Start Service
+
+- **Desktop App (PWA)**: Open `http://localhost:3000` in Chromium/Chrome/Edge and click **Install Desktop App** in the header bar.
+- **Auto-Start OS Service** (`systemd --user` on Linux with optional `loginctl enable-linger`, `launchd` LaunchAgent on macOS, or per-user Scheduled Task on Windows):
+  ```bash
+  ./apexrust service install        # user-local auto-start (add --system on Linux for /etc/systemd/system)
+  ./apexrust service uninstall      # remove registered auto-start services
+  ```
 
 ---
 
@@ -118,8 +249,7 @@ ApexRust Quant maintains parity across two runtimes sharing an identical domain 
     │   ├── bot.example.toml          # Reference Spot/Futures, Automation, Session Windows, Features & Risk config
     │   └── bot.synced.toml           # Auto-generated sanitized snapshot synced from Web Command Center
     ├── deploy/
-    │   ├── git-backup.sh             # Sanitized Git commit & push helper
-    │   └── rust-quant-bot.service    # Hardened Linux systemd unit file
+    │   └── git-backup.sh             # Sanitized Git commit & push helper
     ├── docs/
     │   ├── ARCHITECTURE.md
     │   ├── STRATEGY_GUIDE.md
@@ -295,51 +425,19 @@ cd rust-bot
 cp config/bot.example.toml config/bot.toml
 cargo build --release -p bot-desktop
 
-# Optional systemd daemon install (expects /etc/apexrust-quant/binance.env & /etc/apexrust-quant/bot.toml)
-sudo cp deploy/rust-quant-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now rust-quant-bot
-
-# Manual sanitized Git snapshot
+# Optional OS auto-start service install & sanitized Git snapshot
+../apexrust service install bot --linger
 ./deploy/git-backup.sh
 ```
 
 ---
 
-## Quick Start & Environment Variables
-
-### 1. Run the Web Command Center & Express Proxy
-
-```bash
-# 1. Install Node dependencies
-npm install
-
-# 2. Start full-stack dev server (Express + Vite on http://localhost:3000)
-npm run dev
-
-# 3. Type-check & build production bundle
-npm run lint
-npm run build
-
-# 4. Run production server serving dist/
-npm start
-```
-
-### 2. Run the Native Rust Engine (`rust-bot/`)
-
-Requires Rust `1.86+` / Cargo:
-
-```bash
-cd rust-bot
-cp config/bot.example.toml config/bot.toml
-cargo run --release -p bot-desktop -- --config config/bot.toml --web-port 8080
-```
-
-### 3. Environment Variables (`server.ts`)
+## Environment Variables (`server.ts`)
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` | `3000` | HTTP port for Express + Vite / `dist/` server |
+| `HOST` | `0.0.0.0` (`.env` defaults to `127.0.0.1`) | HTTP bind address (`0.0.0.0` when unset; installer sets `127.0.0.1` unless `--lan`) |
 | `BINANCE_ENVIRONMENT` | `Testnet` | `Testnet` or `Production` |
 | `BINANCE_VENUE` | `Spot` | `Spot` or `Futures` |
 | `BINANCE_AUTH_METHOD` | `HMAC-SHA256` | `HMAC-SHA256` or `Ed25519` |
@@ -367,6 +465,12 @@ npx --yes tsx --test \
   src/engine/sessionWindows.test.ts \
   src/engine/orderHistoryAnalytics.test.ts \
   src/engine/liveFillNotifications.test.ts
+```
+
+### Installer & Lifecycle CLI Tests
+
+```bash
+npm run test:installer
 ```
 
 ### Type-Check & Production Build

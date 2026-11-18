@@ -22,7 +22,4 @@ pub enum BotError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-
-    #[error("Internal engine error: {0}")]
-    Internal(String),
 }

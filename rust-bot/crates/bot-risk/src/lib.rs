@@ -113,6 +113,10 @@ impl RiskManager {
             return Err(BotError::RiskRejected("Zero stop distance".into()));
         }
 
+        if self.current_equity <= 0.0 {
+            return Err(BotError::RiskRejected("Account equity depleted".into()));
+        }
+
         let risk_usdt = self.current_equity * (self.trading_cfg.base_risk_per_trade_pct / 100.0);
         Ok(risk_usdt / stop_distance)
     }
@@ -169,7 +173,7 @@ impl RiskManager {
 
         // 4. Streak guards (do not downgrade an already Halted circuit breaker)
         if self.state != CircuitBreakerState::Halted {
-            if self.lose_streak >= self.risk_cfg.max_lose_streak {
+            if self.risk_cfg.max_lose_streak > 0 && self.lose_streak >= self.risk_cfg.max_lose_streak {
                 self.state = CircuitBreakerState::Cooldown;
                 let until = now + Duration::minutes(self.risk_cfg.streak_cooldown_minutes as i64);
                 self.cooldown_until = Some(until);
@@ -178,7 +182,7 @@ impl RiskManager {
                     self.lose_streak,
                     until.format("%H:%M:%S UTC")
                 ));
-            } else if self.win_streak >= self.risk_cfg.max_win_streak {
+            } else if self.risk_cfg.max_win_streak > 0 && self.win_streak >= self.risk_cfg.max_win_streak {
                 self.state = CircuitBreakerState::Cooldown;
                 let until = now + Duration::minutes(self.risk_cfg.streak_cooldown_minutes as i64);
                 self.cooldown_until = Some(until);
@@ -335,6 +339,38 @@ mod tests {
         assert!(rm.status().quarantined_pairs.contains(&"BTCUSDT".to_string()));
         rm.reset_circuit_breaker();
         assert!(rm.status().quarantined_pairs.is_empty());
+    }
+
+    #[test]
+    fn zero_equity_blocks_entry_and_zero_streak_threshold_does_not_trip() {
+        let risk_cfg = RiskConfig {
+            max_daily_drawdown_pct: 5.0,
+            max_pair_daily_drawdown_pct: 2.0,
+            max_daily_profit_pct: 10.0,
+            max_win_streak: 0,
+            max_lose_streak: 0,
+            streak_cooldown_minutes: 30,
+            flatten_on_circuit_breaker: true,
+        };
+        let trading_cfg = TradingConfig {
+            mode: StrategyMode::Scalping,
+            timeframe: "5m".into(),
+            pairs: vec!["BTCUSDT".into()],
+            max_concurrent_positions: 3,
+            base_risk_per_trade_pct: 0.75,
+            position_sizing_mode: bot_core::PositionSizingMode::FixedUsdt,
+            initial_equity_usdt: 0.0,
+            taker_fee_bps: 10.0,
+        };
+        let now = Utc::now();
+        let mut rm = RiskManager::new(risk_cfg, trading_cfg, now);
+        assert!(rm.authorize_entry("BTCUSDT", 100.0, 98.0, 0, now).is_err());
+
+        // With streak limits set to 0, consecutive wins/losses should NOT enter Cooldown
+        rm.record_realized_pnl("BTCUSDT", 10.0, now);
+        assert_ne!(rm.status().state, bot_core::CircuitBreakerState::Cooldown);
+        rm.record_realized_pnl("BTCUSDT", -10.0, now);
+        assert_ne!(rm.status().state, bot_core::CircuitBreakerState::Cooldown);
     }
 }
 

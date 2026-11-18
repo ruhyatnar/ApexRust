@@ -1,6 +1,0 @@
-{
-  "name": "ApexRust Quant — Binance Multi-Pair Trading Bot & Web Command Center",
-  "description": "Production-structured Rust trading bot workspace using the official Binance Rust SDK (WebSocket primary + REST fallback), multi-pair scalping & intraday trend-following indicators, ATR exit management, circuit breakers, and an interactive web command center.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

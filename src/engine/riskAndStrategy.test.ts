@@ -897,6 +897,117 @@ test('Parity fixes: buildExitPlan honors atrDynamicExits=false and promoteExtern
   assert.equal(btc.openPosition?.exchangeOrderId, '991122');
 });
 
+test('Audit regressions: closed-bar deduplication, vwap_reversion ADX bound, multi-target [30,40,30] allocation, and $0 balance Kelly cap', () => {
+  // 1. Repeated closed candles with identical openTimeMs must not re-trigger automated scans
+  const rt = new SimulationRuntime(DEFAULT_BOT_CONFIG, 1_763_280_000_000, { seedDemoData: false });
+  const eth = rt.snapshot.pairs.find((p) => p.symbol === 'ETHUSDT')!;
+  const lastClosed = eth.candles[eth.candles.length - 1];
+  const prevCandlesLen = eth.candles.length;
+  const scansBefore = rt.snapshot.autoStats.scansRun;
+  rt.stepBar(1_763_280_005_000, {
+    symbol: 'ETHUSDT',
+    candle: { ...lastClosed, isClosed: true },
+  });
+  assert.equal(eth.candles.length, prevCandlesLen);
+  assert.equal(rt.snapshot.autoStats.scansRun, scansBefore);
+
+  // 2. vwap_reversion blocks trending ADX even when vwapBiasFilter is disabled and vwap is null
+  const reversionCandle: Candle = {
+    openTimeMs: 1_763_280_300_000,
+    open: 97,
+    high: 98,
+    low: 96,
+    close: 96.5,
+    volume: 5000,
+    isClosed: true,
+  };
+  const reversionInd: IndicatorSnapshot = {
+    emaFast: 100,
+    emaMid: 100,
+    emaSlow: 100,
+    emaMacro: 100,
+    rsi: 31,
+    prevRsi: 29,
+    adx: 46, // > max(38, adxMinTrend+12)
+    plusDi: 12,
+    minusDi: 32,
+    atr: 2.0,
+    vwap: null,
+  };
+  const blockedHighAdx = evaluateEntrySignal(
+    'ETHUSDT',
+    reversionCandle,
+    reversionInd,
+    DEFAULT_BOT_CONFIG.trading,
+    DEFAULT_BOT_CONFIG.indicators,
+    reversionCandle.openTimeMs,
+    {
+      strategyProfile: 'vwap_reversion',
+      features: { ...DEFAULT_BOT_CONFIG.features, vwapBiasFilter: false },
+    }
+  );
+  assert.equal(blockedHighAdx, null);
+
+  // 3. Multi-target [30, 40, 30] allocates sequential remaining weights (30%, then 40/70, then FullClose)
+  const plan = buildExitPlan('Long', 100, 1.0, DEFAULT_BOT_CONFIG.exits);
+  plan.tpTargets = [
+    { id: 'tp1', pctOffset: 1, allocationPct: 30, targetPrice: 101, hit: false },
+    { id: 'tp2', pctOffset: 2, allocationPct: 40, targetPrice: 102, hit: false },
+    { id: 'tp3', pctOffset: 3, allocationPct: 30, targetPrice: 103, hit: false },
+  ];
+  const multiPos: Position = {
+    id: 'multi-tp',
+    symbol: 'BTCUSDT',
+    side: 'Long',
+    entryPrice: 100,
+    quantity: 10,
+    remainingQuantity: 10,
+    lockedMarginUsdt: 1000,
+    unrealizedPnlUsdt: 0,
+    realizedPnlUsdt: 0,
+    highestFavorablePrice: 100,
+    exitPlan: plan,
+    openedAtMs: 1_763_280_000_000,
+    rationale: 'test',
+  };
+  const a1 = managePositionTick(multiPos, 101.1, 1.0, DEFAULT_BOT_CONFIG.exits);
+  assert.equal(a1.type, 'PartialClose');
+  if (a1.type === 'PartialClose') {
+    assert.ok(Math.abs(a1.ratio - 0.3) < 1e-6);
+    multiPos.remainingQuantity *= 1 - a1.ratio;
+  }
+  const a2 = managePositionTick(multiPos, 102.1, 1.0, DEFAULT_BOT_CONFIG.exits);
+  assert.equal(a2.type, 'PartialClose');
+  if (a2.type === 'PartialClose') {
+    assert.ok(Math.abs(a2.ratio - 40 / 70) < 1e-6);
+    multiPos.remainingQuantity *= 1 - a2.ratio;
+  }
+  assert.ok(Math.abs(multiPos.remainingQuantity - 3.0) < 1e-6);
+  const a3 = managePositionTick(multiPos, 103.1, 1.0, DEFAULT_BOT_CONFIG.exits);
+  assert.equal(a3.type, 'FullClose');
+
+  // 4. Zero availableBalanceUsdt must cap notional at $0 instead of returning a synthetic $10 floor
+  const exp = computeExpectancyStats([], 0.75);
+  const kellyZeroEq = computeKellySizingAnalytics(exp, 0, 0.015, 0.75);
+  assert.equal(
+    kellyZeroEq.tiers.every((t) => t.notionalPositionUsdt === 0),
+    true
+  );
+  const sizedZero = calculateQuantitativePositionSizeUsdt({
+    mode: 'half_kelly',
+    fixedUsdt: 150,
+    equityUsdt: 1000,
+    availableBalanceUsdt: 0,
+    baseRiskPerTradePct: 0.75,
+    entryPrice: 100,
+    stopLossPrice: 98,
+    kelly: computeKellySizingAnalytics(exp, 1000, 0.02, 0.75),
+    venue: 'Spot',
+    leverage: 1,
+  });
+  assert.equal(sizedZero.notionalUsdt, 0);
+});
+
 
 
 

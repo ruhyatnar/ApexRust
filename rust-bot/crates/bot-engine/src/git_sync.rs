@@ -65,25 +65,31 @@ impl GitBackupSync {
             return Err(BotError::Config("git add returned non-zero status".into()));
         }
 
+        let targets = &args[1..];
+        let mut diff_args = vec!["diff", "--cached", "--quiet", "--"];
+        diff_args.extend_from_slice(targets);
         let diff_clean = Command::new("git")
             .current_dir(repo_root)
-            .args(["diff", "--cached", "--quiet"])
+            .args(&diff_args)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
 
         let mut committed = false;
         if !diff_clean {
+            // `--only` commits strictly backup targets without sweeping unrelated staged index changes
+            let mut commit_args = vec!["commit", "--only", "-m", message, "--"];
+            commit_args.extend_from_slice(targets);
             let commit_status = Command::new("git")
                 .current_dir(repo_root)
-                .args(["commit", "-m", message])
+                .args(&commit_args)
                 .status()
                 .map_err(|e| BotError::Config(format!("Failed to invoke git commit: {e}")))?;
             committed = commit_status.success();
         }
 
         let mut pushed = false;
-        if self.cfg.auto_push {
+        if self.cfg.auto_push && committed {
             let push_status = Command::new("git")
                 .current_dir(repo_root)
                 .args(["push", "-u", &self.cfg.remote_name, &self.cfg.branch])

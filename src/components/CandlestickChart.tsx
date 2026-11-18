@@ -47,7 +47,6 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   const [showIndicatorsMenu, setShowIndicatorsMenu] = useState(false);
   const [hideChart, setHideChart] = useState(false);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [activeTool, setActiveTool] = useState<'crosshair' | 'trend' | 'levels'>('crosshair');
 
   const visibleCount = 72;
   const candles = pair.candles.slice(-visibleCount);
@@ -286,38 +285,30 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
           <div className="hidden w-10 shrink-0 flex-col items-center gap-2 border-r border-white/[0.06] bg-[#10141B] py-3 sm:flex">
             <button
               type="button"
-              onClick={() => setActiveTool('crosshair')}
-              aria-label="Crosshair inspector"
-              className={`rounded p-1.5 transition ${
-                activeTool === 'crosshair'
-                  ? 'bg-white/10 text-[#7DF2AD]'
-                  : 'text-slate-500 hover:text-slate-200'
-              }`}
+              onClick={() => setHoverIdx(null)}
+              aria-label="Reset crosshair inspector"
+              className="rounded p-1.5 text-[#7DF2AD] transition hover:bg-white/10"
             >
               <Crosshair className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
               type="button"
-              onClick={() => {
-                setActiveTool('trend');
-                setShowEma((v) => !v);
-              }}
+              onClick={() => setShowEma((v) => !v)}
+              aria-pressed={showEma}
               aria-label="Toggle EMA trend lines"
               className={`rounded p-1.5 transition ${
-                showEma ? 'text-sky-400 hover:bg-white/5' : 'text-slate-500 hover:text-slate-200'
+                showEma ? 'bg-white/10 text-sky-400' : 'text-slate-500 hover:text-slate-200'
               }`}
             >
               <TrendingUp className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
               type="button"
-              onClick={() => {
-                setActiveTool('levels');
-                setShowBrackets((v) => !v);
-              }}
+              onClick={() => setShowBrackets((v) => !v)}
+              aria-pressed={showBrackets}
               aria-label="Toggle ATR SL and TP price levels"
               className={`rounded p-1.5 transition ${
-                showBrackets ? 'text-emerald-400 hover:bg-white/5' : 'text-slate-500 hover:text-slate-200'
+                showBrackets ? 'bg-white/10 text-emerald-400' : 'text-slate-500 hover:text-slate-200'
               }`}
             >
               <Minus className="h-4 w-4" aria-hidden="true" />
@@ -550,8 +541,17 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                 {showBrackets && pos && (
                   <g>
                     {[
-                      { label: 'TP2', price: pos.exitPlan.takeProfit2, color: '#10B981', dash: '4 3' },
-                      { label: 'TP1', price: pos.exitPlan.takeProfit1, color: '#34D399', dash: '2 2' },
+                      ...(pos.exitPlan.tpTargets && pos.exitPlan.tpTargets.length > 0
+                        ? pos.exitPlan.tpTargets.map((t, idx) => ({
+                            label: `TP${idx + 1}`,
+                            price: t.targetPrice,
+                            color: idx === pos.exitPlan.tpTargets!.length - 1 ? '#10B981' : '#34D399',
+                            dash: idx === pos.exitPlan.tpTargets!.length - 1 ? '4 3' : '2 2',
+                          }))
+                        : [
+                            { label: 'TP2', price: pos.exitPlan.takeProfit2, color: '#10B981', dash: '4 3' },
+                            { label: 'TP1', price: pos.exitPlan.takeProfit1, color: '#34D399', dash: '2 2' },
+                          ]),
                       { label: 'ENTRY', price: pos.entryPrice, color: '#3B82F6', dash: '' },
                       {
                         label: pos.exitPlan.trailingActive

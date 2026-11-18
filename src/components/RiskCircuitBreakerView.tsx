@@ -139,7 +139,9 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
           <button
             type="button"
             onClick={() => onSimulateLoss(snapshot.pairs[0]?.symbol ?? 'BTCUSDT', 135)}
-            className="rounded-md border border-amber-500/40 bg-amber-950/30 px-3 py-1.5 text-xs font-medium text-amber-200 transition hover:bg-amber-950/50 whitespace-nowrap"
+            disabled={snapshot.accountMode === 'Live'}
+            title={snapshot.accountMode === 'Live' ? 'Simulation stress test is Paper-only' : undefined}
+            className="rounded-md border border-amber-500/40 bg-amber-950/30 px-3 py-1.5 text-xs font-medium text-amber-200 transition hover:bg-amber-950/50 disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
           >
             Simulate -$135 Loss
           </button>
@@ -318,7 +320,24 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
               />
             </div>
 
-            <div className="flex items-center justify-between pt-4">
+            <div>
+              <label htmlFor="risk-streak-cooldown" className="block text-xs font-medium text-slate-400">
+                Streak Cooldown (min)
+              </label>
+              <input
+                id="risk-streak-cooldown"
+                type="number"
+                min="1"
+                max="240"
+                value={config.risk.streakCooldownMinutes}
+                onChange={(e) =>
+                  updateRisk('streakCooldownMinutes', Math.max(1, Number(e.target.value) || 30))
+                }
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div className="flex items-center justify-between pt-4 sm:col-span-2">
               <label htmlFor="risk-flatten" className="text-xs font-medium text-slate-300">
                 Flatten Open Positions on CB
               </label>

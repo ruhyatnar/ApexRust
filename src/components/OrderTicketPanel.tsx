@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { CheckCircle2, ChevronDown, Plus, Save, ShieldCheck, Sliders, X, XCircle, Zap } from 'lucide-react';
+import { CheckCircle2, ChevronDown, Plus, Save, ShieldCheck, Sliders, X, XCircle } from 'lucide-react';
 import {
   calculateQuantitativePositionSizeUsdt,
   computeExpectancyStats,
@@ -141,14 +141,29 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   const defaultLimitStr = (side === 'Long' ? bid : ask).toFixed(priceDecimals);
   const displayedLimitPrice = isCustomLimitPrice ? limitPriceInput : defaultLimitStr;
 
-  // Reset custom limit price flag when symbol changes
+  const feedbackTimerRef = React.useRef<number | null>(null);
+  const [tpCustomEdited, setTpCustomEdited] = useState(false);
+
+  React.useEffect(() => {
+    return () => {
+      if (feedbackTimerRef.current !== null) window.clearTimeout(feedbackTimerRef.current);
+    };
+  }, []);
+
+  const scheduleClearFeedback = (ms: number) => {
+    if (feedbackTimerRef.current !== null) window.clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = window.setTimeout(() => setFeedback(null), ms);
+  };
+
+  // Reset custom limit price flag and manual TP override when symbol changes
   React.useEffect(() => {
     setIsCustomLimitPrice(false);
+    setTpCustomEdited(false);
   }, [activePair.symbol]);
 
-  // Keep TP targets dynamically scaled to ATR when tpMode === 'ATR'
+  // Keep TP targets dynamically scaled to ATR when tpMode === 'ATR' (unless user edited targets)
   React.useEffect(() => {
-    if (tpMode !== 'ATR' || last <= 0) return;
+    if (tpMode !== 'ATR' || tpCustomEdited || last <= 0) return;
     const atr = activePair.indicators.atr ?? last * 0.01;
     const tp1Pct = Number((((atr * config.exits.atrTp1Multiplier) / last) * 100).toFixed(2));
     const tp2Pct = Number((((atr * config.exits.atrTp2Multiplier) / last) * 100).toFixed(2));
@@ -159,9 +174,9 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
     ]);
   }, [
     tpMode,
+    tpCustomEdited,
     activePair.symbol,
     activePair.indicators.atr,
-    last,
     config.exits.atrTp1Multiplier,
     config.exits.atrTp2Multiplier,
     config.exits.tp1CloseRatio,
@@ -178,13 +193,21 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   const computedStopLossPrice = useMemo(() => {
     const atr = activePair.indicators.atr ?? entryReferencePrice * 0.01;
     const dist =
-      stopLossMode === 'ATR'
+      stopLossMode === 'ATR' && config.features.atrDynamicExits
         ? atr * config.exits.atrSlMultiplier
         : entryReferencePrice * (Math.max(0.2, stopLossPct) / 100);
     return side === 'Long'
       ? Math.max(0.0001, entryReferencePrice - dist)
       : entryReferencePrice + dist;
-  }, [activePair.indicators.atr, config.exits.atrSlMultiplier, entryReferencePrice, side, stopLossMode, stopLossPct]);
+  }, [
+    activePair.indicators.atr,
+    config.exits.atrSlMultiplier,
+    config.features.atrDynamicExits,
+    entryReferencePrice,
+    side,
+    stopLossMode,
+    stopLossPct,
+  ]);
 
   const expectancyStats = useMemo(
     () => computeExpectancyStats(snapshot.recentTrades, config.trading.baseRiskPerTradePct),
@@ -288,6 +311,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   ]);
 
   const handleSliderPct = (pct: number) => {
+    setSizingMode('fixed_usdt');
     setAllocPct(pct);
     if (pct === 0) {
       setUsdtAmount(0);
@@ -299,6 +323,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
 
   const handleAddTarget = () => {
     if (targets.length >= 4) return;
+    setTpCustomEdited(true);
     const prev = targets[targets.length - 1];
     setTargets([
       ...targets,
@@ -312,6 +337,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
 
   const handleRemoveTarget = (id: string) => {
     if (targets.length <= 1) return;
+    setTpCustomEdited(true);
     setTargets(targets.filter((t) => t.id !== id));
   };
 
@@ -348,7 +374,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
     } else {
       setFeedback({ type: 'err', text: res.reason });
     }
-    window.setTimeout(() => setFeedback(null), 5000);
+    scheduleClearFeedback(5000);
   };
 
   const handleSavePreset = () => {
@@ -379,7 +405,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
       type: 'ok',
       text: `Saved ${orderType} preset (${targets.length} TP targets, ${stopLossMode} SL)`,
     });
-    window.setTimeout(() => setFeedback(null), 3000);
+    scheduleClearFeedback(3000);
   };
 
   const coinCode = activePair.symbol.replace('USDT', '');
@@ -704,8 +730,9 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
           <input
             id="ticket-usdt-input"
             type="number"
-            min="10"
-            step="10"
+            min={sizingMode === 'fixed_usdt' && amountUnit === '%' ? 1 : 10}
+            max={sizingMode === 'fixed_usdt' && amountUnit === '%' ? 100 : undefined}
+            step={sizingMode === 'fixed_usdt' && amountUnit === '%' ? 5 : 10}
             value={sizingMode === 'fixed_usdt' ? (amountUnit === 'USDT' ? usdtAmount : allocPct) : effectiveUsdt}
             onChange={(e) => {
               const v = Math.max(0, Number(e.target.value) || 0);
@@ -806,7 +833,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
               className="w-full bg-transparent px-2 py-2 text-right font-mono text-xs font-semibold tabular-nums text-slate-100 focus:outline-none"
             />
             <span className="flex items-center px-2 font-mono text-[11px] text-slate-400">
-              {stopLossMode === 'ATR' ? 'ATR%' : 'USDT'}
+              {stopLossMode === 'ATR' ? 'ATR%' : '%'}
             </span>
             <button
               type="button"
@@ -834,7 +861,11 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
               <select
                 id="ticket-tp-mode"
                 value={tpMode}
-                onChange={(e) => setTpMode(e.target.value as 'MARKET' | 'ATR')}
+                onChange={(e) => {
+                  const nextMode = e.target.value as 'MARKET' | 'ATR';
+                  setTpMode(nextMode);
+                  if (nextMode === 'ATR') setTpCustomEdited(false);
+                }}
                 className="bg-transparent font-mono text-xs font-semibold text-slate-100 focus:outline-none"
               >
                 <option value="MARKET" className="bg-[#141820]">MARKET</option>
@@ -866,6 +897,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
                     value={t.pctOffset}
                     onChange={(e) => {
                       const val = Number(e.target.value) || 0;
+                      setTpCustomEdited(true);
                       setTargets((prev) =>
                         prev.map((item) => (item.id === t.id ? { ...item, pctOffset: val } : item))
                       );
@@ -887,6 +919,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
                     value={t.allocationPct}
                     onChange={(e) => {
                       const val = Math.min(100, Math.max(5, Number(e.target.value) || 0));
+                      setTpCustomEdited(true);
                       setTargets((prev) =>
                         prev.map((item) =>
                           item.id === t.id ? { ...item, allocationPct: val } : item
@@ -982,20 +1015,9 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
               type="button"
               onClick={() => setTriggerRef((r) => (r === 'LAST' ? 'MARK' : 'LAST'))}
               className="rounded-md border border-white/[0.06] bg-[#0D1015] px-2 py-1.5 font-mono text-[11px] text-slate-300 hover:text-white"
+              title="Condition trigger price source"
             >
               {triggerRef}
-            </button>
-            <button
-              type="button"
-              onClick={() => setUseTrailingStop((t) => !t)}
-              className={`flex items-center gap-1 rounded-md border px-2 py-1.5 text-[11px] font-medium transition ${
-                useTrailingStop
-                  ? 'border-amber-400/35 bg-amber-950/30 text-amber-200'
-                  : 'border-white/[0.06] bg-[#0D1015] text-slate-400'
-              }`}
-            >
-              <Zap className="h-3 w-3" aria-hidden="true" />
-              Triggers
             </button>
             <button
               type="button"

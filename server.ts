@@ -53,7 +53,11 @@ function loadInitialSecret(): string {
     if (keyPath) {
       try {
         return fs.readFileSync(path.resolve(process.cwd(), keyPath), 'utf8').trim();
-      } catch {
+      } catch (err) {
+        console.warn(
+          `[server] Failed to read BINANCE_PRIVATE_KEY_PATH (${keyPath}):`,
+          err instanceof Error ? err.message : String(err)
+        );
         return '';
       }
     }
@@ -328,9 +332,18 @@ function loadOrderLogsFromDisk(): BackendOrderExecutionLog[] {
   return seeded;
 }
 
+function sanitizeSymbol(raw: unknown, fallback = ''): string {
+  const clean = String(raw ?? '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '');
+  return clean || fallback;
+}
+
 function saveOrderLogsToDisk(logs: BackendOrderExecutionLog[]): void {
   try {
-    fs.writeFileSync(ORDER_LOGS_FILE, JSON.stringify(logs.slice(0, 500), null, 2), 'utf8');
+    const tmpFile = `${ORDER_LOGS_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(logs.slice(0, 500), null, 2), 'utf8');
+    fs.renameSync(tmpFile, ORDER_LOGS_FILE);
   } catch {
     // Ignore read-only filesystem errors
   }
@@ -345,19 +358,29 @@ function upsertOrderLogs(entries: BackendOrderExecutionLog[]): number {
   for (const existing of orderExecutionLogs) {
     byId.set(existing.id, existing);
     byComposite.set(
-      `${existing.accountMode}:${existing.symbol}:${existing.orderId}:${existing.lifecycle}:${existing.status}`,
+      `${existing.accountMode}:${existing.environment}:${existing.venue}:${existing.symbol}:${existing.orderId}:${existing.lifecycle}`,
       existing.id
     );
   }
   for (const item of entries) {
-    const composite = `${item.accountMode}:${item.symbol}:${item.orderId}:${item.lifecycle}:${item.status}`;
+    const composite = `${item.accountMode}:${item.environment}:${item.venue}:${item.symbol}:${item.orderId}:${item.lifecycle}`;
     const existingId = byId.has(item.id) ? item.id : byComposite.get(composite);
     if (!existingId) {
       added += 1;
       byId.set(item.id, item);
       byComposite.set(composite, item.id);
     } else {
-      byId.set(existingId, { ...byId.get(existingId)!, ...item, id: existingId });
+      const prev = byId.get(existingId)!;
+      const fromClientLive = item.id.startsWith('client-live-') && prev.source === 'live_proxy';
+      byId.set(existingId, {
+        ...prev,
+        ...item,
+        latencyMs: fromClientLive ? prev.latencyMs : item.latencyMs ?? prev.latencyMs,
+        endpoint: fromClientLive ? prev.endpoint : item.endpoint,
+        algoOrderIds: item.algoOrderIds ?? prev.algoOrderIds,
+        orderListId: item.orderListId ?? prev.orderListId,
+        id: existingId,
+      });
     }
   }
   orderExecutionLogs = Array.from(byId.values())
@@ -439,9 +462,10 @@ const symbolFilterCache = new Map<string, SymbolFilters>();
 
 function countStepDecimals(stepStr: string): number {
   if (!stepStr) return 0;
-  const sciMatch = stepStr.trim().match(/e-(\d+)$/i);
+  const sciMatch = stepStr.trim().match(/^(\d+(?:\.(\d+))?)e-(\d+)$/i);
   if (sciMatch) {
-    return Number(sciMatch[1]) || 0;
+    const mantissaFrac = (sciMatch[2] ?? '').replace(/0+$/, '').length;
+    return (Number(sciMatch[3]) || 0) + mantissaFrac;
   }
   if (!stepStr.includes('.')) return 0;
   const trimmed = stepStr.replace(/0+$/, '');
@@ -537,8 +561,7 @@ async function getSymbolFilters(
           marketMinQty: Number(marketLotFilter?.minQty ?? lotFilter?.minQty ?? 0) || 0,
           marketMaxQty: Number(marketLotFilter?.maxQty ?? lotFilter?.maxQty ?? 0) || 0,
           minNotional:
-            Number(notionalFilter?.minNotional ?? notionalFilter?.notional ?? 0) ||
-            (venue === 'Futures' ? 5 : 5),
+            Number(notionalFilter?.minNotional ?? notionalFilter?.notional ?? 0) || 5,
           maxNotional: Number(notionalFilter?.maxNotional ?? 0) || 0,
           quoteDecimals,
           fetchedAtMs: Date.now(),
@@ -623,14 +646,44 @@ async function fetchPublicPrice(symbol: string, venue: ExchangeVenue): Promise<n
 
 const serverTimeOffsetCache = new Map<string, { offsetMs: number; syncedAtMs: number }>();
 
-async function getSyncedBinanceTimestamp(venue: ExchangeVenue): Promise<number> {
-  const key = `${vault.environment}:${venue}`;
-  const cached = serverTimeOffsetCache.get(key);
+interface VaultAuthSnapshot {
+  environment: BinanceEnv;
+  authMethod: AuthMethod;
+  apiKey: string;
+  apiSecret: string;
+  recvWindowMs: number;
+}
+
+function captureVaultAuthSnapshot(): VaultAuthSnapshot {
+  return {
+    environment: vault.environment,
+    authMethod: vault.authMethod,
+    apiKey: vault.apiKey,
+    apiSecret: vault.apiSecret,
+    recvWindowMs: vault.recvWindowMs,
+  };
+}
+
+function safeTokenMatch(provided: string, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(provided, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+async function getSyncedBinanceTimestamp(
+  venue: ExchangeVenue,
+  env: BinanceEnv = vault.environment,
+  forceRefresh = false
+): Promise<number> {
+  const key = `${env}:${venue}`;
+  const cached = !forceRefresh ? serverTimeOffsetCache.get(key) : undefined;
   if (cached && Date.now() - cached.syncedAtMs < 300_000) {
     return Date.now() + cached.offsetMs;
   }
   try {
-    const baseUrl = getRestBaseUrl(vault.environment, venue);
+    const baseUrl = getRestBaseUrl(env, venue);
     const timePath = venue === 'Futures' ? `${baseUrl}/fapi/v1/time` : `${baseUrl}/api/v3/time`;
     const before = Date.now();
     const resp = await fetch(timePath, { signal: AbortSignal.timeout(2500) });
@@ -654,46 +707,57 @@ async function signedBinanceRequest(
   method: 'GET' | 'POST' | 'DELETE',
   endpointPath: string,
   params: Record<string, string | number>,
-  venue: ExchangeVenue = vault.venue
+  venue: ExchangeVenue = vault.venue,
+  authSnap: VaultAuthSnapshot = captureVaultAuthSnapshot()
 ) {
-  const baseUrl = getRestBaseUrl(vault.environment, venue);
-  const syncedTimestamp = await getSyncedBinanceTimestamp(venue);
-  const allParams = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    allParams.set(k, String(v));
+  const baseUrl = getRestBaseUrl(authSnap.environment, venue);
+
+  const attempt = async (forceTimeResync: boolean) => {
+    const syncedTimestamp = await getSyncedBinanceTimestamp(venue, authSnap.environment, forceTimeResync);
+    const allParams = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      allParams.set(k, String(v));
+    }
+    allParams.set('recvWindow', String(authSnap.recvWindowMs));
+    allParams.set('timestamp', String(syncedTimestamp));
+
+    const query = allParams.toString();
+    const signature = signPayload(query, authSnap.authMethod, authSnap.apiSecret);
+    const signedQuery = `${query}&signature=${encodeURIComponent(signature)}`;
+
+    const url =
+      method === 'GET' || method === 'DELETE'
+        ? `${baseUrl}${endpointPath}?${signedQuery}`
+        : `${baseUrl}${endpointPath}`;
+
+    const startedAt = Date.now();
+    const resp = await fetch(url, {
+      method,
+      headers: {
+        'X-MBX-APIKEY': authSnap.apiKey,
+        ...(method === 'POST' ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
+      },
+      ...(method === 'POST' ? { body: signedQuery } : {}),
+      signal: AbortSignal.timeout(8000),
+    });
+    const latencyMs = Date.now() - startedAt;
+    const usedWeight1m = Number(resp.headers.get('x-mbx-used-weight-1m') ?? 0) || undefined;
+    const rawText = await resp.text();
+    let data: Record<string, unknown> = {};
+    try {
+      data = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
+    } catch {
+      data = { rawText };
+    }
+    return { ok: resp.ok, status: resp.status, latencyMs, usedWeight1m, data };
+  };
+
+  const first = await attempt(false);
+  if (!first.ok && Number(first.data.code) === -1021) {
+    serverTimeOffsetCache.delete(`${authSnap.environment}:${venue}`);
+    return attempt(true);
   }
-  allParams.set('recvWindow', String(vault.recvWindowMs));
-  allParams.set('timestamp', String(syncedTimestamp));
-
-  const query = allParams.toString();
-  const signature = signPayload(query, vault.authMethod, vault.apiSecret);
-  const signedQuery = `${query}&signature=${encodeURIComponent(signature)}`;
-
-  const url =
-    method === 'GET' || method === 'DELETE'
-      ? `${baseUrl}${endpointPath}?${signedQuery}`
-      : `${baseUrl}${endpointPath}`;
-
-  const startedAt = Date.now();
-  const resp = await fetch(url, {
-    method,
-    headers: {
-      'X-MBX-APIKEY': vault.apiKey,
-      ...(method === 'POST' ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
-    },
-    ...(method === 'POST' ? { body: signedQuery } : {}),
-    signal: AbortSignal.timeout(8000),
-  });
-  const latencyMs = Date.now() - startedAt;
-  const usedWeight1m = Number(resp.headers.get('x-mbx-used-weight-1m') ?? 0) || undefined;
-  const rawText = await resp.text();
-  let data: Record<string, unknown> = {};
-  try {
-    data = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {};
-  } catch {
-    data = { rawText };
-  }
-  return { ok: resp.ok, status: resp.status, latencyMs, usedWeight1m, data };
+  return first;
 }
 
 const futuresDualSideCache = new Map<string, { dualSide: boolean; checkedAtMs: number }>();
@@ -717,7 +781,7 @@ async function getFuturesDualSideMode(): Promise<boolean> {
   return false;
 }
 
-function parseFillMetrics(data: Record<string, unknown>, refPrice: number) {
+function parseFillMetrics(data: Record<string, unknown>, refPrice: number, baseAsset = '') {
   const executedQty = Number(data.executedQty ?? 0) || 0;
   const cumQuote = Number(data.cummulativeQuoteQty ?? data.cumQuote ?? 0) || 0;
   const fills = Array.isArray(data.fills)
@@ -732,6 +796,7 @@ function parseFillMetrics(data: Record<string, unknown>, refPrice: number) {
   let weightedQuote = 0;
   let weightedQty = 0;
   let totalCommission = 0;
+  let baseCommission = 0;
   let commissionAsset = 'USDT';
   for (const f of fills) {
     const fq = Number(f.qty ?? 0) || 0;
@@ -742,7 +807,12 @@ function parseFillMetrics(data: Record<string, unknown>, refPrice: number) {
       weightedQuote += fq * fp;
     }
     totalCommission += fc;
-    if (f.commissionAsset) commissionAsset = f.commissionAsset;
+    if (f.commissionAsset) {
+      commissionAsset = f.commissionAsset;
+      if (baseAsset && f.commissionAsset.toUpperCase() === baseAsset.toUpperCase()) {
+        baseCommission += fc;
+      }
+    }
   }
 
   let avgPrice = 0;
@@ -758,6 +828,7 @@ function parseFillMetrics(data: Record<string, unknown>, refPrice: number) {
     executedQty: executedQty > 0 ? executedQty : weightedQty,
     avgPrice,
     commission: totalCommission,
+    baseCommission,
     commissionAsset,
   };
 }
@@ -840,6 +911,34 @@ function tomlStr(val: unknown): string {
     .replace(/\r?\n/g, ' ');
 }
 
+function tomlNum(val: unknown, fallback: number): number {
+  if (val === null || val === undefined || val === '') return fallback;
+  const n = Number(val);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const DEFAULT_FEATURE_TOGGLES: Record<string, boolean> = {
+  automated_trading: true,
+  manual_trading: true,
+  signal_generator: true,
+  ws_primary_feed: true,
+  rest_fallback: true,
+  ema_trend_filter: true,
+  rsi_momentum_filter: true,
+  adx_strength_filter: true,
+  vwap_bias_filter: true,
+  volume_confirmation_filter: false,
+  session_window_filter: false,
+  atr_dynamic_exits: true,
+  take_profit_ladder: true,
+  break_even_stop: true,
+  trailing_stop: true,
+  circuit_breaker: true,
+  spot_market: true,
+  futures_market: true,
+  git_auto_backup: true,
+};
+
 function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
   const cfg = (body.config ?? {}) as Record<string, unknown>;
   const trading = (cfg.trading ?? {}) as Record<string, unknown>;
@@ -847,10 +946,13 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
   const automation = (cfg.automation ?? {}) as Record<string, unknown>;
   const exits = (cfg.exits ?? {}) as Record<string, unknown>;
   const risk = (cfg.risk ?? {}) as Record<string, unknown>;
-  const features = (cfg.features ?? {}) as Record<string, unknown>;
-  const pairs = Array.isArray(trading.pairs) ? (trading.pairs as string[]) : ['BTCUSDT', 'ETHUSDT'];
+  const rawFeatures = (cfg.features ?? {}) as Record<string, unknown>;
+  const rawPairs = Array.isArray(trading.pairs)
+    ? (trading.pairs as unknown[]).map((p) => sanitizeSymbol(p)).filter(Boolean)
+    : [];
+  const pairs = rawPairs.length > 0 ? rawPairs : ['BTCUSDT', 'ETHUSDT'];
   const envLower = vault.environment.toLowerCase();
-  const venueLower = String(trading.venue ?? vault.venue).toLowerCase();
+  const venueLower = String(trading.venue ?? vault.venue).toLowerCase() === 'futures' ? 'futures' : 'spot';
   const isFutures = venueLower === 'futures';
   const isProd = envLower === 'production';
   const wsStreamUrl = isFutures
@@ -869,6 +971,29 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
       : 'wss://ws-api.testnet.binance.vision/ws-api/v3';
   const restBaseUrl = getRestBaseUrl(vault.environment, isFutures ? 'Futures' : 'Spot');
 
+  const marginUpper = String(trading.marginType ?? vault.marginType).toUpperCase() === 'CROSSED' ? 'CROSSED' : 'ISOLATED';
+  const modeLower = String(trading.mode ?? 'scalping').toLowerCase() === 'intraday' ? 'intraday' : 'scalping';
+  const sizingLower = String(trading.positionSizingMode ?? 'fixed_usdt').toLowerCase();
+  const profileLower = String(automation.strategyProfile ?? 'trend_pullback').toLowerCase();
+  const dirLower = String(automation.directionPolicy ?? 'long_only').toLowerCase();
+  const rawMethod = String(automation.orderMethod ?? 'MARKET').toUpperCase();
+  const orderMethodUpper =
+    rawMethod === 'LIMIT' || rawMethod === 'LIMIT_MAKER' || rawMethod === 'OCO' ? rawMethod : 'MARKET';
+  const tifUpper =
+    String(automation.timeInForce ?? 'GTC').toUpperCase() === 'IOC'
+      ? 'IOC'
+      : String(automation.timeInForce ?? 'GTC').toUpperCase() === 'FOK'
+        ? 'FOK'
+        : 'GTC';
+
+  const normalizedFeatures: Record<string, boolean> = { ...DEFAULT_FEATURE_TOGGLES };
+  for (const [k, v] of Object.entries(rawFeatures)) {
+    const snake = k.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`).replace(/[^a-z0-9_]/g, '');
+    if (snake in normalizedFeatures) {
+      normalizedFeatures[snake] = Boolean(v);
+    }
+  }
+
   const sessionWindows = Array.isArray(automation.sessionWindows)
     ? (automation.sessionWindows as Array<Record<string, unknown>>)
     : [];
@@ -881,8 +1006,8 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     '[exchange]',
     `environment = "${tomlStr(envLower)}"`,
     `venue = "${tomlStr(venueLower)}"`,
-    `leverage = ${Number(trading.leverage ?? vault.leverage)}`,
-    `margin_type = "${tomlStr(trading.marginType ?? vault.marginType)}"`,
+    `leverage = ${Math.min(20, Math.max(1, Math.round(tomlNum(trading.leverage, vault.leverage))))}`,
+    `margin_type = "${marginUpper}"`,
     `paper_trading = ${!vault.armedForLiveOrders}`,
     `ws_stream_url = "${wsStreamUrl}"`,
     `ws_api_url = "${wsApiUrl}"`,
@@ -894,24 +1019,24 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     'max_consecutive_rest_failures = 5',
     '',
     '[trading]',
-    `mode = "${tomlStr(trading.mode ?? 'scalping')}"`,
+    `mode = "${modeLower}"`,
     `timeframe = "${tomlStr(trading.timeframe ?? '5m')}"`,
     `pairs = [${pairs.map((p) => `"${tomlStr(p)}"`).join(', ')}]`,
-    `max_concurrent_positions = ${Number(trading.maxConcurrentPositions ?? 3)}`,
-    `base_risk_per_trade_pct = ${Number(trading.baseRiskPerTradePct ?? 0.75)}`,
-    `position_sizing_mode = "${tomlStr(trading.positionSizingMode ?? 'fixed_usdt')}"`,
-    `initial_equity_usdt = ${Number(trading.initialEquityUsdt ?? 10000)}`,
-    `taker_fee_bps = ${Number(trading.takerFeeBps ?? 10)}`,
+    `max_concurrent_positions = ${Math.max(1, Math.round(tomlNum(trading.maxConcurrentPositions, 3)))}`,
+    `base_risk_per_trade_pct = ${tomlNum(trading.baseRiskPerTradePct, 0.75)}`,
+    `position_sizing_mode = "${tomlStr(sizingLower)}"`,
+    `initial_equity_usdt = ${Math.max(1, tomlNum(trading.initialEquityUsdt, 10000))}`,
+    `taker_fee_bps = ${Math.max(0, tomlNum(trading.takerFeeBps, 10))}`,
     '',
     '[automation]',
     `enabled = ${Boolean(automation.enabled ?? true)}`,
-    `strategy_profile = "${tomlStr(automation.strategyProfile ?? 'trend_pullback')}"`,
-    `direction_policy = "${tomlStr(automation.directionPolicy ?? 'long_only')}"`,
-    `order_method = "${tomlStr(automation.orderMethod ?? 'MARKET')}"`,
-    `limit_offset_bps = ${Number(automation.limitOffsetBps ?? 5)}`,
-    `time_in_force = "${tomlStr(automation.timeInForce ?? 'GTC')}"`,
-    `signal_cooldown_bars = ${Number(automation.signalCooldownBars ?? 2)}`,
-    `auto_order_notional_usdt = ${Number(automation.autoOrderNotionalUsdt ?? 150)}`,
+    `strategy_profile = "${tomlStr(profileLower)}"`,
+    `direction_policy = "${tomlStr(dirLower)}"`,
+    `order_method = "${orderMethodUpper}"`,
+    `limit_offset_bps = ${Math.max(0, tomlNum(automation.limitOffsetBps, 5))}`,
+    `time_in_force = "${tifUpper}"`,
+    `signal_cooldown_bars = ${Math.max(0, Math.round(tomlNum(automation.signalCooldownBars, 2)))}`,
+    `auto_order_notional_usdt = ${Math.max(10, tomlNum(automation.autoOrderNotionalUsdt, 150))}`,
     `auto_close_on_exit = ${Boolean(automation.autoCloseOnExit ?? true)}`,
     ...sessionWindows.flatMap((w) => [
       '',
@@ -924,46 +1049,46 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     ]),
     '',
     '[indicators]',
-    `ema_fast = ${Number(indicators.emaFast ?? 9)}`,
-    `ema_mid = ${Number(indicators.emaMid ?? 21)}`,
-    `ema_slow = ${Number(indicators.emaSlow ?? 50)}`,
-    `ema_macro = ${Number(indicators.emaMacro ?? 200)}`,
-    `rsi_period = ${Number(indicators.rsiPeriod ?? 14)}`,
-    `rsi_long_pullback_min = ${Number(indicators.rsiLongPullbackMin ?? 42)}`,
-    `rsi_long_pullback_max = ${Number(indicators.rsiLongPullbackMax ?? 58)}`,
-    `rsi_short_pullback_min = ${Number(indicators.rsiShortPullbackMin ?? 42)}`,
-    `rsi_short_pullback_max = ${Number(indicators.rsiShortPullbackMax ?? 58)}`,
-    `adx_period = ${Number(indicators.adxPeriod ?? 14)}`,
-    `adx_min_trend = ${Number(indicators.adxMinTrend ?? 25)}`,
-    `atr_period = ${Number(indicators.atrPeriod ?? 14)}`,
+    `ema_fast = ${Math.max(2, Math.round(tomlNum(indicators.emaFast, 9)))}`,
+    `ema_mid = ${Math.max(3, Math.round(tomlNum(indicators.emaMid, 21)))}`,
+    `ema_slow = ${Math.max(5, Math.round(tomlNum(indicators.emaSlow, 50)))}`,
+    `ema_macro = ${Math.max(20, Math.round(tomlNum(indicators.emaMacro, 200)))}`,
+    `rsi_period = ${Math.max(2, Math.round(tomlNum(indicators.rsiPeriod, 14)))}`,
+    `rsi_long_pullback_min = ${tomlNum(indicators.rsiLongPullbackMin, 42)}`,
+    `rsi_long_pullback_max = ${tomlNum(indicators.rsiLongPullbackMax, 58)}`,
+    `rsi_short_pullback_min = ${tomlNum(indicators.rsiShortPullbackMin, 42)}`,
+    `rsi_short_pullback_max = ${tomlNum(indicators.rsiShortPullbackMax, 58)}`,
+    `adx_period = ${Math.max(2, Math.round(tomlNum(indicators.adxPeriod, 14)))}`,
+    `adx_min_trend = ${tomlNum(indicators.adxMinTrend, 25)}`,
+    `atr_period = ${Math.max(2, Math.round(tomlNum(indicators.atrPeriod, 14)))}`,
     `require_vwap_alignment = ${Boolean(indicators.requireVwapAlignment ?? true)}`,
-    `min_volume_expansion_mult = ${Number(indicators.minVolumeExpansionMult ?? 1.5)}`,
+    `min_volume_expansion_mult = ${tomlNum(indicators.minVolumeExpansionMult, 1.5)}`,
     `volatility_alerts_enabled = ${Boolean(indicators.volatilityAlertsEnabled ?? true)}`,
-    `atr_spike_pct_threshold = ${Number(indicators.atrSpikePctThreshold ?? 0.45)}`,
-    `atr_expansion_ratio_threshold = ${Number(indicators.atrExpansionRatioThreshold ?? 1.25)}`,
-    `volatility_alert_cooldown_sec = ${Number(indicators.volatilityAlertCooldownSec ?? 60)}`,
+    `atr_spike_pct_threshold = ${tomlNum(indicators.atrSpikePctThreshold, 0.45)}`,
+    `atr_expansion_ratio_threshold = ${tomlNum(indicators.atrExpansionRatioThreshold, 1.25)}`,
+    `volatility_alert_cooldown_sec = ${Math.max(0, Math.round(tomlNum(indicators.volatilityAlertCooldownSec, 60)))}`,
     '',
     '[exits]',
-    `atr_sl_multiplier = ${Number(exits.atrSlMultiplier ?? 1.5)}`,
-    `atr_tp1_multiplier = ${Number(exits.atrTp1Multiplier ?? 2.25)}`,
-    `atr_tp2_multiplier = ${Number(exits.atrTp2Multiplier ?? 3.75)}`,
-    `tp1_close_ratio = ${Number(exits.tp1CloseRatio ?? 0.5)}`,
-    `break_even_trigger_r = ${Number(exits.breakEvenTriggerR ?? 1.0)}`,
-    `break_even_fee_buffer_bps = ${Number(exits.breakEvenFeeBufferBps ?? 25)}`,
-    `trailing_activation_r = ${Number(exits.trailingActivationR ?? 1.2)}`,
-    `atr_trailing_multiplier = ${Number(exits.atrTrailingMultiplier ?? 1.4)}`,
+    `atr_sl_multiplier = ${Math.max(0.1, tomlNum(exits.atrSlMultiplier, 1.5))}`,
+    `atr_tp1_multiplier = ${Math.max(0.1, tomlNum(exits.atrTp1Multiplier, 2.25))}`,
+    `atr_tp2_multiplier = ${Math.max(0.1, tomlNum(exits.atrTp2Multiplier, 3.75))}`,
+    `tp1_close_ratio = ${Math.min(1, Math.max(0.05, tomlNum(exits.tp1CloseRatio, 0.5)))}`,
+    `break_even_trigger_r = ${Math.max(0.1, tomlNum(exits.breakEvenTriggerR, 1.0))}`,
+    `break_even_fee_buffer_bps = ${Math.max(0, tomlNum(exits.breakEvenFeeBufferBps, 25))}`,
+    `trailing_activation_r = ${Math.max(0.1, tomlNum(exits.trailingActivationR, 1.2))}`,
+    `atr_trailing_multiplier = ${Math.max(0.1, tomlNum(exits.atrTrailingMultiplier, 1.4))}`,
     '',
     '[risk]',
-    `max_daily_drawdown_pct = ${Number(risk.maxDailyDrawdownPct ?? 3.0)}`,
-    `max_pair_daily_drawdown_pct = ${Number(risk.maxPairDailyDrawdownPct ?? 1.25)}`,
-    `max_daily_profit_pct = ${Number(risk.maxDailyProfitPct ?? 5.0)}`,
-    `max_win_streak = ${Number(risk.maxWinStreak ?? 5)}`,
-    `max_lose_streak = ${Number(risk.maxLoseStreak ?? 3)}`,
-    `streak_cooldown_minutes = ${Number(risk.streakCooldownMinutes ?? 30)}`,
+    `max_daily_drawdown_pct = ${Math.max(0.1, tomlNum(risk.maxDailyDrawdownPct, 3.0))}`,
+    `max_pair_daily_drawdown_pct = ${Math.max(0.1, tomlNum(risk.maxPairDailyDrawdownPct, 1.25))}`,
+    `max_daily_profit_pct = ${Math.max(0.1, tomlNum(risk.maxDailyProfitPct, 5.0))}`,
+    `max_win_streak = ${Math.max(1, Math.round(tomlNum(risk.maxWinStreak, 5)))}`,
+    `max_lose_streak = ${Math.max(1, Math.round(tomlNum(risk.maxLoseStreak, 3)))}`,
+    `streak_cooldown_minutes = ${Math.max(1, Math.round(tomlNum(risk.streakCooldownMinutes, 30)))}`,
     `flatten_on_circuit_breaker = ${Boolean(risk.flattenOnCircuitBreaker ?? true)}`,
     '',
     '[features]',
-    ...Object.entries(features).map(([k, v]) => `${k.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)} = ${Boolean(v)}`),
+    ...Object.entries(normalizedFeatures).map(([k, v]) => `${k} = ${v}`),
     '',
     '[git_backup]',
     'enabled = true',
@@ -1031,6 +1156,12 @@ async function bootstrapServer() {
   const app = express();
   app.use(express.json({ limit: '256kb' }));
 
+  const asyncRoute =
+    (fn: (req: express.Request, res: express.Response, next: express.NextFunction) => Promise<void> | void): express.RequestHandler =>
+    (req, res, next) => {
+      Promise.resolve(fn(req, res, next)).catch(next);
+    };
+
   // Reject cross-site mutating requests and enforce optional APEXRUST_PROXY_TOKEN on sensitive routes
   app.use(['/api/live', '/api/git', '/api/orders'], (req, res, next) => {
     const fetchSite = req.headers['sec-fetch-site'];
@@ -1039,11 +1170,11 @@ async function bootstrapServer() {
       return;
     }
     const configuredToken = (process.env.APEXRUST_PROXY_TOKEN ?? '').trim();
-    if (configuredToken && req.method !== 'GET') {
+    if (configuredToken) {
       const headerToken = String(req.headers['x-apexrust-token'] ?? '').trim();
       const authHeader = String(req.headers.authorization ?? '').trim();
       const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-      if (headerToken !== configuredToken && bearerToken !== configuredToken) {
+      if (!safeTokenMatch(headerToken, configuredToken) && !safeTokenMatch(bearerToken, configuredToken)) {
         res.status(401).json({ error: 'Unauthorized: missing or invalid APEXRUST_PROXY_TOKEN.' });
         return;
       }
@@ -1061,8 +1192,8 @@ async function bootstrapServer() {
   });
 
   // Public Binance Market Data Proxies (avoids browser CORS issues on Futures & Testnet endpoints)
-  app.get('/api/market/klines', async (req, res) => {
-    const symbol = String(req.query.symbol ?? 'BTCUSDT').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  app.get('/api/market/klines', asyncRoute(async (req, res) => {
+    const symbol = sanitizeSymbol(req.query.symbol, 'BTCUSDT');
     const interval = String(req.query.interval ?? '5m').replace(/[^0-9a-zA-Z]/g, '');
     const venue: ExchangeVenue = req.query.venue === 'Futures' ? 'Futures' : 'Spot';
     const env: BinanceEnv = req.query.environment === 'Production' ? 'Production' : 'Testnet';
@@ -1086,10 +1217,10 @@ async function bootstrapServer() {
         error: err instanceof Error ? err.message : 'Failed to fetch Binance klines',
       });
     }
-  });
+  }));
 
-  app.get('/api/market/ticker', async (req, res) => {
-    const symbol = String(req.query.symbol ?? 'BTCUSDT').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  app.get('/api/market/ticker', asyncRoute(async (req, res) => {
+    const symbol = sanitizeSymbol(req.query.symbol, 'BTCUSDT');
     const venue: ExchangeVenue = req.query.venue === 'Futures' ? 'Futures' : 'Spot';
     const env: BinanceEnv = req.query.environment === 'Production' ? 'Production' : 'Testnet';
     const ticker = await fetchPublicTicker(symbol, venue, env);
@@ -1098,7 +1229,7 @@ async function bootstrapServer() {
       return;
     }
     res.json({ ok: true, symbol, venue, environment: env, ...ticker });
-  });
+  }));
 
   app.get('/api/live/config', (_req, res) => {
     res.json(getSafeStatus());
@@ -1145,16 +1276,48 @@ async function bootstrapServer() {
     const nextKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
     const nextSecret = typeof body.apiSecret === 'string' ? body.apiSecret.trim() : '';
 
-    if (nextAuth === 'Ed25519' && nextSecret.length > 0) {
-      try {
-        crypto.createPrivateKey(nextSecret);
-      } catch {
+    if (nextAuth === 'Ed25519') {
+      const candidateSecret = nextSecret.length > 0 ? nextSecret : nextAuth === vault.authMethod ? vault.apiSecret : '';
+      if (candidateSecret.length > 0) {
+        try {
+          const keyObj = crypto.createPrivateKey(candidateSecret);
+          if (keyObj.asymmetricKeyType !== 'ed25519') {
+            res.status(400).json({
+              error: `Expected an Ed25519 PKCS#8 PEM private key, received ${keyObj.asymmetricKeyType ?? 'unsupported'}.`,
+              status: getSafeStatus(),
+            });
+            return;
+          }
+        } catch {
+          res.status(400).json({
+            error: 'Invalid Ed25519 private key PEM. Paste the PKCS#8 PEM block starting with -----BEGIN PRIVATE KEY-----.',
+            status: getSafeStatus(),
+          });
+          return;
+        }
+      } else if (nextKey.length > 0 || vault.apiKey.length > 0) {
         res.status(400).json({
-          error: 'Invalid Ed25519 private key PEM. Paste the PKCS#8 PEM block starting with -----BEGIN PRIVATE KEY-----.',
+          error: 'Switching to Ed25519 requires an Ed25519 PKCS#8 PEM private key.',
           status: getSafeStatus(),
         });
         return;
       }
+    }
+
+    const resultingKey = nextKey.length > 0 ? nextKey : vault.apiKey;
+    const resultingSecret =
+      nextSecret.length > 0
+        ? nextSecret
+        : nextAuth !== vault.authMethod && nextAuth === 'Ed25519'
+          ? ''
+          : vault.apiSecret;
+
+    if ((!resultingKey || !resultingSecret) && (nextKey.length > 0 || nextSecret.length > 0)) {
+      res.status(400).json({
+        error: 'Both API Key and Secret / Private Key are required to configure live credentials.',
+        status: getSafeStatus(),
+      });
+      return;
     }
 
     const keyChanged = nextKey.length > 0 && nextKey !== vault.apiKey;
@@ -1163,6 +1326,16 @@ async function bootstrapServer() {
       nextEnv !== vault.environment ||
       nextVenue !== vault.venue ||
       nextAuth !== vault.authMethod;
+    const nextMaxNotional =
+      typeof body.maxOrderNotionalUsdt === 'number' && Number.isFinite(body.maxOrderNotionalUsdt)
+        ? Math.max(10, Number(body.maxOrderNotionalUsdt.toFixed(2)))
+        : vault.maxOrderNotionalUsdt;
+    const nextPreflight =
+      typeof body.requirePreflightTestOrder === 'boolean'
+        ? body.requirePreflightTestOrder
+        : vault.requirePreflightTestOrder;
+    const riskRelaxed =
+      nextMaxNotional > vault.maxOrderNotionalUsdt || (!nextPreflight && vault.requirePreflightTestOrder);
 
     vault.environment = nextEnv;
     vault.venue = nextVenue;
@@ -1171,18 +1344,14 @@ async function bootstrapServer() {
     if (typeof body.leverage === 'number' && Number.isFinite(body.leverage)) {
       vault.leverage = Math.min(20, Math.max(1, Math.round(body.leverage)));
     }
-    if (nextKey.length > 0) vault.apiKey = nextKey;
-    if (nextSecret.length > 0) vault.apiSecret = nextSecret;
+    vault.apiKey = resultingKey;
+    vault.apiSecret = resultingSecret;
 
     if (typeof body.recvWindowMs === 'number' && Number.isFinite(body.recvWindowMs)) {
       vault.recvWindowMs = Math.min(60_000, Math.max(1000, Math.round(body.recvWindowMs)));
     }
-    if (typeof body.maxOrderNotionalUsdt === 'number' && Number.isFinite(body.maxOrderNotionalUsdt)) {
-      vault.maxOrderNotionalUsdt = Math.max(10, Number(body.maxOrderNotionalUsdt.toFixed(2)));
-    }
-    if (typeof body.requirePreflightTestOrder === 'boolean') {
-      vault.requirePreflightTestOrder = body.requirePreflightTestOrder;
-    }
+    vault.maxOrderNotionalUsdt = nextMaxNotional;
+    vault.requirePreflightTestOrder = nextPreflight;
 
     if (keyChanged || secretChanged || envChanged) {
       vault.armedForLiveOrders = false;
@@ -1193,22 +1362,15 @@ async function bootstrapServer() {
       vault.permissions = [];
       vault.syncedBalances = [];
       futuresDualSideCache.clear();
-    }
-
-    if (!vault.apiKey || !vault.apiSecret) {
-      if (nextKey || nextSecret) {
-        res.status(400).json({
-          error: 'Both API Key and Secret / Private Key are required to configure live credentials.',
-          status: getSafeStatus(),
-        });
-        return;
-      }
+    } else if (riskRelaxed && vault.armedForLiveOrders) {
+      vault.armedForLiveOrders = false;
+      vault.verificationMessage = 'Live safety caps were relaxed — re-arm explicitly before sending live orders.';
     }
 
     res.json({ ok: true, status: getSafeStatus() });
   });
 
-  app.post('/api/live/verify', async (_req, res) => {
+  app.post('/api/live/verify', asyncRoute(async (_req, res) => {
     if (!vault.apiKey || !vault.apiSecret) {
       res.status(400).json({
         error: 'Live credentials are not configured yet.',
@@ -1294,7 +1456,7 @@ async function bootstrapServer() {
           : `Unable to reach ${getRestBaseUrl(vault.environment, vault.venue)}: ${errMsg}`;
       res.status(200).json({ ok: false, status: getSafeStatus() });
     }
-  });
+  }));
 
   app.post('/api/live/arm', (req, res) => {
     const body = (req.body ?? {}) as { armed?: boolean; confirmProduction?: boolean };
@@ -1326,7 +1488,7 @@ async function bootstrapServer() {
     res.json({ ok: true, status: getSafeStatus() });
   });
 
-  app.post('/api/live/order', async (req, res) => {
+  app.post('/api/live/order', asyncRoute(async (req, res) => {
     const body = (req.body ?? {}) as {
       venue?: ExchangeVenue;
       symbol?: string;
@@ -1358,8 +1520,12 @@ async function bootstrapServer() {
       return;
     }
 
+    const authSnap = captureVaultAuthSnapshot();
+    const maxOrderNotionalCap = vault.maxOrderNotionalUsdt;
+    const requirePreflight = vault.requirePreflightTestOrder;
+    const desiredMarginType: MarginType = vault.marginType;
     const venue: ExchangeVenue = body.venue === 'Futures' ? 'Futures' : body.venue === 'Spot' ? 'Spot' : vault.venue;
-    const symbol = (body.symbol ?? 'BTCUSDT').toUpperCase();
+    const symbol = sanitizeSymbol(body.symbol, 'BTCUSDT');
     const side = body.side === 'SELL' ? 'SELL' : 'BUY';
     const orderType =
       body.type === 'LIMIT_MAKER'
@@ -1395,7 +1561,7 @@ async function bootstrapServer() {
       newOrderRespType: venue === 'Futures' ? 'RESULT' : 'FULL',
     };
 
-    let refPrice = requestedPrice > 0 ? requestedPrice : 0;
+    let refPrice = baseEntryType === 'MARKET' ? 0 : requestedPrice > 0 ? requestedPrice : 0;
     if (refPrice <= 0) {
       refPrice = await fetchPublicPrice(symbol, venue);
     }
@@ -1403,7 +1569,7 @@ async function bootstrapServer() {
 
     if (baseEntryType === 'MARKET') {
       const mStep = filters.marketStepSize || filters.stepSize;
-      const mDec = filters.marketStepDecimals ?? filters.stepDecimals;
+      const mDec = filters.marketStepDecimals;
       const mMin = filters.marketMinQty || filters.minQty;
       const mMax = filters.marketMaxQty || filters.maxQty;
 
@@ -1420,11 +1586,30 @@ async function bootstrapServer() {
           res.status(400).json({ error: `MARKET quantity ${formattedQty} exceeds maxQty (${mMax}).` });
           return;
         }
-        if (refPrice > 0 && !body.reduceOnly && filters.minNotional > 0 && qtyNum * refPrice < filters.minNotional) {
-          res.status(400).json({
-            error: `Order notional ~$${(qtyNum * refPrice).toFixed(2)} is below Binance MIN_NOTIONAL ($${filters.minNotional}).`,
-          });
-          return;
+        if (!body.reduceOnly) {
+          if (refPrice <= 0) {
+            res.status(400).json({ error: `Unable to determine live reference price for ${symbol} notional safety check.` });
+            return;
+          }
+          const estNotional = qtyNum * refPrice;
+          if (filters.minNotional > 0 && estNotional < filters.minNotional) {
+            res.status(400).json({
+              error: `Order notional ~$${estNotional.toFixed(2)} is below Binance MIN_NOTIONAL ($${filters.minNotional}).`,
+            });
+            return;
+          }
+          if (filters.maxNotional > 0 && estNotional > filters.maxNotional) {
+            res.status(400).json({
+              error: `Order notional ~$${estNotional.toFixed(2)} exceeds Binance maxNotional ($${filters.maxNotional}).`,
+            });
+            return;
+          }
+          if (estNotional > maxOrderNotionalCap) {
+            res.status(400).json({
+              error: `Order notional ~$${estNotional.toFixed(2)} exceeds server safety cap ($${maxOrderNotionalCap.toFixed(2)}).`,
+            });
+            return;
+          }
         }
         orderParams.quantity = formattedQty;
       } else {
@@ -1432,15 +1617,21 @@ async function bootstrapServer() {
           res.status(400).json({ error: 'quoteOrderQty or quantity must be greater than 0.' });
           return;
         }
-        if (filters.minNotional > 0 && requestedNotional < filters.minNotional) {
+        if (!body.reduceOnly && filters.minNotional > 0 && requestedNotional < filters.minNotional) {
           res.status(400).json({
             error: `Order notional $${requestedNotional.toFixed(2)} is below Binance MIN_NOTIONAL ($${filters.minNotional}).`,
           });
           return;
         }
-        if (requestedNotional > vault.maxOrderNotionalUsdt) {
+        if (!body.reduceOnly && filters.maxNotional > 0 && requestedNotional > filters.maxNotional) {
           res.status(400).json({
-            error: `Order notional $${requestedNotional.toFixed(2)} exceeds server safety cap ($${vault.maxOrderNotionalUsdt.toFixed(2)}).`,
+            error: `Order notional $${requestedNotional.toFixed(2)} exceeds Binance maxNotional ($${filters.maxNotional}).`,
+          });
+          return;
+        }
+        if (!body.reduceOnly && requestedNotional > maxOrderNotionalCap) {
+          res.status(400).json({
+            error: `Order notional $${requestedNotional.toFixed(2)} exceeds server safety cap ($${maxOrderNotionalCap.toFixed(2)}).`,
           });
           return;
         }
@@ -1455,6 +1646,10 @@ async function bootstrapServer() {
             res.status(400).json({
               error: `Computed Futures quantity ${formattedQty} is below Binance minQty (${mMin}).`,
             });
+            return;
+          }
+          if (mMax > 0 && qtyNum > mMax) {
+            res.status(400).json({ error: `Computed Futures quantity ${formattedQty} exceeds maxQty (${mMax}).` });
             return;
           }
           orderParams.quantity = formattedQty;
@@ -1475,9 +1670,9 @@ async function bootstrapServer() {
         res.status(400).json({ error: `${orderType} order requires positive notional or quantity.` });
         return;
       }
-      if (!body.reduceOnly && effectiveNotional > vault.maxOrderNotionalUsdt) {
+      if (!body.reduceOnly && effectiveNotional > maxOrderNotionalCap) {
         res.status(400).json({
-          error: `Order notional $${effectiveNotional.toFixed(2)} exceeds server safety cap ($${vault.maxOrderNotionalUsdt.toFixed(2)}).`,
+          error: `Order notional $${effectiveNotional.toFixed(2)} exceeds server safety cap ($${maxOrderNotionalCap.toFixed(2)}).`,
         });
         return;
       }
@@ -1507,9 +1702,19 @@ async function bootstrapServer() {
         res.status(400).json({ error: `Quantity ${formattedQty} below Binance minQty (${filters.minQty}).` });
         return;
       }
+      if (filters.maxQty > 0 && qtyNum > filters.maxQty) {
+        res.status(400).json({ error: `Quantity ${formattedQty} exceeds Binance maxQty (${filters.maxQty}).` });
+        return;
+      }
       if (!body.reduceOnly && filters.minNotional > 0 && priceNum * qtyNum < filters.minNotional) {
         res.status(400).json({
           error: `Limit notional $${(priceNum * qtyNum).toFixed(2)} below Binance MIN_NOTIONAL ($${filters.minNotional}).`,
+        });
+        return;
+      }
+      if (!body.reduceOnly && filters.maxNotional > 0 && priceNum * qtyNum > filters.maxNotional) {
+        res.status(400).json({
+          error: `Limit notional $${(priceNum * qtyNum).toFixed(2)} exceeds Binance maxNotional ($${filters.maxNotional}).`,
         });
         return;
       }
@@ -1552,10 +1757,12 @@ async function bootstrapServer() {
           const marginRes = await signedBinanceRequest(
             'POST',
             '/fapi/v1/marginType',
-            { symbol, marginType: vault.marginType },
-            'Futures'
+            { symbol, marginType: desiredMarginType },
+            'Futures',
+            authSnap
           );
-          if (!marginRes.ok && Number(marginRes.data.code) !== -4046) {
+          const marginCode = Number(marginRes.data.code);
+          if (!marginRes.ok && marginCode !== -4046 && marginCode !== -4048) {
             res.status(400).json({
               error: `Futures marginType error (${marginRes.data.code ?? marginRes.status}): ${String(marginRes.data.msg ?? 'Rejected')}`,
             });
@@ -1566,7 +1773,8 @@ async function bootstrapServer() {
             'POST',
             '/fapi/v1/leverage',
             { symbol, leverage: desiredLeverage },
-            'Futures'
+            'Futures',
+            authSnap
           );
           if (!levRes.ok) {
             res.status(400).json({
@@ -1577,8 +1785,8 @@ async function bootstrapServer() {
         }
       }
 
-      if (preflightOnly || vault.requirePreflightTestOrder) {
-        const testRes = await signedBinanceRequest('POST', testEndpoint, orderParams, venue);
+      if (preflightOnly || requirePreflight) {
+        const testRes = await signedBinanceRequest('POST', testEndpoint, orderParams, venue, authSnap);
         if (!testRes.ok) {
           const msg =
             typeof testRes.data.msg === 'string'
@@ -1591,7 +1799,7 @@ async function bootstrapServer() {
               clientOrderId: `preflight_${symbol.toLowerCase()}`,
               symbol,
               venue,
-              environment: vault.environment,
+              environment: authSnap.environment,
               accountMode: 'Live',
               source: 'live_proxy',
               lifecycle: 'PREFLIGHT',
@@ -1628,7 +1836,7 @@ async function bootstrapServer() {
               clientOrderId: `preflight_${symbol.toLowerCase()}`,
               symbol,
               venue,
-              environment: vault.environment,
+              environment: authSnap.environment,
               accountMode: 'Live',
               source: 'live_proxy',
               lifecycle: 'PREFLIGHT',
@@ -1636,9 +1844,9 @@ async function bootstrapServer() {
               binanceSide: side,
               orderType,
               timeInForce: tif,
-              status: 'FILLED',
+              status: 'NEW',
               price: refPrice,
-              executedQty: requestedQty > 0 ? requestedQty : refPrice > 0 ? requestedNotional / refPrice : 0,
+              executedQty: 0,
               origQty: requestedQty > 0 ? requestedQty : refPrice > 0 ? requestedNotional / refPrice : 0,
               quoteQty: requestedNotional,
               commission: 0,
@@ -1649,14 +1857,14 @@ async function bootstrapServer() {
               exitReason: null,
               latencyMs: testRes.latencyMs,
               endpoint: `POST ${testEndpoint}`,
-              rationale: `Signed preflight validation (${venue}) passed`,
+              rationale: `Signed preflight validation (${venue}) passed (simulated — not executed)`,
               timestampMs: Date.now(),
             },
           ]);
           res.json({
             ok: true,
             preflight: true,
-            environment: vault.environment,
+            environment: authSnap.environment,
             venue,
             latencyMs: testRes.latencyMs,
             usedWeight1m: testRes.usedWeight1m,
@@ -1666,7 +1874,14 @@ async function bootstrapServer() {
         }
       }
 
-      const liveRes = await signedBinanceRequest('POST', orderEndpoint, orderParams, venue);
+      if (!vault.armedForLiveOrders) {
+        res.status(403).json({
+          error: 'Live execution was disarmed before submitting the order to Binance.',
+        });
+        return;
+      }
+
+      const liveRes = await signedBinanceRequest('POST', orderEndpoint, orderParams, venue, authSnap);
       if (!liveRes.ok) {
         const msg =
           typeof liveRes.data.msg === 'string'
@@ -1709,7 +1924,8 @@ async function bootstrapServer() {
         return;
       }
 
-      const fillMetrics = parseFillMetrics(liveRes.data, refPrice);
+      const baseAsset = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+      const fillMetrics = parseFillMetrics(liveRes.data, refPrice, venue === 'Spot' ? baseAsset : '');
       const executedQty = fillMetrics.executedQty;
       const avgPrice = fillMetrics.avgPrice;
 
@@ -1729,51 +1945,38 @@ async function bootstrapServer() {
         const exitSide = side === 'BUY' ? 'SELL' : 'BUY';
         const tpFmt = floorToStep(Number(body.takeProfitPrice), filters.tickSize, filters.tickDecimals);
         const slFmt = floorToStep(Number(body.stopLossPrice), filters.tickSize, filters.tickDecimals);
-        const exitQtyFmt = floorToStep(executedQty, filters.stepSize, filters.stepDecimals);
+        const netSpotQty = Math.max(0, executedQty - fillMetrics.baseCommission);
+        const exitQtyFmt = floorToStep(
+          venue === 'Spot' ? netSpotQty : executedQty,
+          filters.stepSize,
+          filters.stepDecimals
+        );
         const workingType = body.workingType === 'CONTRACT_PRICE' ? 'CONTRACT_PRICE' : 'MARK_PRICE';
 
         if (venue === 'Spot' && Number(exitQtyFmt) > 0) {
-          const ocoParams: Record<string, string | number> =
-            exitSide === 'SELL'
-              ? {
-                  symbol,
-                  side: 'SELL',
-                  quantity: exitQtyFmt,
-                  aboveType: 'LIMIT_MAKER',
-                  abovePrice: tpFmt,
-                  belowType: 'STOP_LOSS_LIMIT',
-                  belowStopPrice: slFmt,
-                  belowPrice: floorToStep(
-                    Number(body.stopLossPrice) * 0.998,
-                    filters.tickSize,
-                    filters.tickDecimals
-                  ),
-                  belowTimeInForce: 'GTC',
-                  newOrderRespType: 'FULL',
-                }
-              : {
-                  symbol,
-                  side: 'BUY',
-                  quantity: exitQtyFmt,
-                  aboveType: 'STOP_LOSS_LIMIT',
-                  aboveStopPrice: slFmt,
-                  abovePrice: floorToStep(
-                    Number(body.stopLossPrice) * 1.002,
-                    filters.tickSize,
-                    filters.tickDecimals
-                  ),
-                  aboveTimeInForce: 'GTC',
-                  belowType: 'LIMIT_MAKER',
-                  belowPrice: tpFmt,
-                  newOrderRespType: 'FULL',
-                };
-          const ocoRes = await signedBinanceRequest('POST', '/api/v3/orderList/oco', ocoParams, 'Spot');
+          const ocoParams: Record<string, string | number> = {
+            symbol,
+            side: 'SELL',
+            quantity: exitQtyFmt,
+            aboveType: 'LIMIT_MAKER',
+            abovePrice: tpFmt,
+            belowType: 'STOP_LOSS_LIMIT',
+            belowStopPrice: slFmt,
+            belowPrice: floorToStep(
+              Number(body.stopLossPrice) * 0.998,
+              filters.tickSize,
+              filters.tickDecimals
+            ),
+            belowTimeInForce: 'GTC',
+            newOrderRespType: 'FULL',
+          };
+          const ocoRes = await signedBinanceRequest('POST', '/api/v3/orderList/oco', ocoParams, 'Spot', authSnap);
           ocoAttached = ocoRes.ok;
           if (ocoRes.ok) {
             if (ocoRes.data.orderListId != null) {
               ocoOrderListId = Number(ocoRes.data.orderListId);
             }
-            ocoNote = `Attached Spot /api/v3/orderList/oco (#${ocoOrderListId ?? 'ok'} · ${exitSide}) TP @ ${tpFmt} / SL @ ${slFmt}`;
+            ocoNote = `Attached Spot /api/v3/orderList/oco (#${ocoOrderListId ?? 'ok'} · SELL) TP @ ${tpFmt} / SL @ ${slFmt}`;
           } else {
             ocoWarning = `Spot OCO leg failed (${ocoRes.data.code ?? ocoRes.status}): ${String(ocoRes.data.msg ?? 'Position has no exchange OCO bracket')}`;
             ocoNote = ocoWarning;
@@ -1794,7 +1997,8 @@ async function bootstrapServer() {
                 workingType,
                 priceProtect: 'true',
               },
-              'Futures'
+              'Futures',
+              authSnap
             ),
             signedBinanceRequest(
               'POST',
@@ -1810,18 +2014,23 @@ async function bootstrapServer() {
                 workingType,
                 priceProtect: 'true',
               },
-              'Futures'
+              'Futures',
+              authSnap
             ),
           ]);
           ocoAttached = tpRes.ok && slRes.ok;
           const ids: string[] = [];
           if (tpRes.ok && tpRes.data.algoId != null) ids.push(String(tpRes.data.algoId));
           if (slRes.ok && slRes.data.algoId != null) ids.push(String(slRes.data.algoId));
-          if (ids.length > 0) algoOrderIds = ids;
 
           if (ocoAttached) {
+            if (ids.length > 0) algoOrderIds = ids;
             ocoNote = `Attached Futures /fapi/v1/algoOrder TP @ ${tpFmt} + SL @ ${slFmt} (${workingType})`;
           } else {
+            // Roll back any half-attached algo leg so no stray unpaired closePosition trigger lingers
+            for (const id of ids) {
+              await signedBinanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: id }, 'Futures', authSnap).catch(() => {});
+            }
             const tpErr = tpRes.ok ? 'OK' : `${tpRes.data.code ?? tpRes.status}: ${String(tpRes.data.msg ?? 'Err')}`;
             const slErr = slRes.ok ? 'OK' : `${slRes.data.code ?? slRes.status}: ${String(slRes.data.msg ?? 'Err')}`;
             ocoWarning = `Futures conditional bracket warning — TP(${tpErr}) / SL(${slErr})`;
@@ -1922,15 +2131,15 @@ async function bootstrapServer() {
             : 'Failed to reach Binance REST API',
       });
     }
-  });
+  }));
 
-  app.get('/api/live/open-orders', async (req, res) => {
+  app.get('/api/live/open-orders', asyncRoute(async (req, res) => {
     if (!vault.apiKey || !vault.apiSecret) {
       res.status(400).json({ ok: false, error: 'Live API credentials are not configured.', orders: [] });
       return;
     }
     const venue: ExchangeVenue = req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : vault.venue;
-    const symbol = typeof req.query.symbol === 'string' && req.query.symbol ? req.query.symbol.toUpperCase() : undefined;
+    const symbol = typeof req.query.symbol === 'string' && req.query.symbol ? sanitizeSymbol(req.query.symbol) : undefined;
     try {
       const endpoint = venue === 'Futures' ? '/fapi/v1/openOrders' : '/api/v3/openOrders';
       const params: Record<string, string | number> = symbol ? { symbol } : {};
@@ -1959,15 +2168,15 @@ async function bootstrapServer() {
         orders: [],
       });
     }
-  });
+  }));
 
-  app.get('/api/live/order-status', async (req, res) => {
+  app.get('/api/live/order-status', asyncRoute(async (req, res) => {
     if (!vault.apiKey || !vault.apiSecret) {
       res.status(400).json({ ok: false, error: 'Live API credentials are not configured.' });
       return;
     }
     const venue: ExchangeVenue = req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : vault.venue;
-    const symbol = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : '';
+    const symbol = sanitizeSymbol(req.query.symbol);
     const orderId = typeof req.query.orderId === 'string' ? req.query.orderId.trim() : '';
     if (!symbol || !orderId) {
       res.status(400).json({ ok: false, error: 'symbol and orderId are required.' });
@@ -2003,9 +2212,9 @@ async function bootstrapServer() {
         error: err instanceof Error ? err.message : 'Failed to query order status',
       });
     }
-  });
+  }));
 
-  app.post('/api/live/cancel-open-brackets', async (req, res) => {
+  app.post('/api/live/cancel-open-brackets', asyncRoute(async (req, res) => {
     if (!vault.apiKey || !vault.apiSecret) {
       res.status(400).json({ ok: false, error: 'Live API credentials are not configured.' });
       return;
@@ -2020,7 +2229,7 @@ async function bootstrapServer() {
       orderListId?: number | string;
       algoOrderIds?: string[];
     };
-    const symbol = (body.symbol ?? '').toUpperCase();
+    const symbol = sanitizeSymbol(body.symbol);
     const venue: ExchangeVenue = body.venue === 'Futures' ? 'Futures' : body.venue === 'Spot' ? 'Spot' : vault.venue;
     if (!symbol) {
       res.status(400).json({ ok: false, error: 'symbol is required' });
@@ -2029,6 +2238,7 @@ async function bootstrapServer() {
 
     try {
       let cancelled = 0;
+      const errors: string[] = [];
       if (venue === 'Spot') {
         if (body.orderListId != null && Number(body.orderListId) > 0) {
           const r = await signedBinanceRequest(
@@ -2038,9 +2248,12 @@ async function bootstrapServer() {
             'Spot'
           );
           if (r.ok) cancelled += 1;
+          else errors.push(`OCO #${body.orderListId}: ${String(r.data.msg ?? r.status)}`);
         } else {
           const listRes = await signedBinanceRequest('GET', '/api/v3/openOrderList', {}, 'Spot');
-          if (listRes.ok && Array.isArray(listRes.data)) {
+          if (!listRes.ok) {
+            errors.push(`openOrderList: ${String(listRes.data.msg ?? listRes.status)}`);
+          } else if (Array.isArray(listRes.data)) {
             for (const entry of listRes.data as Array<{ symbol?: string; orderListId?: number }>) {
               if (entry.symbol === symbol && entry.orderListId != null) {
                 const delRes = await signedBinanceRequest(
@@ -2050,6 +2263,7 @@ async function bootstrapServer() {
                   'Spot'
                 );
                 if (delRes.ok) cancelled += 1;
+                else errors.push(`OCO #${entry.orderListId}: ${String(delRes.data.msg ?? delRes.status)}`);
               }
             }
           }
@@ -2064,32 +2278,41 @@ async function bootstrapServer() {
               'Futures'
             );
             if (delRes.ok) cancelled += 1;
+            else errors.push(`algo #${algoId}: ${String(delRes.data.msg ?? delRes.status)}`);
           }
         } else {
+          const openAlgoRes = await signedBinanceRequest('GET', '/fapi/v1/algoOpenOrders', { symbol }, 'Futures');
+          const openCount = openAlgoRes.ok && Array.isArray(openAlgoRes.data) ? openAlgoRes.data.length : 1;
           const delAll = await signedBinanceRequest(
             'DELETE',
             '/fapi/v1/algoOpenOrders',
             { symbol },
             'Futures'
           );
-          if (delAll.ok) cancelled += 1;
+          if (delAll.ok) cancelled += Math.max(0, openCount);
+          else errors.push(`algoOpenOrders: ${String(delAll.data.msg ?? delAll.status)}`);
         }
       }
-      res.json({ ok: true, cancelled });
+      if (cancelled === 0 && errors.length > 0) {
+        res.status(400).json({ ok: false, cancelled: 0, error: errors.join('; ') });
+        return;
+      }
+      res.json({ ok: true, cancelled, warnings: errors.length > 0 ? errors : undefined });
     } catch (err) {
       res.status(502).json({
         ok: false,
         error: err instanceof Error ? err.message : 'Failed to cancel open brackets',
       });
     }
-  });
+  }));
 
-  app.delete('/api/live/order', async (req, res) => {
+  app.delete('/api/live/order', asyncRoute(async (req, res) => {
     const body = (req.body ?? {}) as {
       symbol?: string;
       orderId?: string;
       orderListId?: string;
       algoId?: string;
+      side?: 'BUY' | 'SELL' | 'Long' | 'Short';
       orderType?: 'ORDER' | 'OCO' | 'ALGO';
       venue?: ExchangeVenue;
     };
@@ -2101,10 +2324,10 @@ async function bootstrapServer() {
       res.status(403).json({ error: 'Live execution is disarmed.' });
       return;
     }
-    const symbol = (body.symbol ?? '').toUpperCase();
-    const orderId = (body.orderId ?? '').trim();
-    const orderListId = (body.orderListId ?? '').trim();
-    const algoId = (body.algoId ?? '').trim();
+    const symbol = sanitizeSymbol(body.symbol);
+    const orderId = String(body.orderId ?? '').trim();
+    const orderListId = String(body.orderListId ?? '').trim();
+    const algoId = String(body.algoId ?? '').trim();
     const venue: ExchangeVenue = body.venue === 'Futures' ? 'Futures' : body.venue === 'Spot' ? 'Spot' : vault.venue;
 
     if (!symbol || (!orderId && !orderListId && !algoId)) {
@@ -2133,8 +2356,18 @@ async function bootstrapServer() {
         res.status(400).json({ error: msg });
         return;
       }
+      const fallbackSide: 'BUY' | 'SELL' =
+        body.side === 'SELL' || body.side === 'Short'
+          ? 'SELL'
+          : venue === 'Spot' && (body.orderType === 'OCO' || orderListId)
+            ? 'SELL'
+            : 'BUY';
       const canceledBinanceSide: 'BUY' | 'SELL' =
-        String(cancelRes.data.side ?? 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+        cancelRes.data.side !== undefined
+          ? String(cancelRes.data.side).toUpperCase() === 'SELL'
+            ? 'SELL'
+            : 'BUY'
+          : fallbackSide;
       upsertOrderLogs([
         {
           id: `live-cancel-${symbol}-${orderId || orderListId || algoId}-${Date.now()}`,
@@ -2146,7 +2379,12 @@ async function bootstrapServer() {
           accountMode: 'Live',
           source: 'live_proxy',
           lifecycle: 'CANCEL',
-          side: canceledBinanceSide === 'BUY' ? 'Long' : 'Short',
+          side:
+            venue === 'Spot' && canceledBinanceSide === 'SELL'
+              ? 'Long'
+              : canceledBinanceSide === 'BUY'
+                ? 'Long'
+                : 'Short',
           binanceSide: canceledBinanceSide,
           orderType: body.orderType ?? 'ORDER',
           timeInForce: 'GTC',
@@ -2173,10 +2411,10 @@ async function bootstrapServer() {
         error: err instanceof Error ? err.message : 'Failed to reach Binance cancel endpoint',
       });
     }
-  });
+  }));
 
-  app.get('/api/live/trades', async (req, res) => {
-    const symbolParam = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : 'BTCUSDT';
+  app.get('/api/live/trades', asyncRoute(async (req, res) => {
+    const symbolParam = sanitizeSymbol(req.query.symbol, 'BTCUSDT');
     const venueParam = req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : vault.venue;
     const limitParam = typeof req.query.limit === 'string' ? Math.min(50, Math.max(1, Number(req.query.limit) || 25)) : 25;
 
@@ -2250,7 +2488,11 @@ async function bootstrapServer() {
           realizedPnlOut = null;
         } else {
           const realizedPnl = raw.realizedPnl !== undefined ? Number(raw.realizedPnl) : 0;
-          isExitFill = Math.abs(realizedPnl) > 1e-8 || Boolean(raw.reduceOnly);
+          const posSide = typeof raw.positionSide === 'string' ? raw.positionSide.toUpperCase() : 'BOTH';
+          const hedgeExit =
+            (posSide === 'LONG' && binanceSide === 'SELL') ||
+            (posSide === 'SHORT' && binanceSide === 'BUY');
+          isExitFill = Math.abs(realizedPnl) > 1e-8 || Boolean(raw.reduceOnly) || hedgeExit;
           side = isExitFill
             ? binanceSide === 'SELL'
               ? 'Long'
@@ -2319,7 +2561,7 @@ async function bootstrapServer() {
         trades: [],
       });
     }
-  });
+  }));
 
   app.delete('/api/live/config', (_req, res) => {
     vault.apiKey = '';
@@ -2337,13 +2579,19 @@ async function bootstrapServer() {
 
   // ---------- Order Execution History & Binance allOrders Sync APIs ----------
 
-  app.get('/api/orders/history', async (req, res) => {
+  app.get('/api/orders/history', asyncRoute(async (req, res) => {
     const symbolParam =
       typeof req.query.symbol === 'string' && req.query.symbol && req.query.symbol !== 'ALL'
-        ? req.query.symbol.toUpperCase()
+        ? sanitizeSymbol(req.query.symbol)
         : undefined;
     const venueParam =
       req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : undefined;
+    const envParam =
+      req.query.environment === 'Production'
+        ? 'Production'
+        : req.query.environment === 'Testnet'
+          ? 'Testnet'
+          : undefined;
     const statusParam =
       typeof req.query.status === 'string' && req.query.status && req.query.status !== 'ALL'
         ? req.query.status.toUpperCase()
@@ -2434,7 +2682,12 @@ async function bootstrapServer() {
                   : 'NEW';
               const ts = Number(raw.updateTime ?? raw.time ?? Date.now());
               const isReduceOnly = Boolean(raw.reduceOnly);
+              const posSide = String(raw.positionSide ?? 'BOTH').toUpperCase();
+              const isHedgeExit =
+                (posSide === 'LONG' && binSide === 'SELL') ||
+                (posSide === 'SHORT' && binSide === 'BUY');
               const isSpotExit = targetVenue === 'Spot' && binSide === 'SELL';
+              const isExit = isReduceOnly || isSpotExit || isHedgeExit;
               return {
                 id: `binance-ord-${targetVenue.toLowerCase()}-${sym}-${ordId}`,
                 orderId: ordId,
@@ -2451,11 +2704,11 @@ async function bootstrapServer() {
                 lifecycle:
                   normStatus === 'CANCELED'
                     ? 'CANCEL'
-                    : isReduceOnly || isSpotExit
+                    : isExit
                       ? 'EXIT'
                       : 'ENTRY',
                 side:
-                  isReduceOnly || isSpotExit
+                  isExit
                     ? binSide === 'SELL'
                       ? 'Long'
                       : 'Short'
@@ -2515,6 +2768,7 @@ async function bootstrapServer() {
       .filter((log) => {
         if (symbolParam && log.symbol !== symbolParam) return false;
         if (venueParam && log.venue !== venueParam) return false;
+        if (envParam && log.environment !== envParam) return false;
         if (statusParam && log.status !== statusParam) return false;
         if (accountModeParam && log.accountMode !== accountModeParam) return false;
         return true;
@@ -2527,7 +2781,7 @@ async function bootstrapServer() {
       logs: filtered,
       syncResult,
     });
-  });
+  }));
 
   app.post('/api/orders/history', (req, res) => {
     const body = req.body as
@@ -2547,11 +2801,20 @@ async function bootstrapServer() {
           typeof item === 'object' &&
           item !== null &&
           typeof (item as { id?: unknown }).id === 'string' &&
-          typeof (item as { symbol?: unknown }).symbol === 'string'
+          typeof (item as { symbol?: unknown }).symbol === 'string' &&
+          sanitizeSymbol((item as { symbol?: unknown }).symbol).length > 0
       )
       .map((item) => ({
         ...item,
-        symbol: item.symbol.toUpperCase(),
+        symbol: sanitizeSymbol(item.symbol, 'BTCUSDT'),
+        venue: item.venue === 'Futures' ? 'Futures' : 'Spot',
+        environment: item.environment === 'Production' ? 'Production' : 'Testnet',
+        accountMode: item.accountMode === 'Live' ? 'Live' : 'Paper',
+        price: Number.isFinite(Number(item.price)) ? Number(item.price) : 0,
+        executedQty: Number.isFinite(Number(item.executedQty)) ? Number(item.executedQty) : 0,
+        origQty: Number.isFinite(Number(item.origQty)) ? Number(item.origQty) : 0,
+        quoteQty: Number.isFinite(Number(item.quoteQty)) ? Number(item.quoteQty) : 0,
+        commission: Number.isFinite(Number(item.commission)) ? Number(item.commission) : 0,
         timestampMs:
           typeof item.timestampMs === 'number' && Number.isFinite(item.timestampMs)
             ? item.timestampMs
@@ -2580,12 +2843,12 @@ async function bootstrapServer() {
 
   // ---------- Git Sync Backup APIs ----------
 
-  app.get('/api/git/status', async (_req, res) => {
+  app.get('/api/git/status', asyncRoute(async (_req, res) => {
     const status = await getGitStatusSummary();
     res.json({ ok: true, status });
-  });
+  }));
 
-  app.post('/api/git/init', async (_req, res) => {
+  app.post('/api/git/init', asyncRoute(async (_req, res) => {
     ensureGitIgnoreDefaults();
     if (!fs.existsSync(path.resolve(process.cwd(), '.git'))) {
       const initRes = await runGit(['init', '-b', 'main']);
@@ -2608,11 +2871,11 @@ async function bootstrapServer() {
 
     const status = await getGitStatusSummary();
     res.json({ ok: true, status });
-  });
+  }));
 
-  app.post('/api/git/remote', async (req, res) => {
-    const body = (req.body ?? {}) as { remoteUrl?: string };
-    const cleanUrl = (body.remoteUrl ?? '').trim();
+  app.post('/api/git/remote', asyncRoute(async (req, res) => {
+    const body = (req.body ?? {}) as { remoteUrl?: unknown };
+    const cleanUrl = typeof body.remoteUrl === 'string' ? body.remoteUrl.trim() : '';
     if (!cleanUrl || !isValidGitRemote(cleanUrl)) {
       res.status(400).json({
         ok: false,
@@ -2638,9 +2901,9 @@ async function bootstrapServer() {
 
     const status = await getGitStatusSummary();
     res.json({ ok: true, status });
-  });
+  }));
 
-  app.post('/api/git/backup', async (req, res) => {
+  app.post('/api/git/backup', asyncRoute(async (req, res) => {
     const body = (req.body ?? {}) as {
       commitMessage?: string;
       push?: boolean;
@@ -2704,11 +2967,12 @@ async function bootstrapServer() {
         ? body.commitMessage.trim().slice(0, 140)
         : `chore(backup): sync ApexRust config & strategy snapshot (${new Date().toISOString().slice(0, 16)}Z)`;
 
-    const diffCheck = await runGit(['diff', '--cached', '--quiet']);
+    const diffCheck = await runGit(['diff', '--cached', '--quiet', '--', ...addTargets]);
     let committed = false;
     let commitNote = 'Working tree backup already up to date';
     if (!diffCheck.ok) {
-      const commitRes = await runGit(['commit', '-m', msg]);
+      // `--only` commits strictly the backup targets without sweeping unrelated staged index changes
+      const commitRes = await runGit(['commit', '--only', '-m', msg, '--', ...addTargets]);
       if (!commitRes.ok) {
         res.status(500).json({ ok: false, error: commitRes.stderr || 'git commit failed' });
         return;
@@ -2742,6 +3006,15 @@ async function bootstrapServer() {
       message: pushError ?? commitNote,
       status: statusAfterCommit,
     });
+  }));
+
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ ok: false, error: 'API endpoint not found.' });
+  });
+
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const message = err instanceof Error ? err.message : 'Unexpected server error';
+    res.status(500).json({ ok: false, error: message });
   });
 
   const distDir = path.resolve(process.cwd(), 'dist');
@@ -2798,8 +3071,9 @@ async function bootstrapServer() {
   }
 
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, '0.0.0.0', () => {
-    console.log(`ApexRust server listening on http://0.0.0.0:${port}`);
+  const host = (process.env.HOST || '0.0.0.0').trim() || '0.0.0.0';
+  app.listen(port, host, () => {
+    console.log(`ApexRust server listening on http://${host}:${port}`);
   });
 }
 

@@ -561,6 +561,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 <option value="3m">3m (Momentum)</option>
                 <option value="5m">5m (Standard)</option>
                 <option value="15m">15m (Intraday)</option>
+                <option value="1h">1h (Swing)</option>
               </select>
             </div>
 
@@ -641,7 +642,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label htmlFor="cfg-rsi-min" className="block text-xs font-medium text-slate-400">
-                RSI Pullback Min
+                RSI Long Pullback Min
               </label>
               <input
                 id="cfg-rsi-min"
@@ -657,7 +658,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
             </div>
             <div>
               <label htmlFor="cfg-rsi-max" className="block text-xs font-medium text-slate-400">
-                RSI Pullback Max
+                RSI Long Pullback Max
               </label>
               <input
                 id="cfg-rsi-max"
@@ -667,6 +668,41 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 value={config.indicators.rsiLongPullbackMax}
                 onChange={(e) =>
                   updateIndicators('rsiLongPullbackMax', Number(e.target.value) || 58)
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="cfg-rsi-short-min" className="block text-xs font-medium text-slate-400">
+                RSI Short Pullback Min
+              </label>
+              <input
+                id="cfg-rsi-short-min"
+                type="number"
+                min="25"
+                max="55"
+                value={config.indicators.rsiShortPullbackMin}
+                onChange={(e) =>
+                  updateIndicators('rsiShortPullbackMin', Number(e.target.value) || 42)
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label htmlFor="cfg-rsi-short-max" className="block text-xs font-medium text-slate-400">
+                RSI Short Pullback Max
+              </label>
+              <input
+                id="cfg-rsi-short-max"
+                type="number"
+                min="45"
+                max="80"
+                value={config.indicators.rsiShortPullbackMax}
+                onChange={(e) =>
+                  updateIndicators('rsiShortPullbackMax', Number(e.target.value) || 58)
                 }
                 className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
               />
@@ -721,6 +757,74 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 onChange={(e) =>
                   updateExits('atrTrailingMultiplier', Number(e.target.value) || 1.4)
                 }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="cfg-atr-tp1" className="block text-xs font-medium text-slate-400">
+                ATR TP1 Mult
+              </label>
+              <input
+                id="cfg-atr-tp1"
+                type="number"
+                step="0.05"
+                min="0.5"
+                max="10"
+                value={config.exits.atrTp1Multiplier}
+                onChange={(e) => updateExits('atrTp1Multiplier', Number(e.target.value) || 2.25)}
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label htmlFor="cfg-atr-tp2" className="block text-xs font-medium text-slate-400">
+                ATR TP2 Mult
+              </label>
+              <input
+                id="cfg-atr-tp2"
+                type="number"
+                step="0.05"
+                min="0.8"
+                max="15"
+                value={config.exits.atrTp2Multiplier}
+                onChange={(e) => updateExits('atrTp2Multiplier', Number(e.target.value) || 3.75)}
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="cfg-tp1-ratio" className="block text-xs font-medium text-slate-400">
+                TP1 Scale-Out Ratio
+              </label>
+              <input
+                id="cfg-tp1-ratio"
+                type="number"
+                step="0.05"
+                min="0.1"
+                max="1"
+                value={config.exits.tp1CloseRatio}
+                onChange={(e) =>
+                  updateExits('tp1CloseRatio', Math.min(1, Math.max(0.1, Number(e.target.value) || 0.5)))
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label htmlFor="cfg-trail-act" className="block text-xs font-medium text-slate-400">
+                Trailing Activation (R)
+              </label>
+              <input
+                id="cfg-trail-act"
+                type="number"
+                step="0.1"
+                min="0.3"
+                max="5"
+                value={config.exits.trailingActivationR}
+                onChange={(e) => updateExits('trailingActivationR', Number(e.target.value) || 1.2)}
                 className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
               />
             </div>
@@ -829,7 +933,8 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               <button
                 type="button"
                 onClick={() => onSimulateVolatilitySpike?.(testSpikeSymbol)}
-                disabled={config.indicators.volatilityAlertsEnabled === false}
+                disabled={config.indicators.volatilityAlertsEnabled === false || snapshot.accountMode === 'Live'}
+                title={snapshot.accountMode === 'Live' ? 'Spike simulation is Paper-only' : undefined}
                 className="flex items-center gap-1 rounded-md bg-amber-400/15 px-2.5 py-1 text-xs font-semibold text-amber-300 transition hover:bg-amber-400/25 disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
               >
                 <Zap className="h-3.5 w-3.5" aria-hidden="true" />
@@ -959,7 +1064,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               const atr = p.indicators.atr ?? 0;
               const atrPct = p.lastPrice > 0 ? (atr / p.lastPrice) * 100 : 0;
               const prevAtrs = p.indicatorHistory
-                .slice(-11, -1)
+                .slice(-12, -1)
                 .map((h) => h.atr)
                 .filter((v): v is number => v !== null && v > 0);
               const baseAtr =
@@ -967,8 +1072,16 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                   ? prevAtrs.reduce((acc, v) => acc + v, 0) / prevAtrs.length
                   : atr;
               const lastBar = p.candles[p.candles.length - 1];
-              const barRange = lastBar ? lastBar.high - lastBar.low : 0;
-              const expRatio = baseAtr > 0 ? Math.max(atr / baseAtr, barRange / baseAtr) : 1.0;
+              const prevBar = p.candles[p.candles.length - 2];
+              const prevClose = prevBar?.close ?? lastBar?.open ?? p.lastPrice;
+              const trueRange = lastBar
+                ? Math.max(
+                    lastBar.high - lastBar.low,
+                    Math.abs(lastBar.high - prevClose),
+                    Math.abs(lastBar.low - prevClose)
+                  )
+                : 0;
+              const expRatio = baseAtr > 0 ? Math.max(atr / baseAtr, trueRange / baseAtr) : 1.0;
               const pctThresh = config.indicators.atrSpikePctThreshold ?? 0.45;
               const ratioThresh = config.indicators.atrExpansionRatioThreshold ?? 1.25;
               const isSpiking =

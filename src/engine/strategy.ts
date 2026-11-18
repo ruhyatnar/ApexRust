@@ -68,8 +68,8 @@ export function evaluateEntrySignal(
 
   if (profile === 'vwap_reversion') {
     if (
-      useVwap &&
-      (ind.vwap === null || (useAdx && ind.adx > Math.max(38, indCfg.adxMinTrend + 12)))
+      (useVwap && ind.vwap === null) ||
+      (useAdx && ind.adx > Math.max(38, indCfg.adxMinTrend + 12))
     ) {
       return null;
     }
@@ -337,13 +337,30 @@ export function evaluateSignalDiagnostics(
 
   if (profile === 'ema_breakout') {
     const recent = candles.slice(-11, -1);
-    const priorHigh = recent.length > 0 ? Math.max(...recent.map((c) => c.high)) : price;
-    const priorLow = recent.length > 0 ? Math.min(...recent.map((c) => c.low)) : price;
+    const priorHigh = recent.length > 0 ? Math.max(...recent.map((c) => c.high)) : latestCandle.open;
+    const priorLow = recent.length > 0 ? Math.min(...recent.map((c) => c.low)) : latestCandle.open;
     const avgVol =
       recent.length > 0 ? recent.reduce((sum, c) => sum + c.volume, 0) / recent.length : latestCandle.volume;
     const reqVolMult = useVolConfirm ? Math.max(1.1, minVolMult) : 1.1;
     const volSurgeOk = avgVol > 0 ? latestCandle.volume >= avgVol * reqVolMult : false;
-    const breakoutOk = price > priorHigh || (!longOnly && price < priorLow);
+    const breakoutLong = price > priorHigh;
+    const breakoutShort = !longOnly && price < priorLow;
+    const breakoutOk = breakoutLong || breakoutShort;
+    const macroLongOk =
+      !useEma || (tradingCfg.mode === 'intraday' && ind.emaMacro !== null ? price > ind.emaMacro : true);
+    const macroShortOk =
+      !useEma || (tradingCfg.mode === 'intraday' && ind.emaMacro !== null ? price < ind.emaMacro : true);
+    const macroOk = breakoutShort && !breakoutLong ? macroShortOk : macroLongOk;
+    const diOk =
+      !useAdx ||
+      (ind.plusDi !== null &&
+        ind.minusDi !== null &&
+        (ind.plusDi > ind.minusDi || (!longOnly && ind.minusDi > ind.plusDi)));
+    const vwapAlignOk =
+      !useVwap ||
+      !indCfg.requireVwapAlignment ||
+      ind.vwap === null ||
+      (breakoutShort && !breakoutLong ? price <= ind.vwap : price >= ind.vwap);
     const rsiOk =
       !useRsi ||
       (ind.rsi !== null &&
@@ -352,8 +369,10 @@ export function evaluateSignalDiagnostics(
     checks = [
       { label: '10-Bar Donchian Breakout', ok: breakoutOk },
       { label: 'EMA Stack (9 > 21 > 50)', ok: !useEma || emaStackBull || (!longOnly && emaStackBear) },
-      { label: `ADX ≥ ${indCfg.adxMinTrend} (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk },
+      { label: 'Macro EMA Alignment (200)', ok: macroOk },
+      { label: `ADX ≥ ${indCfg.adxMinTrend} & +DI/-DI (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk && diOk },
       { label: `RSI Momentum Band (${ind.rsi?.toFixed(1) ?? '—'})`, ok: rsiOk },
+      { label: 'Session VWAP Alignment', ok: vwapAlignOk },
       {
         label: `Volume ≥ ${reqVolMult.toFixed(1)}× Avg (${(latestCandle.volume / Math.max(avgVol, 1e-9)).toFixed(2)}×)`,
         ok: volSurgeOk,
@@ -407,9 +426,20 @@ export function evaluateSignalDiagnostics(
       ind.vwap === null ||
       (emaBear && !longOnly ? price <= ind.vwap : price >= ind.vwap);
 
+    const macroPullOk =
+      !useEma ||
+      tradingCfg.mode !== 'intraday' ||
+      ind.emaMacro === null ||
+      (emaBear && !longOnly ? price < ind.emaMacro : price > ind.emaMacro);
+    const diPullOk =
+      !useAdx ||
+      (ind.plusDi !== null &&
+        ind.minusDi !== null &&
+        (emaBear && !longOnly ? ind.minusDi > ind.plusDi : ind.plusDi > ind.minusDi));
+
     checks = [
-      { label: 'EMA Stack & Pullback', ok: !useEma || emaBull || (!longOnly && emaBear) },
-      { label: `ADX ≥ ${indCfg.adxMinTrend} (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk },
+      { label: 'EMA Stack & Pullback', ok: (!useEma || emaBull || (!longOnly && emaBear)) && macroPullOk },
+      { label: `ADX ≥ ${indCfg.adxMinTrend} & +DI/-DI (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk && diPullOk },
       {
         label: `RSI Curl Band (${ind.prevRsi?.toFixed(1) ?? '—'} → ${ind.rsi?.toFixed(1) ?? '—'})`,
         ok: !useRsi || rsiPullLongOk || rsiPullShortOk,
@@ -525,6 +555,10 @@ export function managePositionTick(
 
     if (tpEnabled) {
       if (pos.exitPlan.tpTargets && pos.exitPlan.tpTargets.length > 0) {
+        const remainingWeightBefore = pos.exitPlan.tpTargets.reduce(
+          (acc, x) => acc + (x.hit ? 0 : x.allocationPct),
+          0
+        );
         for (let i = 0; i < pos.exitPlan.tpTargets.length; i += 1) {
           const t = pos.exitPlan.tpTargets[i];
           if (!t.hit && markPrice >= t.targetPrice) {
@@ -534,9 +568,10 @@ export function managePositionTick(
             if (isLast) {
               return { type: 'FullClose', exitPrice: t.targetPrice, reason: 'TakeProfit2' };
             }
+            const fracOfRemaining = remainingWeightBefore > 0 ? t.allocationPct / remainingWeightBefore : t.allocationPct / 100;
             return {
               type: 'PartialClose',
-              ratio: Math.min(0.95, Math.max(0.05, t.allocationPct / 100)),
+              ratio: Math.min(0.95, Math.max(0.05, fracOfRemaining)),
               exitPrice: t.targetPrice,
               reason: 'TakeProfit1',
             };
@@ -593,6 +628,10 @@ export function managePositionTick(
 
   if (tpEnabled) {
     if (pos.exitPlan.tpTargets && pos.exitPlan.tpTargets.length > 0) {
+      const remainingWeightBefore = pos.exitPlan.tpTargets.reduce(
+        (acc, x) => acc + (x.hit ? 0 : x.allocationPct),
+        0
+      );
       for (let i = 0; i < pos.exitPlan.tpTargets.length; i += 1) {
         const t = pos.exitPlan.tpTargets[i];
         if (!t.hit && markPrice <= t.targetPrice) {
@@ -602,9 +641,10 @@ export function managePositionTick(
           if (isLast) {
             return { type: 'FullClose', exitPrice: t.targetPrice, reason: 'TakeProfit2' };
           }
+          const fracOfRemaining = remainingWeightBefore > 0 ? t.allocationPct / remainingWeightBefore : t.allocationPct / 100;
           return {
             type: 'PartialClose',
-            ratio: Math.min(0.95, Math.max(0.05, t.allocationPct / 100)),
+            ratio: Math.min(0.95, Math.max(0.05, fracOfRemaining)),
             exitPrice: t.targetPrice,
             reason: 'TakeProfit1',
           };

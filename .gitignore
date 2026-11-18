@@ -1,6 +1,9 @@
 node_modules/
 package-lock.json
 build/
+.apexrust/
+.env.bak
+rust-bot/config/bot.toml.bak
 dist/
 coverage/
 target/

@@ -8,55 +8,6 @@ use bot_core::{
 };
 use chrono::{DateTime, Utc};
 
-/// Evaluates whether a symbol exhibits a valid trend-following pullback entry using default toggles.
-pub fn evaluate_entry_signal(
-    symbol: &str,
-    candle: &Candle,
-    ind: &IndicatorSnapshot,
-    trading_cfg: &TradingConfig,
-    ind_cfg: &IndicatorConfig,
-    now: DateTime<Utc>,
-) -> Option<EntrySignal> {
-    evaluate_entry_signal_with_options(
-        symbol,
-        candle,
-        ind,
-        trading_cfg,
-        ind_cfg,
-        StrategyProfile::TrendPullback,
-        DirectionPolicy::Both,
-        &FeatureToggles::default(),
-        now,
-    )
-}
-
-/// Evaluates entry signals honoring `StrategyProfile`, `DirectionPolicy`, `FeatureToggles`, and `recent_candles`.
-#[allow(clippy::too_many_arguments)]
-pub fn evaluate_entry_signal_with_options(
-    symbol: &str,
-    candle: &Candle,
-    ind: &IndicatorSnapshot,
-    trading_cfg: &TradingConfig,
-    ind_cfg: &IndicatorConfig,
-    profile: StrategyProfile,
-    direction_policy: DirectionPolicy,
-    features: &FeatureToggles,
-    now: DateTime<Utc>,
-) -> Option<EntrySignal> {
-    evaluate_entry_signal_full(
-        symbol,
-        candle,
-        ind,
-        trading_cfg,
-        ind_cfg,
-        profile,
-        direction_policy,
-        features,
-        &[],
-        now,
-    )
-}
-
 /// Evaluates entry signals with full historical candle context for Donchian breakout confirmation.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_entry_signal_full(
@@ -175,16 +126,16 @@ pub fn evaluate_entry_signal_full(
 
     let vwap_long_ok = !features.vwap_bias_filter
         || !ind_cfg.require_vwap_alignment
-        || ind.vwap.map_or(true, |v| candle.close >= v);
+        || ind.vwap.is_none_or(|v| candle.close >= v);
     let vwap_short_ok = !features.vwap_bias_filter
         || !ind_cfg.require_vwap_alignment
-        || ind.vwap.map_or(true, |v| candle.close <= v);
+        || ind.vwap.is_none_or(|v| candle.close <= v);
 
     if matches!(profile, StrategyProfile::EmaBreakout) {
         let lookback: Vec<&Candle> = recent_candles
             .iter()
             .rev()
-            .skip(if recent_candles.last().map_or(false, |c| c.open_time_ms == candle.open_time_ms) { 1 } else { 0 })
+            .skip(if recent_candles.last().is_some_and(|c| c.open_time_ms == candle.open_time_ms) { 1 } else { 0 })
             .take(10)
             .collect();
         let prior_high = if lookback.is_empty() {
@@ -212,8 +163,8 @@ pub fn evaluate_entry_signal_full(
         let ema_break_short_ok = !features.ema_trend_filter || (ema_fast < ema_mid && ema_mid < ema_slow);
         let di_long_ok = !features.adx_strength_filter || pdi > mdi;
         let di_short_ok = !features.adx_strength_filter || mdi > pdi;
-        let rsi_break_long_ok = !features.rsi_momentum_filter || (rsi >= 50.0 && rsi <= 74.0);
-        let rsi_break_short_ok = !features.rsi_momentum_filter || (rsi <= 50.0 && rsi >= 26.0);
+        let rsi_break_long_ok = !features.rsi_momentum_filter || (50.0..=74.0).contains(&rsi);
+        let rsi_break_short_ok = !features.rsi_momentum_filter || (26.0..=50.0).contains(&rsi);
 
         if candle.close > prior_high
             && ema_break_long_ok
@@ -400,7 +351,7 @@ pub fn manage_position_tick(
             }
 
             // 2. Check Runner TP2
-            if mark_price >= pos.exit_plan.take_profit_2 {
+            if pos.exit_plan.tp_ladder_enabled && mark_price >= pos.exit_plan.take_profit_2 {
                 return PositionTickAction::FullClose {
                     exit_price: pos.exit_plan.take_profit_2,
                     reason: ExitReason::TakeProfit2,
@@ -463,7 +414,7 @@ pub fn manage_position_tick(
                 };
             }
 
-            if mark_price <= pos.exit_plan.take_profit_2 {
+            if pos.exit_plan.tp_ladder_enabled && mark_price <= pos.exit_plan.take_profit_2 {
                 return PositionTickAction::FullClose {
                     exit_price: pos.exit_plan.take_profit_2,
                     reason: ExitReason::TakeProfit2,
@@ -552,5 +503,52 @@ mod tests {
         manage_position_tick(&mut pos, 104.5, 2.0, &cfg);
         assert!(pos.exit_plan.trailing_active);
         assert!(pos.exit_plan.active_stop_loss >= sl_before);
+    }
+
+    #[test]
+    fn tp_ladder_disabled_skips_partial_tp1_exit() {
+        let cfg = ExitConfig {
+            atr_sl_multiplier: 1.5,
+            atr_tp1_multiplier: 2.25,
+            atr_tp2_multiplier: 3.75,
+            tp1_close_ratio: 0.5,
+            break_even_trigger_r: 1.0,
+            break_even_fee_buffer_bps: 10.0,
+            trailing_activation_r: 1.2,
+            atr_trailing_multiplier: 1.4,
+        };
+        let features = FeatureToggles {
+            take_profit_ladder: false,
+            ..FeatureToggles::default()
+        };
+        let plan = build_exit_plan_with_features(Side::Long, 100.0, 2.0, &cfg, &features);
+        assert!(!plan.tp_ladder_enabled);
+
+        let mut pos = Position {
+            id: "test-no-ladder".into(),
+            symbol: "BTCUSDT".into(),
+            side: Side::Long,
+            entry_price: 100.0,
+            quantity: 1.0,
+            remaining_quantity: 1.0,
+            unrealized_pnl_usdt: 0.0,
+            realized_pnl_usdt: 0.0,
+            highest_favorable_price: 100.0,
+            exit_plan: plan,
+            opened_at: Utc::now(),
+        };
+
+        // When take_profit_ladder is disabled, both TP1 and TP2 are skipped in favor of TrailingStop
+        let at_tp1 = manage_position_tick(&mut pos, 104.6, 2.0, &cfg);
+        assert_eq!(at_tp1, PositionTickAction::Hold);
+        assert!(!pos.exit_plan.tp1_hit);
+
+        let at_tp2 = manage_position_tick(&mut pos, 107.6, 2.0, &cfg);
+        assert_eq!(at_tp2, PositionTickAction::Hold);
+        assert!(pos.exit_plan.trailing_active);
+
+        let stop_trigger = pos.exit_plan.active_stop_loss - 0.1;
+        let on_trail = manage_position_tick(&mut pos, stop_trigger, 2.0, &cfg);
+        assert!(matches!(on_trail, PositionTickAction::FullClose { reason: ExitReason::TrailingStop, .. }));
     }
 }

@@ -1,4 +1,7 @@
-use crate::{build_sdk_rest_config, to_binance_decimal, validate_live_safety, LiveOrderAck, LiveOrderRequest};
+use crate::{
+    build_sdk_rest_config, get_or_fetch_symbol_filters, to_binance_step_decimal,
+    validate_live_safety, LiveOrderAck, LiveOrderRequest, SymbolFilters,
+};
 use binance_sdk::spot::rest_api::{
     DeleteOrderListParams, NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderSideEnum,
     NewOrderTimeInForceEnum, NewOrderTypeEnum, OrderListOcoAboveTypeEnum,
@@ -13,7 +16,10 @@ use bot_core::{
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
-use tracing::debug;
+use std::collections::HashMap;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 /// Official Binance Spot REST API wrapper (`binance_sdk::spot::SpotRestApi`)
 /// used for historical kline warmup, REST fallback polling, and signed Spot orders / OCO brackets.
@@ -21,6 +27,7 @@ pub struct BinanceRestClient {
     cfg: ExchangeConfig,
     http: reqwest::Client,
     sdk_client: Option<binance_sdk::spot::rest_api::RestApi>,
+    filter_cache: RwLock<HashMap<String, SymbolFilters>>,
 }
 
 impl BinanceRestClient {
@@ -35,10 +42,17 @@ impl BinanceRestClient {
             None
         };
 
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Failed to build Spot HTTP client: {e}")))?;
+
         Ok(Self {
             cfg,
-            http: reqwest::Client::new(),
+            http,
             sdk_client,
+            filter_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -150,7 +164,12 @@ impl BinanceRestClient {
 
     /// Execute a live Spot order (and optional `/api/v3/orderList/oco` exit bracket) via `binance-sdk`.
     pub async fn execute_spot_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
-        validate_live_safety(&self.cfg, ExchangeVenue::Spot, req)?;
+        let ref_px = req
+            .limit_price
+            .filter(|&p| p > 0.0)
+            .or_else(|| req.quote_order_qty.map(|q| q / req.quantity.max(1e-9)))
+            .unwrap_or(100.0);
+        validate_live_safety(&self.cfg, ExchangeVenue::Spot, req, ref_px)?;
         let sdk = self
             .sdk_client
             .as_ref()
@@ -169,6 +188,15 @@ impl BinanceRestClient {
             .is_some_and(|c| c.require_preflight_test_order);
 
         let sym = req.symbol.to_uppercase();
+        let filters = get_or_fetch_symbol_filters(
+            &self.http,
+            &self.filter_cache,
+            self.effective_base_url(),
+            ExchangeVenue::Spot,
+            &sym,
+            ref_px,
+        )
+        .await;
         let side_buy = match req.side {
             Side::Long => !req.reduce_only,
             Side::Short => req.reduce_only,
@@ -180,11 +208,16 @@ impl BinanceRestClient {
         {
             None
         } else {
-            Some(to_binance_decimal(req.quantity, 5)?)
+            let (step, dec) = if matches!(req.order_method, OrderExecutionMethod::Market | OrderExecutionMethod::Oco) {
+                (filters.market_step_size, filters.market_step_decimals)
+            } else {
+                (filters.step_size, filters.step_decimals)
+            };
+            Some(to_binance_step_decimal(req.quantity, step, dec)?)
         };
         let quote_dec = if req.order_method == OrderExecutionMethod::Market && side_buy {
             req.quote_order_qty
-                .map(|q| to_binance_decimal(q, 2))
+                .map(|q| to_binance_step_decimal(q, 0.01, 2))
                 .transpose()?
         } else {
             None
@@ -226,7 +259,11 @@ impl BinanceRestClient {
                 let px = req
                     .limit_price
                     .ok_or_else(|| BotError::RestApi("LIMIT order missing price".into()))?;
-                test_builder = test_builder.price(to_binance_decimal(px, 4)?);
+                test_builder = test_builder.price(to_binance_step_decimal(
+                    px,
+                    filters.tick_size,
+                    filters.tick_decimals,
+                )?);
                 if req.order_method == OrderExecutionMethod::Limit {
                     test_builder = test_builder.time_in_force(match req.time_in_force.as_str() {
                         "IOC" => OrderTestTimeInForceEnum::Ioc,
@@ -273,7 +310,11 @@ impl BinanceRestClient {
             let px = req
                 .limit_price
                 .ok_or_else(|| BotError::RestApi("LIMIT order missing price".into()))?;
-            order_builder = order_builder.price(to_binance_decimal(px, 4)?);
+            order_builder = order_builder.price(to_binance_step_decimal(
+                px,
+                filters.tick_size,
+                filters.tick_decimals,
+            )?);
             if req.order_method == OrderExecutionMethod::Limit {
                 order_builder = order_builder.time_in_force(tif);
             }
@@ -306,35 +347,75 @@ impl BinanceRestClient {
             req.limit_price.unwrap_or(0.0)
         };
 
+        let base_asset = sym.strip_suffix("USDT").unwrap_or(&sym);
+        let base_commission: f64 = resp
+            .fills
+            .as_ref()
+            .map(|fills| {
+                fills
+                    .iter()
+                    .filter(|f| {
+                        f.commission_asset
+                            .as_deref()
+                            .is_some_and(|a| a.eq_ignore_ascii_case(base_asset))
+                    })
+                    .filter_map(|f| f.commission.as_deref()?.parse::<f64>().ok())
+                    .sum()
+            })
+            .unwrap_or(0.0);
+        let net_exec_qty = (exec_qty - base_commission).max(0.0);
+
         let mut order_list_id = None;
-        if req.order_method == OrderExecutionMethod::Oco && exec_qty > 0.0 {
+        let mut bracket_warning = None;
+        if req.order_method == OrderExecutionMethod::Oco && net_exec_qty > 0.0 {
             if let (Some(tp), Some(sl)) = (req.take_profit_price, req.stop_loss_price) {
-                let oco_builder = OrderListOcoParams::builder(
-                    sym,
-                    OrderListOcoSideEnum::Sell,
-                    to_binance_decimal(exec_qty, 5)?,
-                    OrderListOcoAboveTypeEnum::LimitMaker,
-                    OrderListOcoBelowTypeEnum::StopLossLimit,
-                )
-                .above_price(to_binance_decimal(tp, 4)?)
-                .below_stop_price(to_binance_decimal(sl, 4)?)
-                .below_price(to_binance_decimal(sl * 0.998, 4)?)
-                .below_time_in_force(OrderListOcoBelowTimeInForceEnum::Gtc)
-                .recv_window(recv_window);
-                if let Ok(oco_params) = oco_builder.build() {
-                    if let Ok(oco_resp) = sdk.order_list_oco(oco_params).await {
-                        if let Ok(oco_data) = oco_resp.data().await {
-                            order_list_id = oco_data.order_list_id;
+                match (
+                    to_binance_step_decimal(net_exec_qty, filters.step_size, filters.step_decimals),
+                    to_binance_step_decimal(tp, filters.tick_size, filters.tick_decimals),
+                    to_binance_step_decimal(sl, filters.tick_size, filters.tick_decimals),
+                    to_binance_step_decimal(sl * 0.998, filters.tick_size, filters.tick_decimals),
+                ) {
+                    (Ok(oco_qty), Ok(tp_dec), Ok(sl_dec), Ok(sl_lim_dec)) => {
+                        let oco_res = OrderListOcoParams::builder(
+                            sym,
+                            OrderListOcoSideEnum::Sell,
+                            oco_qty,
+                            OrderListOcoAboveTypeEnum::LimitMaker,
+                            OrderListOcoBelowTypeEnum::StopLossLimit,
+                        )
+                        .above_price(tp_dec)
+                        .below_stop_price(sl_dec)
+                        .below_price(sl_lim_dec)
+                        .below_time_in_force(OrderListOcoBelowTimeInForceEnum::Gtc)
+                        .recv_window(recv_window)
+                        .build();
+
+                        match oco_res {
+                            Ok(oco_params) => match sdk.order_list_oco(oco_params).await {
+                                Ok(r) => match r.data().await {
+                                    Ok(oco_data) => order_list_id = oco_data.order_list_id,
+                                    Err(e) => bracket_warning = Some(format!("Spot OCO decode failed: {e}")),
+                                },
+                                Err(e) => bracket_warning = Some(format!("Spot /api/v3/orderList/oco failed: {e}")),
+                            },
+                            Err(e) => bracket_warning = Some(format!("Spot OCO params error: {e}")),
                         }
+                    }
+                    _ => {
+                        bracket_warning = Some("Spot OCO rounding error after entry fill".into());
                     }
                 }
             }
+        }
+        if let Some(ref w) = bracket_warning {
+            warn!(%w, "Entry filled on Spot, using local exit management");
         }
 
         Ok(LiveOrderAck {
             order_id: resp.order_id.map(|id| id.to_string()),
             order_list_id,
             algo_order_ids: Vec::new(),
+            bracket_warning,
             executed_qty: exec_qty,
             avg_price,
         })
@@ -344,8 +425,16 @@ impl BinanceRestClient {
         let Some(sdk) = self.sdk_client.as_ref() else {
             return Ok(());
         };
+        let recv_window = Decimal::from(
+            self.cfg
+                .credentials
+                .as_ref()
+                .map(|c| c.recv_window_ms)
+                .unwrap_or(5000),
+        );
         let params = DeleteOrderListParams::builder(symbol.to_uppercase())
             .order_list_id(order_list_id)
+            .recv_window(recv_window)
             .build()
             .map_err(|e| BotError::RestApi(format!("Cancel OCO params error: {e}")))?;
         sdk.delete_order_list(params)

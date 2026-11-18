@@ -418,7 +418,18 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
       r.rMultiple !== null ? r.rMultiple.toFixed(2) : '',
       r.exitReason ?? 'ENTRY_FILL',
     ]);
-    const csvContent = [headers.join(','), ...rows.map((row) => row.join(','))].join('\n');
+    const csvEscape = (cell: unknown): string => {
+      const raw = String(cell ?? '');
+      const neutralized = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
+      if (/[",\n\r]/.test(neutralized)) {
+        return `"${neutralized.replace(/"/g, '""')}"`;
+      }
+      return neutralized;
+    };
+    const csvContent = [
+      headers.map(csvEscape).join(','),
+      ...rows.map((row) => row.map(csvEscape).join(',')),
+    ].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -437,9 +448,13 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
         : payloadSchemaMode === 'ORDER'
           ? buildBinanceOrderResponsePayload(rec)
           : buildBinanceWsPayload(rec);
-    navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
-    setCopiedPayload(true);
-    setTimeout(() => setCopiedPayload(false), 1800);
+    try {
+      void navigator.clipboard?.writeText(JSON.stringify(payload, null, 2));
+      setCopiedPayload(true);
+      setTimeout(() => setCopiedPayload(false), 1800);
+    } catch {
+      // Clipboard API unavailable in non-secure context
+    }
   };
 
   return (

@@ -1,0 +1,78 @@
+name: Installer Smoke Tests
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'install.*'
+      - 'apexrust*'
+      - 'scripts/**'
+      - 'server.ts'
+      - 'package.json'
+      - '.env.example'
+      - 'rust-bot/config/bot.example.toml'
+      - '.github/workflows/install-smoke.yml'
+  pull_request:
+    paths:
+      - 'install.*'
+      - 'apexrust*'
+      - 'scripts/**'
+      - 'server.ts'
+      - 'package.json'
+      - '.env.example'
+      - 'rust-bot/config/bot.example.toml'
+      - '.github/workflows/install-smoke.yml'
+
+jobs:
+  unit-tests:
+    name: Installer Unit Tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm run test:installer
+
+  shell-syntax:
+    name: POSIX Shell Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh -n install.sh apexrust
+
+  smoke-install:
+    name: End-to-End Unattended Install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run non-interactive web install & health check (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          ./install.sh --yes --non-interactive --components web --env testnet --venue spot --no-service
+          ./apexrust status
+          ./apexrust doctor
+          curl -fsS http://127.0.0.1:3000/api/health
+          ./apexrust uninstall --yes --purge
+
+      - name: Run non-interactive web install & health check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\install.ps1 --yes --non-interactive --components web --env testnet --venue spot --no-service
+          .\apexrust.cmd status
+          .\apexrust.cmd doctor
+          Invoke-RestMethod -Uri http://127.0.0.1:3000/api/health | ConvertTo-Json -Compress
+          .\apexrust.cmd uninstall --yes --purge

@@ -12,8 +12,7 @@ rust-bot/
 │   ├── bot.example.toml           # Complete Spot/Futures, Automation, Session Windows, FeatureToggles, Risk & Git config
 │   └── bot.synced.toml            # Auto-generated sanitized snapshot synced from the Web Command Center (no secrets)
 ├── deploy/
-│   ├── git-backup.sh              # Sanitized Git sync & backup script (never commits keys/secrets)
-│   └── rust-quant-bot.service     # Linux systemd unit for headless 24/7 operation
+│   └── git-backup.sh              # Sanitized Git sync & backup script (never commits keys/secrets)
 ├── docs/
 │   ├── ARCHITECTURE.md            # Crate graph, Web/Express bridge, WS/REST failover, OCO/GTX & FeatureToggles
 │   ├── STRATEGY_GUIDE.md          # Multi-profile signals, Volume & UTC gates, ATR exits, Volatility alerts & Kelly sizing
@@ -96,10 +95,12 @@ cargo test --workspace
 cargo run --release -p bot-desktop -- --config config/bot.toml --web-port 8080
 ```
 
-### 4. Install as Linux `systemd` Service & Backup via Git
+### 4. Auto-Start Service & Backup via Git
+
+From the repository root, use the ApexRust CLI to register auto-start services (`systemd --user` on Linux, `launchd` on macOS, Scheduled Tasks on Windows):
+
 ```bash
-sudo cp deploy/rust-quant-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now rust-quant-bot
-./deploy/git-backup.sh
+cd ..
+./apexrust service install bot
+./rust-bot/deploy/git-backup.sh
 ```

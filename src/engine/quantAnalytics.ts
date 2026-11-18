@@ -233,7 +233,7 @@ export function computeKellySizingAnalytics(
   stopDistanceFraction: number,
   baseRiskPerTradePct = 0.75
 ): KellySizingAnalytics {
-  const safeEquity = Math.max(100, equityUsdt || 10_000);
+  const safeEquity = Number.isFinite(equityUsdt) && equityUsdt > 0 ? equityUsdt : 0;
   const safeStopDist = Math.max(0.002, Math.min(0.25, stopDistanceFraction || 0.015));
 
   const p = expectancy.winRateP;
@@ -407,17 +407,28 @@ export function calculateQuantitativePositionSizeUsdt(params: {
   // Cap notional by venue buying power (Spot: availableBalanceUsdt * 0.98; Futures: availableBalanceUsdt * leverage * 0.95)
   const maxBuyingPowerUsdt =
     params.venue === 'Futures'
-      ? params.availableBalanceUsdt * Math.max(1, params.leverage) * 0.95
-      : params.availableBalanceUsdt * 0.98;
+      ? Math.max(0, params.availableBalanceUsdt) * Math.max(1, params.leverage) * 0.95
+      : Math.max(0, params.availableBalanceUsdt) * 0.98;
 
-  const notionalUsdt = Number(
-    Math.max(10, Math.min(rawNotionalUsdt, Math.max(10, maxBuyingPowerUsdt))).toFixed(2)
-  );
+  if (maxBuyingPowerUsdt <= 0) {
+    return {
+      notionalUsdt: 0,
+      dollarRiskUsdt: 0,
+      riskFractionPct: 0,
+      stopDistancePct: Number(stopDistancePct.toFixed(2)),
+      blockedByNegativeKelly: false,
+    };
+  }
+
+  const notionalUsdt = Number(Math.min(rawNotionalUsdt, maxBuyingPowerUsdt).toFixed(2));
+  const actualDollarRisk = notionalUsdt * stopDistanceFraction;
+  const effectiveRiskFractionPct =
+    params.equityUsdt > 0 ? (actualDollarRisk / params.equityUsdt) * 100 : riskFractionPct;
 
   return {
     notionalUsdt,
-    dollarRiskUsdt: Number((notionalUsdt * stopDistanceFraction).toFixed(2)),
-    riskFractionPct: Number(riskFractionPct.toFixed(2)),
+    dollarRiskUsdt: Number(actualDollarRisk.toFixed(2)),
+    riskFractionPct: Number(effectiveRiskFractionPct.toFixed(2)),
     stopDistancePct: Number(stopDistancePct.toFixed(2)),
     blockedByNegativeKelly: false,
   };
@@ -642,8 +653,10 @@ export function evaluatePreTradeValidation(params: {
       title: 'Wait for Candle Close (Non-Repainting)',
       detail: latestCandle?.isClosed
         ? 'Closed bar confirmed (no mid-candle repainting)'
-        : 'Incomplete bar — wait for close',
-      passed: Boolean(latestCandle?.isClosed ?? true),
+        : !latestCandle
+          ? 'No candle data loaded'
+          : 'Incomplete bar — wait for close',
+      passed: Boolean(latestCandle?.isClosed),
       mandatory: true,
     },
     {

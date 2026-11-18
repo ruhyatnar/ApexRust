@@ -53,7 +53,7 @@ export const DateRangePicker: React.FC<DateRangePickerProps> = ({
   const [open, setOpen] = useState<boolean>(false);
   const [openUpward, setOpenUpward] = useState<boolean>(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const effectiveNowMs = referenceNowMs ?? Date.now();
+  const effectiveNowMs = useMemo(() => referenceNowMs ?? Date.now(), [referenceNowMs, open]);
   const todayUtcIso = new Date(effectiveNowMs).toISOString().slice(0, 10);
 
   const [viewCursor, setViewCursor] = useState<{ year: number; month: number }>(() =>

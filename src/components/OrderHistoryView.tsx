@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowDownRight,
@@ -87,6 +87,13 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
   const [csvExported, setCsvExported] = useState<boolean>(false);
 
   // Follow global account mode switch while allowing explicit ALL inspection
+  const symbolFilterRef = useRef(symbolFilter);
+  symbolFilterRef.current = symbolFilter;
+  const venueFilterRef = useRef(venueFilter);
+  venueFilterRef.current = venueFilter;
+  const hasLogsRef = useRef(false);
+  hasLogsRef.current = logs.length > 0;
+
   useEffect(() => {
     setModeFilter(accountMode);
   }, [accountMode]);
@@ -96,7 +103,7 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
       const isSync = Boolean(opts?.syncBinance);
       if (isSync) {
         setSyncingBinance(true);
-      } else if (logs.length === 0) {
+      } else if (!hasLogsRef.current) {
         setLoading(true);
       }
       setErrorMessage(null);
@@ -105,14 +112,16 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
         const params = new URLSearchParams();
         if (isSync) {
           params.set('syncBinance', '1');
-          if (symbolFilter !== 'ALL') {
-            params.set('symbol', symbolFilter);
+          const curSym = symbolFilterRef.current;
+          const curVenue = venueFilterRef.current;
+          if (curSym !== 'ALL') {
+            params.set('symbol', curSym);
           } else if (symbols.length > 0) {
             params.set('symbols', symbols.join(','));
           } else {
             params.set('symbol', activeSymbol);
           }
-          params.set('venue', venueFilter !== 'ALL' ? venueFilter : activeVenue);
+          params.set('venue', curVenue !== 'ALL' ? curVenue : activeVenue);
         }
         const queryStr = params.toString();
         const url = queryStr ? `/api/orders/history?${queryStr}` : '/api/orders/history';
@@ -161,7 +170,7 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
         setSyncingBinance(false);
       }
     },
-    [activeSymbol, activeVenue, symbolFilter, venueFilter, logs.length]
+    [activeSymbol, activeVenue, symbols]
   );
 
   useEffect(() => {
@@ -643,7 +652,7 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
               role="group"
               aria-label="Filter order logs by execution status"
             >
-              {(['ALL', 'FILLED', 'NEW', 'CANCELED', 'REJECTED'] as const).map((st) => (
+              {(['ALL', 'FILLED', 'PARTIALLY_FILLED', 'NEW', 'CANCELED', 'EXPIRED', 'REJECTED'] as const).map((st) => (
                 <button
                   key={st}
                   type="button"

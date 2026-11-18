@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# POSIX wrapper for ApexRust Quant CLI (`./apexrust <command>`).
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export PATH="$HOME/.cargo/bin:$HOME/.local/share/fnm:$HOME/.fnm:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if command -v fnm >/dev/null 2>&1; then
+  eval "$(fnm env --shell sh 2>/dev/null || true)"
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "Error: Node.js not found in PATH. Run ./install.sh first." >&2
+  exit 1
+fi
+
+exec node "$SCRIPT_DIR/scripts/apexrust.mjs" "$@"

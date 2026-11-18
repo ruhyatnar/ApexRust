@@ -29,10 +29,6 @@ pub struct FailoverGateway {
 }
 
 impl FailoverGateway {
-    pub fn new(cfg: ExchangeConfig, pairs: Vec<String>, timeframe: String) -> Result<Self> {
-        Self::new_with_toggles(cfg, pairs, timeframe, true, true)
-    }
-
     pub fn new_with_toggles(
         cfg: ExchangeConfig,
         pairs: Vec<String>,
@@ -119,11 +115,11 @@ impl FailoverGateway {
             let ws_tx = tx.clone();
             let gw_ws = Arc::clone(&self);
             tokio::spawn(async move {
-                let driver = BinanceWsDriver::new(
+                let driver = Arc::new(BinanceWsDriver::new(
                     gw_ws.cfg.clone(),
                     gw_ws.pairs.clone(),
                     gw_ws.timeframe.clone(),
-                );
+                ));
                 let mut backoff_ms = gw_ws.cfg.ws_reconnect_initial_ms;
                 let (inner_tx, mut inner_rx) = mpsc::channel::<MarketEvent>(512);
 
@@ -147,7 +143,37 @@ impl FailoverGateway {
 
                 loop {
                     let started = Instant::now();
-                    match driver.run_once(&inner_tx).await {
+                    let d = Arc::clone(&driver);
+                    let tx_copy = inner_tx.clone();
+                    let mut ws_task = tokio::spawn(async move { d.run_once(&tx_copy).await });
+                    let heartbeat_timeout =
+                        Duration::from_millis(gw_ws.cfg.ws_heartbeat_timeout_ms.max(1000));
+                    let mut watchdog = tokio::time::interval(Duration::from_millis(1000));
+                    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                    let run_res = loop {
+                        tokio::select! {
+                            res = &mut ws_task => {
+                                break res.unwrap_or_else(|e| Err(bot_core::BotError::WebSocket(format!("WS task aborted: {e}"))));
+                            }
+                            _ = watchdog.tick() => {
+                                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                                let last = gw_ws.last_ws_epoch_ms.load(Ordering::Relaxed);
+                                let stalled = if last == 0 {
+                                    started.elapsed() > heartbeat_timeout
+                                } else {
+                                    now_ms.saturating_sub(last) > heartbeat_timeout.as_millis() as u64
+                                };
+                                if stalled {
+                                    warn!("WebSocket heartbeat stalled; aborting socket for reconnect");
+                                    ws_task.abort();
+                                    break Err(bot_core::BotError::WebSocket("Heartbeat stalled".into()));
+                                }
+                            }
+                        }
+                    };
+
+                    match run_res {
                         Ok(()) => break,
                         Err(e) => {
                             warn!(error = %e, "WebSocket disconnected; engaging REST fallback");
@@ -166,8 +192,12 @@ impl FailoverGateway {
         if self.rest_fallback_enabled {
             let gw_rest = Arc::clone(&self);
             tokio::spawn(async move {
-                let mut tick =
-                    tokio::time::interval(Duration::from_millis(gw_rest.cfg.rest_poll_interval_ms));
+                let mut tick = tokio::time::interval(Duration::from_millis(
+                    gw_rest.cfg.rest_poll_interval_ms.max(250),
+                ));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut consecutive_failures: u32 = 0;
+
                 loop {
                     tick.tick().await;
                     if gw_rest.ws_primary_enabled {
@@ -181,13 +211,18 @@ impl FailoverGateway {
                         }
                     } else {
                         let mut guard = gw_rest.mode.write().await;
-                        *guard = TransportMode::RestFallback;
+                        if *guard == TransportMode::WsPrimary {
+                            *guard = TransportMode::RestFallback;
+                        }
                     }
 
-                    if *gw_rest.mode.read().await == TransportMode::RestFallback {
+                    let current_mode = *gw_rest.mode.read().await;
+                    if matches!(current_mode, TransportMode::RestFallback | TransportMode::Reconnecting) {
+                        let mut batch_ok = false;
                         for pair in &gw_rest.pairs {
                             match gw_rest.poll_latest_bar(pair, &gw_rest.timeframe).await {
                                 Ok(ev) => {
+                                    batch_ok = true;
                                     if tx.send(ev).await.is_err() {
                                         return;
                                     }
@@ -195,6 +230,20 @@ impl FailoverGateway {
                                 Err(e) => {
                                     error!(%pair, error = %e, "REST fallback poll failed");
                                 }
+                            }
+                        }
+                        if batch_ok {
+                            consecutive_failures = 0;
+                            let mut guard = gw_rest.mode.write().await;
+                            if *guard == TransportMode::Reconnecting {
+                                *guard = TransportMode::RestFallback;
+                            }
+                        } else {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            if gw_rest.cfg.max_consecutive_rest_failures > 0
+                                && consecutive_failures >= gw_rest.cfg.max_consecutive_rest_failures
+                            {
+                                *gw_rest.mode.write().await = TransportMode::Reconnecting;
                             }
                         }
                     }
@@ -205,7 +254,7 @@ impl FailoverGateway {
 
     async fn engage_rest_fallback(&self) {
         let mut guard = self.mode.write().await;
-        if *guard != TransportMode::RestFallback {
+        if *guard == TransportMode::WsPrimary {
             *guard = TransportMode::RestFallback;
             self.failover_count.fetch_add(1, Ordering::Relaxed);
         }

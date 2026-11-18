@@ -104,11 +104,22 @@ impl BinanceWsDriver {
         let url = self.build_combined_stream_url();
         info!(%url, "Connecting to Binance WebSocket primary stream");
 
-        let (mut ws, _) = connect_async(&url)
-            .await
-            .map_err(|e| BotError::WebSocket(format!("Connect failed: {e}")))?;
+        let (mut ws, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            connect_async(&url),
+        )
+        .await
+        .map_err(|_| BotError::WebSocket("WebSocket connect timed out (15s)".into()))?
+        .map_err(|e| BotError::WebSocket(format!("Connect failed: {e}")))?;
 
-        while let Some(frame) = ws.next().await {
+        let read_timeout = std::time::Duration::from_millis((self.cfg.ws_heartbeat_timeout_ms * 2).max(5000));
+        loop {
+            let frame_opt = tokio::time::timeout(read_timeout, ws.next())
+                .await
+                .map_err(|_| BotError::WebSocket("WebSocket stream heartbeat timeout".into()))?;
+            let Some(frame) = frame_opt else {
+                break;
+            };
             match frame {
                 Ok(Message::Text(txt)) => {
                     if let Some(ev) = Self::parse_combined_event(&txt) {
