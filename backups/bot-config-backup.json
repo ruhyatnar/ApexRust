@@ -1,5 +1,5 @@
 {
-  "backedUpAt": "2026-11-18T11:09:14.020Z",
+  "backedUpAt": "2026-11-18T11:09:17.834Z",
   "environment": "Testnet",
   "venue": "Spot",
   "leverage": 3,
@@ -64,7 +64,7 @@
       "flattenOnCircuitBreaker": true
     },
     "automation": {
-      "enabled": true,
+      "enabled": false,
       "strategyProfile": "trend_pullback",
       "directionPolicy": "long_only",
       "orderMethod": "MARKET",
@@ -98,7 +98,7 @@
       ]
     },
     "features": {
-      "automatedTrading": true,
+      "automatedTrading": false,
       "manualTrading": true,
       "signalGenerator": true,
       "wsPrimaryFeed": true,
