@@ -1,5 +1,5 @@
-use crate::{BinanceRestClient, BinanceWsDriver};
-use bot_core::{ExchangeConfig, MarketEvent, Result, TransportMode};
+use crate::{BinanceFuturesClient, BinanceRestClient, BinanceWsDriver, LiveOrderAck, LiveOrderRequest};
+use bot_core::{Candle, ExchangeConfig, ExchangeVenue, MarketEvent, Result, TransportMode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,8 +13,8 @@ pub struct FailoverHealth {
     pub last_ws_age_ms: u64,
 }
 
-/// Coordinates primary WebSocket streaming and seamless REST polling fallback
-/// whenever WebSocket heartbeats exceed `ws_heartbeat_timeout_ms`.
+/// Coordinates primary WebSocket streaming, seamless REST polling fallback,
+/// and authenticated Spot/Futures order dispatch via `binance-sdk`.
 pub struct FailoverGateway {
     cfg: ExchangeConfig,
     pairs: Vec<String>,
@@ -22,6 +22,7 @@ pub struct FailoverGateway {
     ws_primary_enabled: bool,
     rest_fallback_enabled: bool,
     rest: Arc<BinanceRestClient>,
+    futures: Arc<BinanceFuturesClient>,
     mode: Arc<RwLock<TransportMode>>,
     failover_count: Arc<AtomicU64>,
     last_ws_epoch_ms: Arc<AtomicU64>,
@@ -40,6 +41,7 @@ impl FailoverGateway {
         rest_fallback_enabled: bool,
     ) -> Result<Self> {
         let rest = Arc::new(BinanceRestClient::new(cfg.clone())?);
+        let futures = Arc::new(BinanceFuturesClient::new(cfg.clone())?);
         let initial_mode = if ws_primary_enabled {
             TransportMode::WsPrimary
         } else if rest_fallback_enabled {
@@ -54,14 +56,49 @@ impl FailoverGateway {
             ws_primary_enabled,
             rest_fallback_enabled,
             rest,
+            futures,
             mode: Arc::new(RwLock::new(initial_mode)),
             failover_count: Arc::new(AtomicU64::new(0)),
             last_ws_epoch_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    pub fn rest_client(&self) -> Arc<BinanceRestClient> {
-        Arc::clone(&self.rest)
+    pub async fn fetch_klines(&self, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Candle>> {
+        match self.cfg.venue {
+            ExchangeVenue::Futures => self.futures.fetch_futures_klines(symbol, interval, limit).await,
+            ExchangeVenue::Spot => self.rest.fetch_klines(symbol, interval, limit).await,
+        }
+    }
+
+    pub async fn poll_latest_bar(&self, symbol: &str, interval: &str) -> Result<MarketEvent> {
+        match self.cfg.venue {
+            ExchangeVenue::Futures => self.futures.poll_latest_futures_bar(symbol, interval).await,
+            ExchangeVenue::Spot => self.rest.poll_latest_bar(symbol, interval).await,
+        }
+    }
+
+    pub async fn execute_live_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
+        match self.cfg.venue {
+            ExchangeVenue::Futures => self.futures.execute_futures_order(req).await,
+            ExchangeVenue::Spot => self.rest.execute_spot_order(req).await,
+        }
+    }
+
+    pub async fn cancel_open_brackets(
+        &self,
+        symbol: &str,
+        order_list_id: Option<i64>,
+    ) -> Result<()> {
+        match self.cfg.venue {
+            ExchangeVenue::Futures => self.futures.cancel_futures_algo_orders(symbol).await,
+            ExchangeVenue::Spot => {
+                if let Some(list_id) = order_list_id {
+                    self.rest.cancel_spot_oco(symbol, list_id).await
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     pub async fn health(&self) -> FailoverHealth {
@@ -78,7 +115,6 @@ impl FailoverGateway {
 
     /// Spawn the WebSocket primary loop + Watchdog + REST fallback poller.
     pub fn spawn(self: Arc<Self>, tx: mpsc::Sender<MarketEvent>) {
-        // Task 1: Primary WebSocket loop with exponential backoff reconnect (when enabled)
         if self.ws_primary_enabled {
             let ws_tx = tx.clone();
             let gw_ws = Arc::clone(&self);
@@ -127,7 +163,6 @@ impl FailoverGateway {
             });
         }
 
-        // Task 2: Heartbeat Watchdog & REST Fallback Poller (when enabled)
         if self.rest_fallback_enabled {
             let gw_rest = Arc::clone(&self);
             tokio::spawn(async move {
@@ -151,7 +186,7 @@ impl FailoverGateway {
 
                     if *gw_rest.mode.read().await == TransportMode::RestFallback {
                         for pair in &gw_rest.pairs {
-                            match gw_rest.rest.poll_latest_bar(pair, &gw_rest.timeframe).await {
+                            match gw_rest.poll_latest_bar(pair, &gw_rest.timeframe).await {
                                 Ok(ev) => {
                                     if tx.send(ev).await.is_err() {
                                         return;

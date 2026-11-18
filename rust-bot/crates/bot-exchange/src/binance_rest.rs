@@ -1,17 +1,22 @@
-use binance_sdk::config::ConfigurationRestApi;
+use crate::{build_sdk_rest_config, to_binance_decimal, validate_live_safety, LiveOrderAck, LiveOrderRequest};
+use binance_sdk::spot::rest_api::{
+    DeleteOrderListParams, NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderSideEnum,
+    NewOrderTimeInForceEnum, NewOrderTypeEnum, OrderListOcoAboveTypeEnum,
+    OrderListOcoBelowTimeInForceEnum, OrderListOcoBelowTypeEnum, OrderListOcoParams,
+    OrderListOcoSideEnum, OrderTestParams, OrderTestSideEnum, OrderTestTimeInForceEnum,
+    OrderTestTypeEnum,
+};
 use binance_sdk::spot::SpotRestApi;
 use bot_core::{
-    BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent, Result,
-    TransportMode,
+    BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent,
+    OrderExecutionMethod, Result, Side, TransportMode,
 };
 use chrono::Utc;
-use std::env;
+use rust_decimal::Decimal;
 use tracing::debug;
 
-/// Official Binance REST API wrapper (`binance_sdk::spot::SpotRestApi`)
-/// used for:
-/// 1. Historical kline warmup at startup (200+ candles for EMA 200 / ADX / ATR)
-/// 2. Automatic fallback market polling & Spot Market/Limit/OCO order execution if WebSocket stalls.
+/// Official Binance Spot REST API wrapper (`binance_sdk::spot::SpotRestApi`)
+/// used for historical kline warmup, REST fallback polling, and signed Spot orders / OCO brackets.
 pub struct BinanceRestClient {
     cfg: ExchangeConfig,
     http: reqwest::Client,
@@ -20,20 +25,14 @@ pub struct BinanceRestClient {
 
 impl BinanceRestClient {
     pub fn new(cfg: ExchangeConfig) -> Result<Self> {
-        let sdk_client = match (env::var("BINANCE_API_KEY"), env::var("BINANCE_PRIVATE_KEY_PATH")) {
-            (Ok(api_key), Ok(key_path)) if !api_key.is_empty() => {
-                let rest_cfg = ConfigurationRestApi::builder()
-                    .api_key(api_key)
-                    .private_key(binance_sdk::config::PrivateKey::File(key_path))
-                    .build()
-                    .map_err(|e| BotError::RestApi(format!("binance-sdk config error: {e}")))?;
-                let client = match cfg.environment {
-                    ExchangeEnvironment::Production => SpotRestApi::production(rest_cfg),
-                    ExchangeEnvironment::Testnet => SpotRestApi::testnet(rest_cfg),
-                };
-                Some(client)
-            }
-            _ => None,
+        let sdk_client = if let Some(rest_cfg) = build_sdk_rest_config(&cfg)? {
+            let client = match cfg.environment {
+                ExchangeEnvironment::Production => SpotRestApi::production(rest_cfg),
+                ExchangeEnvironment::Testnet => SpotRestApi::testnet(rest_cfg),
+            };
+            Some(client)
+        } else {
+            None
         };
 
         Ok(Self {
@@ -41,10 +40,6 @@ impl BinanceRestClient {
             http: reqwest::Client::new(),
             sdk_client,
         })
-    }
-
-    pub fn has_authenticated_sdk(&self) -> bool {
-        self.sdk_client.is_some()
     }
 
     fn effective_base_url(&self) -> &str {
@@ -76,8 +71,7 @@ impl BinanceRestClient {
         }
     }
 
-    /// Fetch historical klines via public REST endpoint
-    /// (automatically selects `/api/v3/klines` for Spot or `/fapi/v1/klines` for USD-M Futures).
+    /// Fetch historical klines via public Spot REST endpoint (`/api/v3/klines`).
     pub async fn fetch_klines(&self, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Candle>> {
         let kline_path = match self.cfg.venue {
             ExchangeVenue::Spot => "/api/v3/klines",
@@ -133,41 +127,6 @@ impl BinanceRestClient {
         Ok(candles)
     }
 
-    /// Construct canonical Spot OCO (`POST /api/v3/orderList/oco`) exit payload
-    /// compliant with official Binance Spot API (replaces deprecated `/api/v3/order/oco`).
-    pub fn build_spot_oco_exit_payload(
-        symbol: &str,
-        quantity: f64,
-        take_profit_price: f64,
-        stop_loss_trigger: f64,
-    ) -> serde_json::Value {
-        serde_json::json!({
-            "endpoint": "/api/v3/orderList/oco",
-            "symbol": symbol.to_uppercase(),
-            "side": "SELL",
-            "quantity": format!("{quantity:.6}"),
-            "aboveType": "LIMIT_MAKER",
-            "abovePrice": format!("{take_profit_price:.4}"),
-            "belowType": "STOP_LOSS_LIMIT",
-            "belowStopPrice": format!("{stop_loss_trigger:.4}"),
-            "belowPrice": format!("{:.4}", stop_loss_trigger * 0.998),
-            "belowTimeInForce": "GTC",
-            "newOrderRespType": "FULL"
-        })
-    }
-
-    /// Construct canonical Spot `GET /api/v3/myTrades` signed query parameters
-    /// for syncing filled entry and exit executions into `TradeHistoryView`.
-    pub fn build_my_trades_query(symbol: &str, limit: u16, recv_window_ms: u64) -> serde_json::Value {
-        serde_json::json!({
-            "endpoint": "/api/v3/myTrades",
-            "symbol": symbol.to_uppercase(),
-            "limit": limit.min(1000),
-            "recvWindow": recv_window_ms,
-            "timestamp": Utc::now().timestamp_millis()
-        })
-    }
-
     /// Single fallback poll yielding a `MarketEvent` tagged `TransportMode::RestFallback`.
     pub async fn poll_latest_bar(&self, symbol: &str, interval: &str) -> Result<MarketEvent> {
         let mut bars = self.fetch_klines(symbol, interval, 2).await?;
@@ -187,5 +146,211 @@ impl BinanceRestClient {
             source: TransportMode::RestFallback,
             received_at: Utc::now(),
         })
+    }
+
+    /// Execute a live Spot order (and optional `/api/v3/orderList/oco` exit bracket) via `binance-sdk`.
+    pub async fn execute_spot_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
+        validate_live_safety(&self.cfg, ExchangeVenue::Spot, req)?;
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| BotError::RestApi("Spot SDK credentials not configured".into()))?;
+        let recv_window = Decimal::from(
+            self.cfg
+                .credentials
+                .as_ref()
+                .map(|c| c.recv_window_ms)
+                .unwrap_or(5000),
+        );
+        let require_preflight = self
+            .cfg
+            .credentials
+            .as_ref()
+            .is_some_and(|c| c.require_preflight_test_order);
+
+        let sym = req.symbol.to_uppercase();
+        let side_buy = match req.side {
+            Side::Long => !req.reduce_only,
+            Side::Short => req.reduce_only,
+        };
+
+        let qty_dec = if req.order_method == OrderExecutionMethod::Market
+            && side_buy
+            && req.quote_order_qty.is_some()
+        {
+            None
+        } else {
+            Some(to_binance_decimal(req.quantity, 5)?)
+        };
+        let quote_dec = if req.order_method == OrderExecutionMethod::Market && side_buy {
+            req.quote_order_qty
+                .map(|q| to_binance_decimal(q, 2))
+                .transpose()?
+        } else {
+            None
+        };
+
+        let tif = match req.time_in_force.as_str() {
+            "IOC" => NewOrderTimeInForceEnum::Ioc,
+            "FOK" => NewOrderTimeInForceEnum::Fok,
+            _ => NewOrderTimeInForceEnum::Gtc,
+        };
+
+        if require_preflight {
+            let mut test_builder = OrderTestParams::builder(
+                sym.clone(),
+                if side_buy {
+                    OrderTestSideEnum::Buy
+                } else {
+                    OrderTestSideEnum::Sell
+                },
+                match req.order_method {
+                    OrderExecutionMethod::Limit => OrderTestTypeEnum::Limit,
+                    OrderExecutionMethod::LimitMaker => OrderTestTypeEnum::LimitMaker,
+                    OrderExecutionMethod::Market | OrderExecutionMethod::Oco => {
+                        OrderTestTypeEnum::Market
+                    }
+                },
+            )
+            .recv_window(recv_window);
+            if let Some(q) = qty_dec {
+                test_builder = test_builder.quantity(q);
+            }
+            if let Some(qq) = quote_dec {
+                test_builder = test_builder.quote_order_qty(qq);
+            }
+            if matches!(
+                req.order_method,
+                OrderExecutionMethod::Limit | OrderExecutionMethod::LimitMaker
+            ) {
+                let px = req
+                    .limit_price
+                    .ok_or_else(|| BotError::RestApi("LIMIT order missing price".into()))?;
+                test_builder = test_builder.price(to_binance_decimal(px, 4)?);
+                if req.order_method == OrderExecutionMethod::Limit {
+                    test_builder = test_builder.time_in_force(match req.time_in_force.as_str() {
+                        "IOC" => OrderTestTimeInForceEnum::Ioc,
+                        "FOK" => OrderTestTimeInForceEnum::Fok,
+                        _ => OrderTestTimeInForceEnum::Gtc,
+                    });
+                }
+            }
+            let test_params = test_builder
+                .build()
+                .map_err(|e| BotError::RestApi(format!("Spot test order params error: {e}")))?;
+            sdk.order_test(test_params)
+                .await
+                .map_err(|e| BotError::RestApi(format!("Spot /api/v3/order/test failed: {e}")))?;
+        }
+
+        let mut order_builder = NewOrderParams::builder(
+            sym.clone(),
+            if side_buy {
+                NewOrderSideEnum::Buy
+            } else {
+                NewOrderSideEnum::Sell
+            },
+            match req.order_method {
+                OrderExecutionMethod::Limit => NewOrderTypeEnum::Limit,
+                OrderExecutionMethod::LimitMaker => NewOrderTypeEnum::LimitMaker,
+                OrderExecutionMethod::Market | OrderExecutionMethod::Oco => {
+                    NewOrderTypeEnum::Market
+                }
+            },
+        )
+        .recv_window(recv_window)
+        .new_order_resp_type(NewOrderNewOrderRespTypeEnum::Full);
+        if let Some(q) = qty_dec {
+            order_builder = order_builder.quantity(q);
+        }
+        if let Some(qq) = quote_dec {
+            order_builder = order_builder.quote_order_qty(qq);
+        }
+        if matches!(
+            req.order_method,
+            OrderExecutionMethod::Limit | OrderExecutionMethod::LimitMaker
+        ) {
+            let px = req
+                .limit_price
+                .ok_or_else(|| BotError::RestApi("LIMIT order missing price".into()))?;
+            order_builder = order_builder.price(to_binance_decimal(px, 4)?);
+            if req.order_method == OrderExecutionMethod::Limit {
+                order_builder = order_builder.time_in_force(tif);
+            }
+        }
+
+        let order_params = order_builder
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Spot new order params error: {e}")))?;
+        let resp = sdk
+            .new_order(order_params)
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot new_order failed: {e}")))?
+            .data()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot new_order decode failed: {e}")))?;
+
+        let exec_qty: f64 = resp
+            .executed_qty
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(req.quantity);
+        let cum_quote: f64 = resp
+            .cummulative_quote_qty
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let avg_price = if exec_qty > 0.0 && cum_quote > 0.0 {
+            cum_quote / exec_qty
+        } else {
+            req.limit_price.unwrap_or(0.0)
+        };
+
+        let mut order_list_id = None;
+        if req.order_method == OrderExecutionMethod::Oco && exec_qty > 0.0 {
+            if let (Some(tp), Some(sl)) = (req.take_profit_price, req.stop_loss_price) {
+                let oco_builder = OrderListOcoParams::builder(
+                    sym,
+                    OrderListOcoSideEnum::Sell,
+                    to_binance_decimal(exec_qty, 5)?,
+                    OrderListOcoAboveTypeEnum::LimitMaker,
+                    OrderListOcoBelowTypeEnum::StopLossLimit,
+                )
+                .above_price(to_binance_decimal(tp, 4)?)
+                .below_stop_price(to_binance_decimal(sl, 4)?)
+                .below_price(to_binance_decimal(sl * 0.998, 4)?)
+                .below_time_in_force(OrderListOcoBelowTimeInForceEnum::Gtc)
+                .recv_window(recv_window);
+                if let Ok(oco_params) = oco_builder.build() {
+                    if let Ok(oco_resp) = sdk.order_list_oco(oco_params).await {
+                        if let Ok(oco_data) = oco_resp.data().await {
+                            order_list_id = oco_data.order_list_id;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(LiveOrderAck {
+            order_id: resp.order_id.map(|id| id.to_string()),
+            order_list_id,
+            algo_order_ids: Vec::new(),
+            executed_qty: exec_qty,
+            avg_price,
+        })
+    }
+
+    pub async fn cancel_spot_oco(&self, symbol: &str, order_list_id: i64) -> Result<()> {
+        let Some(sdk) = self.sdk_client.as_ref() else {
+            return Ok(());
+        };
+        let params = DeleteOrderListParams::builder(symbol.to_uppercase())
+            .order_list_id(order_list_id)
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Cancel OCO params error: {e}")))?;
+        sdk.delete_order_list(params)
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot delete_order_list failed: {e}")))?;
+        Ok(())
     }
 }

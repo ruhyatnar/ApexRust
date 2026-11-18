@@ -1,22 +1,29 @@
 //! Main Tokio trading orchestrator tying together:
 //! Binance WebSocket/REST Failover -> Indicator Pipeline -> Trend Strategy ->
-//! Risk Circuit Breaker -> Position & Exit Execution -> Broadcast Telemetry.
+//! Risk Circuit Breaker & Quantitative Kelly Sizing -> Live/Paper Order Execution ->
+//! Sanitized Git Backup -> Broadcast Telemetry.
 
 pub mod git_sync;
 
 use bot_core::{
-    BotConfig, Candle, CircuitBreakerState, ClosedTrade, EngineSnapshot, ExitReason, MarketEvent,
-    PairSnapshot, Position, PositionSizingMode, Result, Side, VolatilitySpikeAlert,
+    BotConfig, Candle, CircuitBreakerState, ClosedTrade, EngineSnapshot, ExchangeVenue, ExitReason,
+    MarketEvent, OrderExecutionMethod, PairSnapshot, Position, PositionSizingMode, Result, Side,
+    VolatilitySpikeAlert,
 };
-use bot_exchange::FailoverGateway;
+use bot_exchange::{FailoverGateway, LiveOrderRequest};
 use bot_indicators::IndicatorPipeline;
-use bot_risk::RiskManager;
+use bot_risk::{
+    compute_expectancy_and_profit_factor, compute_kelly_fraction, compute_log_growth_rate,
+    compute_stop_distance_notional, RiskManager,
+};
 use bot_strategy::{
     build_exit_plan_with_features, evaluate_entry_signal_full, manage_position_tick,
     PositionTickAction,
 };
 use chrono::Utc;
+use git_sync::GitBackupSync;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
@@ -28,6 +35,14 @@ pub enum EngineCommand {
     TripCircuitBreaker(String),
     ResetCircuitBreaker,
     FlattenAll,
+    BackupNow,
+    ManualOrder {
+        symbol: String,
+        side: Side,
+        notional_usdt: f64,
+        order_method: OrderExecutionMethod,
+        limit_price: Option<f64>,
+    },
 }
 
 pub struct TradingEngine {
@@ -87,6 +102,117 @@ impl TradingEngine {
         Arc::clone(&self.latest_snapshot)
     }
 
+    fn venue_enabled(&self) -> bool {
+        match self.cfg.exchange.venue {
+            ExchangeVenue::Spot => self.cfg.features.spot_market,
+            ExchangeVenue::Futures => self.cfg.features.futures_market,
+        }
+    }
+
+    fn is_live_armed(&self) -> bool {
+        !self.cfg.exchange.paper_trading
+            && self
+                .cfg
+                .exchange
+                .credentials
+                .as_ref()
+                .is_some_and(|c| c.armed_for_live_orders)
+    }
+
+    /// Compute quantitative position size (in base asset quantity) honoring
+    /// `FixedUsdt`, `FixedRiskPct`, `QuarterKelly`, `HalfKelly`, and `FullKelly`,
+    /// returning `None` when negative Kelly (`f* <= 0`) blocks entry.
+    pub fn compute_position_quantity(
+        &self,
+        recent_trades: &[ClosedTrade],
+        equity_usdt: f64,
+        entry_price: f64,
+        stop_loss_price: f64,
+        risk_qty: f64,
+    ) -> Option<f64> {
+        if entry_price <= 0.0 {
+            return None;
+        }
+        match self.cfg.trading.position_sizing_mode {
+            PositionSizingMode::FixedUsdt => {
+                if self.cfg.automation.auto_order_notional_usdt > 0.0 {
+                    Some(self.cfg.automation.auto_order_notional_usdt / entry_price)
+                } else {
+                    Some(risk_qty)
+                }
+            }
+            PositionSizingMode::FixedRiskPct => Some(risk_qty),
+            PositionSizingMode::QuarterKelly
+            | PositionSizingMode::HalfKelly
+            | PositionSizingMode::FullKelly => {
+                let (p, avg_win_r, avg_loss_r, gross_profit, gross_loss) =
+                    if recent_trades.is_empty() {
+                        (0.58, 1.8, 1.0, 180.0, 100.0)
+                    } else {
+                        let wins: Vec<&ClosedTrade> =
+                            recent_trades.iter().filter(|t| t.pnl_usdt > 0.0).collect();
+                        let losses: Vec<&ClosedTrade> =
+                            recent_trades.iter().filter(|t| t.pnl_usdt <= 0.0).collect();
+                        let p = wins.len() as f64 / recent_trades.len() as f64;
+                        let gp: f64 = wins.iter().map(|t| t.pnl_usdt).sum();
+                        let gl: f64 = losses.iter().map(|t| t.pnl_usdt.abs()).sum();
+                        let awr = if wins.is_empty() {
+                            1.8
+                        } else {
+                            wins.iter().map(|t| t.r_multiple.abs().max(0.05)).sum::<f64>()
+                                / wins.len() as f64
+                        };
+                        let alr = if losses.is_empty() {
+                            1.0
+                        } else {
+                            losses
+                                .iter()
+                                .map(|t| t.r_multiple.abs().max(0.05))
+                                .sum::<f64>()
+                                / losses.len() as f64
+                        };
+                        (p, awr, alr, gp, gl)
+                    };
+                let (exp_r, _pf) =
+                    compute_expectancy_and_profit_factor(p, avg_win_r, avg_loss_r, gross_profit, gross_loss);
+                let payoff_b = if avg_loss_r > 1e-9 {
+                    avg_win_r / avg_loss_r
+                } else {
+                    1.5
+                };
+                let raw_kelly = compute_kelly_fraction(p, payoff_b);
+                if raw_kelly <= 0.0 || exp_r <= 0.0 {
+                    return None;
+                }
+                let mult = match self.cfg.trading.position_sizing_mode {
+                    PositionSizingMode::QuarterKelly => 0.25,
+                    PositionSizingMode::HalfKelly => 0.50,
+                    PositionSizingMode::FullKelly => 1.0,
+                    _ => 0.50,
+                };
+                let frac = (raw_kelly * mult).clamp(0.0, 0.5);
+                let _log_g = compute_log_growth_rate(p, payoff_b, frac);
+                let notional = compute_stop_distance_notional(
+                    equity_usdt,
+                    frac,
+                    entry_price,
+                    stop_loss_price,
+                )
+                .ok()?;
+                Some(notional / entry_price)
+            }
+        }
+    }
+
+    fn run_git_backup(&self, reason: &str) {
+        let sync = GitBackupSync::new(self.cfg.git_backup.clone());
+        let repo_root = PathBuf::from(".");
+        match sync.backup_snapshot(&repo_root, reason) {
+            Ok(outcome) => info!(summary = %outcome.summary, "Git backup sync completed"),
+            Err(err) => warn!(%err, "Git backup sync failed"),
+        }
+    }
+
     pub async fn run(self: Arc<Self>, mut cmd_rx: mpsc::Receiver<EngineCommand>) -> Result<()> {
         let mut pipelines: HashMap<String, IndicatorPipeline> = HashMap::new();
         let mut candle_history: HashMap<String, Vec<Candle>> = HashMap::new();
@@ -94,6 +220,7 @@ impl TradingEngine {
         let mut last_entry_bar: HashMap<String, u64> = HashMap::new();
         let mut last_prices: HashMap<String, f64> = HashMap::new();
         let mut open_positions: HashMap<String, Position> = HashMap::new();
+        let mut open_oco_lists: HashMap<String, Option<i64>> = HashMap::new();
         let mut recent_trades: Vec<ClosedTrade> = Vec::new();
         let mut recent_volatility_alerts: Vec<VolatilitySpikeAlert> = Vec::new();
         let mut last_vol_alert_ms: HashMap<String, i64> = HashMap::new();
@@ -101,13 +228,16 @@ impl TradingEngine {
         let mut running = true;
         let fee_bps = self.cfg.trading.taker_fee_bps;
 
-        // 1. Historical kline warmup via REST API
-        let rest = self.gateway.rest_client();
+        // 1. Historical kline warmup via REST API (routed by venue Spot vs Futures)
         for pair in &self.cfg.trading.pairs {
             let mut pipe = IndicatorPipeline::new(&self.cfg.indicators);
             let mut hist = Vec::new();
             let mut bars_seen = 0u64;
-            if let Ok(candles) = rest.fetch_klines(pair, &self.cfg.trading.timeframe, 220).await {
+            if let Ok(candles) = self
+                .gateway
+                .fetch_klines(pair, &self.cfg.trading.timeframe, 220)
+                .await
+            {
                 for c in &candles {
                     if !c.is_closed {
                         continue;
@@ -141,12 +271,86 @@ impl TradingEngine {
                         EngineCommand::TripCircuitBreaker(reason) => {
                             risk.trip_circuit_breaker(reason);
                             if self.cfg.risk.flatten_on_circuit_breaker {
-                                Self::flatten_all(&mut open_positions, &last_prices, &mut recent_trades, &mut risk, fee_bps);
+                                self.flatten_all_positions(&mut open_positions, &mut open_oco_lists, &last_prices, &mut recent_trades, &mut risk, fee_bps).await;
                             }
                         }
                         EngineCommand::ResetCircuitBreaker => risk.reset_circuit_breaker(),
                         EngineCommand::FlattenAll => {
-                            Self::flatten_all(&mut open_positions, &last_prices, &mut recent_trades, &mut risk, fee_bps);
+                            self.flatten_all_positions(&mut open_positions, &mut open_oco_lists, &last_prices, &mut recent_trades, &mut risk, fee_bps).await;
+                        }
+                        EngineCommand::BackupNow => {
+                            self.run_git_backup("chore(backup): manual desktop snapshot");
+                        }
+                        EngineCommand::ManualOrder { symbol, side, notional_usdt, order_method, limit_price } => {
+                            if !self.cfg.features.manual_trading || !self.venue_enabled() {
+                                warn!(%symbol, "Manual order blocked by FeatureToggles");
+                                continue;
+                            }
+                            if open_positions.contains_key(&symbol) {
+                                warn!(%symbol, "Manual order rejected: position already open");
+                                continue;
+                            }
+                            let ref_px = limit_price
+                                .filter(|&p| p > 0.0)
+                                .or_else(|| last_prices.get(&symbol).copied())
+                                .unwrap_or(0.0);
+                            if ref_px <= 0.0 || notional_usdt <= 0.0 {
+                                warn!(%symbol, "Manual order rejected: invalid price or notional");
+                                continue;
+                            }
+                            let atr = pipelines.get(&symbol).and_then(|p| p.snapshot().atr).unwrap_or(ref_px * 0.01);
+                            let plan = build_exit_plan_with_features(side, ref_px, atr, &self.cfg.exits, &self.cfg.features);
+                            let auth_ok = if self.cfg.features.circuit_breaker {
+                                risk.authorize_entry(&symbol, ref_px, plan.initial_stop_loss, open_positions.len(), Utc::now()).is_ok()
+                            } else {
+                                true
+                            };
+                            if auth_ok {
+                                let qty = notional_usdt / ref_px;
+                                let mut actual_entry = ref_px;
+                                let mut actual_qty = qty;
+                                let mut list_id = None;
+                                if self.is_live_armed() {
+                                    let req = LiveOrderRequest {
+                                        symbol: symbol.clone(),
+                                        side,
+                                        order_method,
+                                        quantity: qty,
+                                        quote_order_qty: Some(notional_usdt),
+                                        limit_price,
+                                        take_profit_price: Some(plan.take_profit_2),
+                                        stop_loss_price: Some(plan.initial_stop_loss),
+                                        time_in_force: self.cfg.automation.time_in_force.clone(),
+                                        reduce_only: false,
+                                    };
+                                    match self.gateway.execute_live_order(&req).await {
+                                        Ok(ack) => {
+                                            if ack.avg_price > 0.0 { actual_entry = ack.avg_price; }
+                                            if ack.executed_qty > 0.0 { actual_qty = ack.executed_qty; }
+                                            list_id = ack.order_list_id;
+                                        }
+                                        Err(err) => {
+                                            warn!(%symbol, %err, "Live manual order failed");
+                                            continue;
+                                        }
+                                    }
+                                }
+                                let now = Utc::now();
+                                open_oco_lists.insert(symbol.clone(), list_id);
+                                open_positions.insert(symbol.clone(), Position {
+                                    id: format!("{}-manual-{}", symbol, now.timestamp_millis()),
+                                    symbol,
+                                    side,
+                                    entry_price: actual_entry,
+                                    quantity: actual_qty,
+                                    remaining_quantity: actual_qty,
+                                    unrealized_pnl_usdt: 0.0,
+                                    realized_pnl_usdt: 0.0,
+                                    highest_favorable_price: actual_entry,
+                                    exit_plan: plan,
+                                    opened_at: now,
+                                });
+                            }
                         }
                     }
                 }
@@ -207,7 +411,7 @@ impl TradingEngine {
                         }
                     }
 
-                    // Manage existing position tick-by-tick (SL / TP1 / BE / ATR Trailing)
+                    // Manage existing position tick-by-tick (24/7 regardless of session window)
                     if let Some(mut pos) = open_positions.remove(&ev.symbol) {
                         let atr_val = ind.atr.unwrap_or(pos.exit_plan.risk_distance_r);
                         match manage_position_tick(&mut pos, ev.price, atr_val, &self.cfg.exits) {
@@ -216,7 +420,27 @@ impl TradingEngine {
                             }
                             PositionTickAction::PartialClose { ratio, exit_price, reason } => {
                                 let close_qty = pos.remaining_quantity * ratio;
-                                let pnl = Self::calc_net_pnl(pos.side, pos.entry_price, exit_price, close_qty, fee_bps);
+                                let mut exec_exit_px = exit_price;
+                                if self.is_live_armed() && self.cfg.automation.auto_close_on_exit {
+                                    let req = LiveOrderRequest {
+                                        symbol: ev.symbol.clone(),
+                                        side: pos.side,
+                                        order_method: OrderExecutionMethod::Market,
+                                        quantity: close_qty,
+                                        quote_order_qty: None,
+                                        limit_price: None,
+                                        take_profit_price: None,
+                                        stop_loss_price: None,
+                                        time_in_force: "GTC".into(),
+                                        reduce_only: true,
+                                    };
+                                    match self.gateway.execute_live_order(&req).await {
+                                        Ok(ack) if ack.avg_price > 0.0 => exec_exit_px = ack.avg_price,
+                                        Ok(_) => {}
+                                        Err(err) => warn!(symbol = %ev.symbol, %err, "Live partial exit failed"),
+                                    }
+                                }
+                                let pnl = Self::calc_net_pnl(pos.side, pos.entry_price, exec_exit_px, close_qty, fee_bps);
                                 let r_mult = pnl / (pos.exit_plan.risk_distance_r * close_qty).max(1e-9);
                                 pos.remaining_quantity -= close_qty;
                                 pos.realized_pnl_usdt += pnl;
@@ -226,7 +450,7 @@ impl TradingEngine {
                                     symbol: pos.symbol.clone(),
                                     side: pos.side,
                                     entry_price: pos.entry_price,
-                                    exit_price,
+                                    exit_price: exec_exit_px,
                                     quantity: close_qty,
                                     pnl_usdt: pnl,
                                     r_multiple: r_mult,
@@ -237,7 +461,29 @@ impl TradingEngine {
                             }
                             PositionTickAction::FullClose { exit_price, reason } => {
                                 let closed_qty = pos.remaining_quantity;
-                                let pnl = Self::calc_net_pnl(pos.side, pos.entry_price, exit_price, closed_qty, fee_bps);
+                                let mut exec_exit_px = exit_price;
+                                if self.is_live_armed() && self.cfg.automation.auto_close_on_exit {
+                                    let list_id = open_oco_lists.remove(&ev.symbol).flatten();
+                                    let _ = self.gateway.cancel_open_brackets(&ev.symbol, list_id).await;
+                                    let req = LiveOrderRequest {
+                                        symbol: ev.symbol.clone(),
+                                        side: pos.side,
+                                        order_method: OrderExecutionMethod::Market,
+                                        quantity: closed_qty,
+                                        quote_order_qty: None,
+                                        limit_price: None,
+                                        take_profit_price: None,
+                                        stop_loss_price: None,
+                                        time_in_force: "GTC".into(),
+                                        reduce_only: true,
+                                    };
+                                    match self.gateway.execute_live_order(&req).await {
+                                        Ok(ack) if ack.avg_price > 0.0 => exec_exit_px = ack.avg_price,
+                                        Ok(_) => {}
+                                        Err(err) => warn!(symbol = %ev.symbol, %err, "Live full exit failed"),
+                                    }
+                                }
+                                let pnl = Self::calc_net_pnl(pos.side, pos.entry_price, exec_exit_px, closed_qty, fee_bps);
                                 let r_mult = pnl / (pos.exit_plan.risk_distance_r * closed_qty).max(1e-9);
                                 risk.record_realized_pnl(&ev.symbol, pnl, ev.received_at);
                                 recent_trades.insert(0, ClosedTrade {
@@ -245,23 +491,27 @@ impl TradingEngine {
                                     symbol: pos.symbol.clone(),
                                     side: pos.side,
                                     entry_price: pos.entry_price,
-                                    exit_price,
+                                    exit_price: exec_exit_px,
                                     quantity: closed_qty,
                                     pnl_usdt: pnl,
                                     r_multiple: r_mult,
                                     reason,
                                     closed_at: ev.received_at,
                                 });
+                                if self.cfg.features.git_auto_backup {
+                                    self.run_git_backup("chore(backup): auto-sync after trade exit");
+                                }
                                 if self.cfg.features.circuit_breaker
                                     && risk.status().state == CircuitBreakerState::Halted
                                     && self.cfg.risk.flatten_on_circuit_breaker
                                 {
-                                    Self::flatten_all(&mut open_positions, &last_prices, &mut recent_trades, &mut risk, fee_bps);
+                                    self.flatten_all_positions(&mut open_positions, &mut open_oco_lists, &last_prices, &mut recent_trades, &mut risk, fee_bps).await;
                                 }
                             }
                         }
                     } else if running
                         && ev.candle.is_closed
+                        && self.venue_enabled()
                         && self.cfg.automation.enabled
                         && self.cfg.features.automated_trading
                         && self.cfg.features.signal_generator
@@ -298,34 +548,82 @@ impl TradingEngine {
                                     &self.cfg.exits,
                                     &self.cfg.features,
                                 );
-                                match risk.authorize_entry(
-                                    &sig.symbol,
-                                    sig.entry_price,
-                                    plan.initial_stop_loss,
-                                    open_positions.len(),
-                                    ev.received_at,
-                                ) {
+                                let auth_res = if self.cfg.features.circuit_breaker {
+                                    risk.authorize_entry(
+                                        &sig.symbol,
+                                        sig.entry_price,
+                                        plan.initial_stop_loss,
+                                        open_positions.len(),
+                                        ev.received_at,
+                                    )
+                                } else {
+                                    let stop_dist = (sig.entry_price - plan.initial_stop_loss).abs().max(1e-9);
+                                    let risk_usdt = risk.current_equity() * (self.cfg.trading.base_risk_per_trade_pct / 100.0);
+                                    Ok(risk_usdt / stop_dist)
+                                };
+                                match auth_res {
                                     Ok(risk_qty) => {
-                                        let qty = match self.cfg.trading.position_sizing_mode {
-                                            PositionSizingMode::FixedUsdt
-                                                if self.cfg.automation.auto_order_notional_usdt > 0.0
-                                                    && sig.entry_price > 0.0 =>
-                                            {
-                                                self.cfg.automation.auto_order_notional_usdt / sig.entry_price
-                                            }
-                                            _ => risk_qty,
+                                        let Some(mut qty) = self.compute_position_quantity(
+                                            &recent_trades,
+                                            risk.current_equity(),
+                                            sig.entry_price,
+                                            plan.initial_stop_loss,
+                                            risk_qty,
+                                        ) else {
+                                            warn!(symbol = %sig.symbol, "Entry blocked by negative Kelly filter (EV <= 0)");
+                                            continue;
                                         };
+                                        let mut actual_entry = sig.entry_price;
+                                        let mut list_id = None;
+                                        if self.is_live_armed() {
+                                            let limit_px = if matches!(
+                                                self.cfg.automation.order_method,
+                                                OrderExecutionMethod::Limit | OrderExecutionMethod::LimitMaker
+                                            ) {
+                                                let off = self.cfg.automation.limit_offset_bps.max(0.0) / 10_000.0;
+                                                Some(match sig.side {
+                                                    Side::Long => sig.entry_price * (1.0 - off),
+                                                    Side::Short => sig.entry_price * (1.0 + off),
+                                                })
+                                            } else {
+                                                None
+                                            };
+                                            let req = LiveOrderRequest {
+                                                symbol: sig.symbol.clone(),
+                                                side: sig.side,
+                                                order_method: self.cfg.automation.order_method,
+                                                quantity: qty,
+                                                quote_order_qty: Some(qty * sig.entry_price),
+                                                limit_price: limit_px,
+                                                take_profit_price: Some(plan.take_profit_2),
+                                                stop_loss_price: Some(plan.initial_stop_loss),
+                                                time_in_force: self.cfg.automation.time_in_force.clone(),
+                                                reduce_only: false,
+                                            };
+                                            match self.gateway.execute_live_order(&req).await {
+                                                Ok(ack) => {
+                                                    if ack.avg_price > 0.0 { actual_entry = ack.avg_price; }
+                                                    if ack.executed_qty > 0.0 { qty = ack.executed_qty; }
+                                                    list_id = ack.order_list_id;
+                                                }
+                                                Err(err) => {
+                                                    warn!(symbol = %sig.symbol, %err, "Live entry rejected");
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         last_entry_bar.insert(sig.symbol.clone(), current_bar);
+                                        open_oco_lists.insert(sig.symbol.clone(), list_id);
                                         let pos = Position {
                                             id: format!("{}-{}", sig.symbol, ev.received_at.timestamp_millis()),
                                             symbol: sig.symbol.clone(),
                                             side: sig.side,
-                                            entry_price: sig.entry_price,
+                                            entry_price: actual_entry,
                                             quantity: qty,
                                             remaining_quantity: qty,
                                             unrealized_pnl_usdt: 0.0,
                                             realized_pnl_usdt: 0.0,
-                                            highest_favorable_price: sig.entry_price,
+                                            highest_favorable_price: actual_entry,
                                             exit_plan: plan,
                                             opened_at: ev.received_at,
                                         };
@@ -382,8 +680,10 @@ impl TradingEngine {
         gross - round_trip_fee
     }
 
-    fn flatten_all(
+    async fn flatten_all_positions(
+        &self,
         open_positions: &mut HashMap<String, Position>,
+        open_oco_lists: &mut HashMap<String, Option<i64>>,
         last_prices: &HashMap<String, f64>,
         recent_trades: &mut Vec<ClosedTrade>,
         risk: &mut RiskManager,
@@ -391,8 +691,29 @@ impl TradingEngine {
     ) {
         let now = Utc::now();
         for (sym, pos) in open_positions.drain() {
-            let px = last_prices.get(&sym).copied().unwrap_or(pos.entry_price);
+            let mut px = last_prices.get(&sym).copied().unwrap_or(pos.entry_price);
             let qty = pos.remaining_quantity;
+            if self.is_live_armed() {
+                let list_id = open_oco_lists.remove(&sym).flatten();
+                let _ = self.gateway.cancel_open_brackets(&sym, list_id).await;
+                let req = LiveOrderRequest {
+                    symbol: sym.clone(),
+                    side: pos.side,
+                    order_method: OrderExecutionMethod::Market,
+                    quantity: qty,
+                    quote_order_qty: None,
+                    limit_price: None,
+                    take_profit_price: None,
+                    stop_loss_price: None,
+                    time_in_force: "GTC".into(),
+                    reduce_only: true,
+                };
+                if let Ok(ack) = self.gateway.execute_live_order(&req).await {
+                    if ack.avg_price > 0.0 {
+                        px = ack.avg_price;
+                    }
+                }
+            }
             let pnl = Self::calc_net_pnl(pos.side, pos.entry_price, px, qty, taker_fee_bps);
             let r_mult = pnl / (pos.exit_plan.risk_distance_r * qty).max(1e-9);
             risk.record_realized_pnl(&sym, pnl, now);
@@ -412,5 +733,47 @@ impl TradingEngine {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_kelly_blocks_quantitative_entry() {
+        let mut cfg = BotConfig::from_toml_file("../../config/bot.example.toml").unwrap();
+        cfg.trading.position_sizing_mode = PositionSizingMode::HalfKelly;
+        let engine = TradingEngine::new(cfg).unwrap();
+
+        let losing_trades = vec![
+            ClosedTrade {
+                id: "1".into(),
+                symbol: "BTCUSDT".into(),
+                side: Side::Long,
+                entry_price: 100.0,
+                exit_price: 98.0,
+                quantity: 1.0,
+                pnl_usdt: -20.0,
+                r_multiple: -1.0,
+                reason: ExitReason::StopLoss,
+                closed_at: Utc::now(),
+            },
+            ClosedTrade {
+                id: "2".into(),
+                symbol: "BTCUSDT".into(),
+                side: Side::Long,
+                entry_price: 100.0,
+                exit_price: 98.0,
+                quantity: 1.0,
+                pnl_usdt: -20.0,
+                r_multiple: -1.0,
+                reason: ExitReason::StopLoss,
+                closed_at: Utc::now(),
+            },
+        ];
+
+        assert!(engine.compute_position_quantity(&losing_trades, 10_000.0, 100.0, 98.0, 1.0).is_none());
+        assert!(engine.compute_position_quantity(&[], 10_000.0, 100.0, 98.0, 1.0).is_some());
     }
 }

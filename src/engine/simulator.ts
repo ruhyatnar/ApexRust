@@ -713,7 +713,7 @@ export class SimulationRuntime {
       fillDetails?.avgPrice && fillDetails.avgPrice > 0 ? fillDetails.avgPrice : pair.lastPrice;
     const atr = pair.indicators.atr ?? entryPrice * 0.01;
     const slDist =
-      input.stopLossMode === 'ATR'
+      input.stopLossMode === 'ATR' && this.config.features.atrDynamicExits
         ? atr * this.config.exits.atrSlMultiplier
         : entryPrice * (Math.max(0.2, input.stopLossPct) / 100);
     const initialSl = input.side === 'Long' ? entryPrice - slDist : entryPrice + slDist;
@@ -823,6 +823,46 @@ export class SimulationRuntime {
     this.snapshot.pendingOrders.unshift(pending);
     this.pushLog('info', note);
     this.syncRiskToSnapshot();
+  }
+
+  promoteExternalLivePendingOrder(
+    pendingOrderId: string,
+    fillPrice?: number,
+    executedQty?: number,
+    nowMs = Date.now()
+  ): boolean {
+    const idx = this.snapshot.pendingOrders.findIndex((o) => o.id === pendingOrderId);
+    if (idx === -1) return false;
+    const [pending] = this.snapshot.pendingOrders.splice(idx, 1);
+    const resolvedPrice = fillPrice && fillPrice > 0 ? fillPrice : pending.limitPrice;
+    const resolvedQty =
+      executedQty && executedQty > 0
+        ? executedQty
+        : pending.usdtAmount / Math.max(resolvedPrice, 1e-6);
+
+    this.recordExternalLiveOrder(
+      {
+        symbol: pending.symbol,
+        orderType: pending.orderType,
+        side: pending.side,
+        usdtAmount: resolvedPrice * resolvedQty,
+        limitPrice: pending.limitPrice,
+        timeInForce: pending.timeInForce,
+        stopLossMode: pending.stopLossMode,
+        stopLossPct: pending.stopLossPct,
+        useBreakEven: pending.useBreakEven,
+        useTrailingStop: pending.useTrailingStop,
+        targets: pending.targets,
+      },
+      `Live ${this.config.trading.venue} resting ${pending.orderType} filled @ $${resolvedPrice.toFixed(resolvedPrice >= 100 ? 2 : 4)}`,
+      nowMs,
+      {
+        executedQty: resolvedQty,
+        avgPrice: resolvedPrice,
+        orderId: pending.exchangeOrderId,
+      }
+    );
+    return true;
   }
 
   private static resolveEndpoints(
@@ -1137,7 +1177,7 @@ export class SimulationRuntime {
     const entryPrice = isLimitOrder ? requestedLimit : pair.lastPrice;
     const atr = pair.indicators.atr ?? entryPrice * 0.01;
     const slDist =
-      input.stopLossMode === 'ATR'
+      input.stopLossMode === 'ATR' && this.config.features.atrDynamicExits
         ? atr * this.config.exits.atrSlMultiplier
         : entryPrice * (Math.max(0.2, input.stopLossPct) / 100);
 
@@ -1229,7 +1269,7 @@ export class SimulationRuntime {
   ): Position {
     const atr = pair.indicators.atr ?? entryPrice * 0.01;
     const slDist =
-      input.stopLossMode === 'ATR'
+      input.stopLossMode === 'ATR' && this.config.features.atrDynamicExits
         ? atr * this.config.exits.atrSlMultiplier
         : entryPrice * (Math.max(0.2, input.stopLossPct) / 100);
     const initialSl = input.side === 'Long' ? entryPrice - slDist : entryPrice + slDist;
@@ -1835,7 +1875,13 @@ export class SimulationRuntime {
     this.snapshot.autoStats.signalsDetected += 1;
     this.lastSignalTick.set(pair.symbol, this.snapshot.tickCount);
 
-    const plan = buildExitPlan(sig.side, sig.entryPrice, sig.atr, this.config.exits);
+    const plan = buildExitPlan(
+      sig.side,
+      sig.entryPrice,
+      sig.atr,
+      this.config.exits,
+      this.config.features
+    );
     const openCount =
       this.snapshot.pairs.filter((p) => p.openPosition !== null).length +
       this.snapshot.pendingOrders.length;
@@ -1991,7 +2037,7 @@ export class SimulationRuntime {
         limitPrice,
         timeInForce: auto.timeInForce,
         stopLossMode: 'ATR',
-        stopLossPct: 1.5,
+        stopLossPct: autoInput.stopLossPct,
         useBreakEven: true,
         useTrailingStop: true,
         targets: autoInput.targets,

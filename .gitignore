@@ -2,6 +2,9 @@ node_modules/
 build/
 dist/
 coverage/
+target/
+rust-bot/target/
+rust-bot/Cargo.lock
 .DS_Store
 *.log
 .env*
@@ -9,4 +12,5 @@ coverage/
 .env
 .env.*
 *.pem
+*.key
 .apexrust-order-logs.json

@@ -201,6 +201,11 @@ impl RiskManager {
         self.cooldown_until = None;
         self.lose_streak = 0;
         self.win_streak = 0;
+        self.quarantined_pairs.clear();
+    }
+
+    pub fn current_equity(&self) -> f64 {
+        self.current_equity
     }
 
     pub fn pair_daily_pnl(&self, symbol: &str) -> f64 {
@@ -296,5 +301,40 @@ pub fn compute_expectancy_and_profit_factor(
         0.0
     };
     (expectancy_r, profit_factor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bot_core::StrategyMode;
+
+    #[test]
+    fn reset_circuit_breaker_clears_quarantined_pairs() {
+        let risk_cfg = RiskConfig {
+            max_daily_drawdown_pct: 5.0,
+            max_pair_daily_drawdown_pct: 1.0,
+            max_daily_profit_pct: 10.0,
+            max_win_streak: 5,
+            max_lose_streak: 5,
+            streak_cooldown_minutes: 30,
+            flatten_on_circuit_breaker: true,
+        };
+        let trading_cfg = TradingConfig {
+            mode: StrategyMode::Scalping,
+            timeframe: "5m".into(),
+            pairs: vec!["BTCUSDT".into()],
+            max_concurrent_positions: 3,
+            base_risk_per_trade_pct: 0.75,
+            position_sizing_mode: bot_core::PositionSizingMode::FixedUsdt,
+            initial_equity_usdt: 10_000.0,
+            taker_fee_bps: 10.0,
+        };
+        let now = Utc::now();
+        let mut rm = RiskManager::new(risk_cfg, trading_cfg, now);
+        rm.record_realized_pnl("BTCUSDT", -150.0, now);
+        assert!(rm.status().quarantined_pairs.contains(&"BTCUSDT".to_string()));
+        rm.reset_circuit_breaker();
+        assert!(rm.status().quarantined_pairs.is_empty());
+    }
 }
 

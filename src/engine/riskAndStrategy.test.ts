@@ -856,6 +856,47 @@ test('Audit fixes: unclosed WS bars do not mutate indicators, breakEvenArmed sta
   assert.equal(expInf.profitFactor, Infinity);
 });
 
+test('Parity fixes: buildExitPlan honors atrDynamicExits=false and promoteExternalLivePendingOrder promotes filled live limit orders', () => {
+  const fixedPlan = buildExitPlan('Long', 100, 5.0, DEFAULT_BOT_CONFIG.exits, {
+    ...DEFAULT_BOT_CONFIG.features,
+    atrDynamicExits: false,
+  });
+  assert.ok(Math.abs(fixedPlan.initialStopLoss - 98.5) < 1e-6);
+  assert.ok(Math.abs(fixedPlan.takeProfit1 - 102.5) < 1e-6);
+  assert.ok(Math.abs(fixedPlan.takeProfit2 - 104.0) < 1e-6);
+
+  const liveRt = new SimulationRuntime(DEFAULT_BOT_CONFIG, 1_763_280_000_000, {
+    accountMode: 'Live',
+    seedDemoData: false,
+  });
+  liveRt.recordExternalLivePendingOrder(
+    {
+      symbol: 'BTCUSDT',
+      orderType: 'LIMIT',
+      side: 'Long',
+      usdtAmount: 200,
+      limitPrice: 90_000,
+      timeInForce: 'GTC',
+      stopLossMode: 'ATR',
+      stopLossPct: 1.5,
+      useBreakEven: true,
+      useTrailingStop: true,
+      targets: [{ pctOffset: 2.5, allocationPct: 100 }],
+    },
+    90_000,
+    '991122',
+    'Resting live LIMIT'
+  );
+  assert.equal(liveRt.snapshot.pendingOrders.length, 1);
+  const pendingId = liveRt.snapshot.pendingOrders[0].id;
+  const promoted = liveRt.promoteExternalLivePendingOrder(pendingId, 90_000, 0.00222);
+  assert.equal(promoted, true);
+  assert.equal(liveRt.snapshot.pendingOrders.length, 0);
+  const btc = liveRt.snapshot.pairs.find((p) => p.symbol === 'BTCUSDT')!;
+  assert.ok(btc.openPosition !== null);
+  assert.equal(btc.openPosition?.exchangeOrderId, '991122');
+});
+
 
 
 

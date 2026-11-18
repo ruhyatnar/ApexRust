@@ -407,20 +407,8 @@ pub fn manage_position_tick(
                 };
             }
 
-            // 3. Check Partial TP1
-            if pos.exit_plan.tp_ladder_enabled
-                && !pos.exit_plan.tp1_hit
-                && mark_price >= pos.exit_plan.take_profit_1
-            {
-                pos.exit_plan.tp1_hit = true;
-                return PositionTickAction::PartialClose {
-                    ratio: cfg.tp1_close_ratio,
-                    exit_price: pos.exit_plan.take_profit_1,
-                    reason: ExitReason::TakeProfit1,
-                };
-            }
-
-            // 4. Arm Break-Even at >= break_even_trigger_r
+            // 3. Arm Break-Even at >= break_even_trigger_r and update Monotonic ATR Trailing Stop
+            //    before evaluating PartialClose TP1 so a direct move to TP1 still protects the runner.
             let r_gain = (mark_price - pos.entry_price) / r;
             if pos.exit_plan.break_even_enabled
                 && !pos.exit_plan.break_even_armed
@@ -433,7 +421,6 @@ pub fn manage_position_tick(
                 pos.exit_plan.break_even_armed = true;
             }
 
-            // 5. Monotonic ATR Trailing Stop
             if pos.exit_plan.trailing_enabled
                 && r_gain >= cfg.trailing_activation_r
                 && current_atr > 0.0
@@ -443,6 +430,19 @@ pub fn manage_position_tick(
                 if trail_sl > pos.exit_plan.active_stop_loss {
                     pos.exit_plan.active_stop_loss = trail_sl;
                 }
+            }
+
+            // 4. Check Partial TP1
+            if pos.exit_plan.tp_ladder_enabled
+                && !pos.exit_plan.tp1_hit
+                && mark_price >= pos.exit_plan.take_profit_1
+            {
+                pos.exit_plan.tp1_hit = true;
+                return PositionTickAction::PartialClose {
+                    ratio: cfg.tp1_close_ratio,
+                    exit_price: pos.exit_plan.take_profit_1,
+                    reason: ExitReason::TakeProfit1,
+                };
             }
         }
         Side::Short => {
@@ -470,18 +470,6 @@ pub fn manage_position_tick(
                 };
             }
 
-            if pos.exit_plan.tp_ladder_enabled
-                && !pos.exit_plan.tp1_hit
-                && mark_price <= pos.exit_plan.take_profit_1
-            {
-                pos.exit_plan.tp1_hit = true;
-                return PositionTickAction::PartialClose {
-                    ratio: cfg.tp1_close_ratio,
-                    exit_price: pos.exit_plan.take_profit_1,
-                    reason: ExitReason::TakeProfit1,
-                };
-            }
-
             let r_gain = (pos.entry_price - mark_price) / r;
             if pos.exit_plan.break_even_enabled
                 && !pos.exit_plan.break_even_armed
@@ -503,6 +491,18 @@ pub fn manage_position_tick(
                 if trail_sl < pos.exit_plan.active_stop_loss {
                     pos.exit_plan.active_stop_loss = trail_sl;
                 }
+            }
+
+            if pos.exit_plan.tp_ladder_enabled
+                && !pos.exit_plan.tp1_hit
+                && mark_price <= pos.exit_plan.take_profit_1
+            {
+                pos.exit_plan.tp1_hit = true;
+                return PositionTickAction::PartialClose {
+                    ratio: cfg.tp1_close_ratio,
+                    exit_price: pos.exit_plan.take_profit_1,
+                    reason: ExitReason::TakeProfit1,
+                };
             }
         }
     }

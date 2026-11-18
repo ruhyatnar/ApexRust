@@ -323,11 +323,3 @@ export class IndicatorPipeline {
     return this.latest;
   }
 }
-
-export function computeIndicatorSeries(
-  candles: Candle[],
-  cfg: IndicatorConfig
-): IndicatorSnapshot[] {
-  const pipe = new IndicatorPipeline(cfg);
-  return candles.map((c) => pipe.update(c));
-}

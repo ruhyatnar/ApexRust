@@ -783,8 +783,37 @@ export default function App() {
         const currentPending = [...rt.snapshot.pendingOrders];
         for (const pending of currentPending) {
           if (pending.exchangeOrderId && !openIds.has(pending.exchangeOrderId)) {
-            rt.cancelPendingOrder(pending.id);
-            changed = true;
+            try {
+              const statusResp = await fetch(
+                `/api/live/order-status?symbol=${encodeURIComponent(pending.symbol)}&orderId=${encodeURIComponent(pending.exchangeOrderId)}&venue=${encodeURIComponent(config.trading.venue)}`
+              );
+              if (!statusResp.ok) continue;
+              const statusData = (await statusResp.json()) as {
+                ok?: boolean;
+                status?: string;
+                executedQty?: number;
+                avgPrice?: number;
+              };
+              if (!statusData.ok) continue;
+              if (statusData.status === 'FILLED') {
+                rt.promoteExternalLivePendingOrder(
+                  pending.id,
+                  statusData.avgPrice,
+                  statusData.executedQty,
+                  Date.now()
+                );
+                changed = true;
+              } else if (
+                statusData.status === 'CANCELED' ||
+                statusData.status === 'REJECTED' ||
+                statusData.status === 'EXPIRED'
+              ) {
+                rt.cancelPendingOrder(pending.id);
+                changed = true;
+              }
+            } catch {
+              // Ignore transient order-status error; retry next poll
+            }
           }
         }
         if (changed) {
@@ -1497,11 +1526,28 @@ export default function App() {
       if (!resp.ok || !data.ok) {
         return { ok: false, message: data.error ?? 'Failed to save credentials' };
       }
-      // Keep active venue / leverage aligned with vault selection
-      handleUpdateFuturesSettings(payload.leverage, payload.marginType);
-      if (payload.venue !== config.trading.venue) {
-        handleUpdateVenue(payload.venue);
+      // Keep active venue, leverage, marginType, and directionPolicy aligned atomically
+      const safeLeverage = Math.min(20, Math.max(1, payload.leverage));
+      const nextVenue = payload.venue;
+      const nextDirection =
+        nextVenue === 'Futures' ? 'both' : config.automation.directionPolicy;
+      if (nextVenue !== config.trading.venue) {
+        paperRuntimeRef.current?.setVenue(nextVenue);
+        liveRuntimeRef.current?.setVenue(nextVenue);
       }
+      handleUpdateConfig({
+        ...config,
+        trading: {
+          ...config.trading,
+          venue: nextVenue,
+          leverage: safeLeverage,
+          marginType: payload.marginType,
+        },
+        automation: {
+          ...config.automation,
+          directionPolicy: nextDirection,
+        },
+      });
       return {
         ok: true,
         message: `Credentials stored in server vault (${payload.venue} · ${payload.environment} · ${payload.authMethod}).`,

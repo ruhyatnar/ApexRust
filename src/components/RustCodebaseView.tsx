@@ -1,12 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import { Check, Copy, FileCode2, FolderTree, Search, Terminal } from 'lucide-react';
 
-// Dynamically bundle all actual files from /rust-bot/ via Vite glob raw import
-const rawRustModules = import.meta.glob('/rust-bot/**/*', {
-  query: '?raw',
-  import: 'default',
-  eager: true,
-}) as Record<string, string>;
+// Dynamically bundle all source/config/doc files from /rust-bot/ (excluding Cargo target artifacts)
+const rawRustModules = import.meta.glob(
+  ['/rust-bot/**/*', '!/rust-bot/target/**', '!/rust-bot/Cargo.lock'],
+  {
+    query: '?raw',
+    import: 'default',
+    eager: true,
+  }
+) as Record<string, string>;
 
 interface RustFileEntry {
   path: string;

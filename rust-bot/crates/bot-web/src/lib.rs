@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bot_core::EngineSnapshot;
+use bot_core::{EngineSnapshot, OrderExecutionMethod, Side};
 use bot_engine::{EngineCommand, TradingEngine};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -32,12 +32,19 @@ pub enum ControlAction {
     TripCb,
     ResetCb,
     FlattenAll,
+    BackupNow,
+    ManualOrder,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ControlRequest {
     pub action: ControlAction,
     pub reason: Option<String>,
+    pub symbol: Option<String>,
+    pub side: Option<Side>,
+    pub notional_usdt: Option<f64>,
+    pub order_method: Option<OrderExecutionMethod>,
+    pub limit_price: Option<f64>,
 }
 
 pub fn router(state: WebState) -> Router {
@@ -102,6 +109,14 @@ async fn control_handler(
         }
         ControlAction::ResetCb => EngineCommand::ResetCircuitBreaker,
         ControlAction::FlattenAll => EngineCommand::FlattenAll,
+        ControlAction::BackupNow => EngineCommand::BackupNow,
+        ControlAction::ManualOrder => EngineCommand::ManualOrder {
+            symbol: req.symbol.unwrap_or_else(|| "BTCUSDT".into()).to_uppercase(),
+            side: req.side.unwrap_or(Side::Long),
+            notional_usdt: req.notional_usdt.unwrap_or(150.0),
+            order_method: req.order_method.unwrap_or(OrderExecutionMethod::Market),
+            limit_price: req.limit_price,
+        },
     };
     let ok = state.cmd_tx.send(cmd).await.is_ok();
     Json(serde_json::json!({ "accepted": ok }))

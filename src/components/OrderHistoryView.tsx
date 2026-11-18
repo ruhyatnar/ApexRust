@@ -105,7 +105,13 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
         const params = new URLSearchParams();
         if (isSync) {
           params.set('syncBinance', '1');
-          params.set('symbol', symbolFilter !== 'ALL' ? symbolFilter : activeSymbol);
+          if (symbolFilter !== 'ALL') {
+            params.set('symbol', symbolFilter);
+          } else if (symbols.length > 0) {
+            params.set('symbols', symbols.join(','));
+          } else {
+            params.set('symbol', activeSymbol);
+          }
           params.set('venue', venueFilter !== 'ALL' ? venueFilter : activeVenue);
         }
         const queryStr = params.toString();

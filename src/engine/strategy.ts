@@ -436,11 +436,13 @@ export function buildExitPlan(
   side: Side,
   entryPrice: number,
   atr: number,
-  cfg: ExitConfig
+  cfg: ExitConfig,
+  features?: Partial<FeatureToggles>
 ): ExitPlan {
-  const slDist = atr * cfg.atrSlMultiplier;
-  const tp1Dist = atr * cfg.atrTp1Multiplier;
-  const tp2Dist = atr * cfg.atrTp2Multiplier;
+  const atrEnabled = features?.atrDynamicExits !== false;
+  const slDist = atrEnabled ? atr * cfg.atrSlMultiplier : entryPrice * 0.015;
+  const tp1Dist = atrEnabled ? atr * cfg.atrTp1Multiplier : entryPrice * 0.025;
+  const tp2Dist = atrEnabled ? atr * cfg.atrTp2Multiplier : entryPrice * 0.04;
 
   if (side === 'Long') {
     return {
@@ -450,7 +452,9 @@ export function buildExitPlan(
       takeProfit2: entryPrice + tp2Dist,
       tp1Hit: false,
       breakEvenArmed: false,
+      breakEvenEnabled: features?.breakEvenStop !== false,
       trailingActive: false,
+      trailingEnabled: features?.trailingStop !== false,
       riskDistanceR: slDist,
     };
   }
@@ -462,7 +466,9 @@ export function buildExitPlan(
     takeProfit2: entryPrice - tp2Dist,
     tp1Hit: false,
     breakEvenArmed: false,
+    breakEvenEnabled: features?.breakEvenStop !== false,
     trailingActive: false,
+    trailingEnabled: features?.trailingStop !== false,
     riskDistanceR: slDist,
   };
 }
@@ -500,6 +506,23 @@ export function managePositionTick(
       return { type: 'FullClose', exitPrice: pos.exitPlan.activeStopLoss, reason };
     }
 
+    const rGain = (markPrice - pos.entryPrice) / r;
+    if (beEnabled && !pos.exitPlan.breakEvenArmed && rGain >= cfg.breakEvenTriggerR) {
+      const bePrice = pos.entryPrice + feeBuffer;
+      if (bePrice > pos.exitPlan.activeStopLoss) {
+        pos.exitPlan.activeStopLoss = bePrice;
+      }
+      pos.exitPlan.breakEvenArmed = true;
+    }
+
+    if (trailEnabled && rGain >= cfg.trailingActivationR && currentAtr > 0) {
+      pos.exitPlan.trailingActive = true;
+      const trailSl = pos.highestFavorablePrice - currentAtr * cfg.atrTrailingMultiplier;
+      if (trailSl > pos.exitPlan.activeStopLoss) {
+        pos.exitPlan.activeStopLoss = trailSl;
+      }
+    }
+
     if (tpEnabled) {
       if (pos.exitPlan.tpTargets && pos.exitPlan.tpTargets.length > 0) {
         for (let i = 0; i < pos.exitPlan.tpTargets.length; i += 1) {
@@ -535,23 +558,6 @@ export function managePositionTick(
         }
       }
     }
-
-    const rGain = (markPrice - pos.entryPrice) / r;
-    if (beEnabled && !pos.exitPlan.breakEvenArmed && rGain >= cfg.breakEvenTriggerR) {
-      const bePrice = pos.entryPrice + feeBuffer;
-      if (bePrice > pos.exitPlan.activeStopLoss) {
-        pos.exitPlan.activeStopLoss = bePrice;
-      }
-      pos.exitPlan.breakEvenArmed = true;
-    }
-
-    if (trailEnabled && rGain >= cfg.trailingActivationR && currentAtr > 0) {
-      pos.exitPlan.trailingActive = true;
-      const trailSl = pos.highestFavorablePrice - currentAtr * cfg.atrTrailingMultiplier;
-      if (trailSl > pos.exitPlan.activeStopLoss) {
-        pos.exitPlan.activeStopLoss = trailSl;
-      }
-    }
     return { type: 'Hold' };
   }
 
@@ -566,6 +572,23 @@ export function managePositionTick(
         ? 'BreakEvenStop'
         : 'StopLoss';
     return { type: 'FullClose', exitPrice: pos.exitPlan.activeStopLoss, reason };
+  }
+
+  const rGain = (pos.entryPrice - markPrice) / r;
+  if (beEnabled && !pos.exitPlan.breakEvenArmed && rGain >= cfg.breakEvenTriggerR) {
+    const bePrice = pos.entryPrice - feeBuffer;
+    if (bePrice < pos.exitPlan.activeStopLoss) {
+      pos.exitPlan.activeStopLoss = bePrice;
+    }
+    pos.exitPlan.breakEvenArmed = true;
+  }
+
+  if (trailEnabled && rGain >= cfg.trailingActivationR && currentAtr > 0) {
+    pos.exitPlan.trailingActive = true;
+    const trailSl = pos.highestFavorablePrice + currentAtr * cfg.atrTrailingMultiplier;
+    if (trailSl < pos.exitPlan.activeStopLoss) {
+      pos.exitPlan.activeStopLoss = trailSl;
+    }
   }
 
   if (tpEnabled) {
@@ -601,23 +624,6 @@ export function managePositionTick(
           reason: 'TakeProfit1',
         };
       }
-    }
-  }
-
-  const rGain = (pos.entryPrice - markPrice) / r;
-  if (beEnabled && !pos.exitPlan.breakEvenArmed && rGain >= cfg.breakEvenTriggerR) {
-    const bePrice = pos.entryPrice - feeBuffer;
-    if (bePrice < pos.exitPlan.activeStopLoss) {
-      pos.exitPlan.activeStopLoss = bePrice;
-    }
-    pos.exitPlan.breakEvenArmed = true;
-  }
-
-  if (trailEnabled && rGain >= cfg.trailingActivationR && currentAtr > 0) {
-    pos.exitPlan.trailingActive = true;
-    const trailSl = pos.highestFavorablePrice + currentAtr * cfg.atrTrailingMultiplier;
-    if (trailSl < pos.exitPlan.activeStopLoss) {
-      pos.exitPlan.activeStopLoss = trailSl;
     }
   }
 

@@ -799,7 +799,18 @@ function isValidGitRemote(url: string): boolean {
 
 function ensureGitIgnoreDefaults(): void {
   const giPath = path.resolve(process.cwd(), '.gitignore');
-  const required = ['.env', '.env.*', '*.pem', 'node_modules/', 'dist/'];
+  const required = [
+    '.env',
+    '.env.*',
+    '*.pem',
+    '*.key',
+    'node_modules/',
+    'dist/',
+    'target/',
+    'rust-bot/target/',
+    'rust-bot/config/bot.toml',
+    '.apexrust-order-logs.json',
+  ];
   let current = '';
   if (fs.existsSync(giPath)) {
     current = fs.readFileSync(giPath, 'utf8');
@@ -1020,12 +1031,22 @@ async function bootstrapServer() {
   const app = express();
   app.use(express.json({ limit: '256kb' }));
 
-  // Reject cross-site mutating requests against local live execution, git, and order log endpoints
+  // Reject cross-site mutating requests and enforce optional APEXRUST_PROXY_TOKEN on sensitive routes
   app.use(['/api/live', '/api/git', '/api/orders'], (req, res, next) => {
     const fetchSite = req.headers['sec-fetch-site'];
     if (req.method !== 'GET' && fetchSite === 'cross-site') {
       res.status(403).json({ error: 'Cross-site request blocked for live trading and git safety.' });
       return;
+    }
+    const configuredToken = (process.env.APEXRUST_PROXY_TOKEN ?? '').trim();
+    if (configuredToken && req.method !== 'GET') {
+      const headerToken = String(req.headers['x-apexrust-token'] ?? '').trim();
+      const authHeader = String(req.headers.authorization ?? '').trim();
+      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      if (headerToken !== configuredToken && bearerToken !== configuredToken) {
+        res.status(401).json({ error: 'Unauthorized: missing or invalid APEXRUST_PROXY_TOKEN.' });
+        return;
+      }
     }
     next();
   });
@@ -1355,6 +1376,13 @@ async function bootstrapServer() {
     const requestedNotional = Number(body.quoteOrderQty ?? 0);
     const desiredLeverage = Math.min(20, Math.max(1, Math.round(Number(body.leverage ?? vault.leverage))));
 
+    if (venue === 'Spot' && side === 'SELL' && orderType === 'OCO') {
+      res.status(400).json({
+        error: 'Spot OCO short-entry is unsupported on Binance Spot. Use USD-M Futures for Short brackets.',
+      });
+      return;
+    }
+
     const baseEntryType = orderType === 'OCO' ? 'MARKET' : orderType;
     const orderParams: Record<string, string | number> = {
       symbol,
@@ -1363,7 +1391,8 @@ async function bootstrapServer() {
         venue === 'Futures' && baseEntryType === 'LIMIT_MAKER'
           ? 'LIMIT'
           : baseEntryType,
-      newOrderRespType: 'FULL',
+      // USD-M Futures /fapi/v1/order only supports ACK | RESULT (FULL is Spot-only)
+      newOrderRespType: venue === 'Futures' ? 'RESULT' : 'FULL',
     };
 
     let refPrice = requestedPrice > 0 ? requestedPrice : 0;
@@ -1519,7 +1548,7 @@ async function bootstrapServer() {
           }
         }
 
-        if (!preflightOnly) {
+        if (!preflightOnly && !body.reduceOnly) {
           const marginRes = await signedBinanceRequest(
             'POST',
             '/fapi/v1/marginType',
@@ -1763,7 +1792,7 @@ async function bootstrapServer() {
                 triggerPrice: tpFmt,
                 closePosition: 'true',
                 workingType,
-                priceProtect: 'TRUE',
+                priceProtect: 'true',
               },
               'Futures'
             ),
@@ -1779,7 +1808,7 @@ async function bootstrapServer() {
                 triggerPrice: slFmt,
                 closePosition: 'true',
                 workingType,
-                priceProtect: 'TRUE',
+                priceProtect: 'true',
               },
               'Futures'
             ),
@@ -1915,12 +1944,63 @@ async function bootstrapServer() {
         return;
       }
       const orders = Array.isArray(ordersRes.data) ? ordersRes.data : [];
-      res.json({ ok: true, venue, environment: vault.environment, orders });
+      let algoOrders: unknown[] = [];
+      if (venue === 'Futures') {
+        const algoRes = await signedBinanceRequest('GET', '/fapi/v1/algoOpenOrders', params, 'Futures');
+        if (algoRes.ok && Array.isArray(algoRes.data)) {
+          algoOrders = algoRes.data;
+        }
+      }
+      res.json({ ok: true, venue, environment: vault.environment, orders, algoOrders });
     } catch (err) {
       res.status(502).json({
         ok: false,
         error: err instanceof Error ? err.message : 'Failed to query open orders',
         orders: [],
+      });
+    }
+  });
+
+  app.get('/api/live/order-status', async (req, res) => {
+    if (!vault.apiKey || !vault.apiSecret) {
+      res.status(400).json({ ok: false, error: 'Live API credentials are not configured.' });
+      return;
+    }
+    const venue: ExchangeVenue = req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : vault.venue;
+    const symbol = typeof req.query.symbol === 'string' ? req.query.symbol.toUpperCase() : '';
+    const orderId = typeof req.query.orderId === 'string' ? req.query.orderId.trim() : '';
+    if (!symbol || !orderId) {
+      res.status(400).json({ ok: false, error: 'symbol and orderId are required.' });
+      return;
+    }
+    try {
+      const endpoint = venue === 'Futures' ? '/fapi/v1/order' : '/api/v3/order';
+      const queryRes = await signedBinanceRequest('GET', endpoint, { symbol, orderId }, venue);
+      if (!queryRes.ok) {
+        res.status(400).json({
+          ok: false,
+          error: `Binance ${queryRes.data.code ?? queryRes.status}: ${String(queryRes.data.msg ?? 'Order query failed')}`,
+        });
+        return;
+      }
+      const executedQty = Number(queryRes.data.executedQty ?? 0) || 0;
+      const cumQuote = Number(queryRes.data.cummulativeQuoteQty ?? queryRes.data.cumQuote ?? 0) || 0;
+      const rawPrice = Number(queryRes.data.avgPrice ?? queryRes.data.price ?? 0) || 0;
+      const avgPrice = executedQty > 0 && cumQuote > 0 ? cumQuote / executedQty : rawPrice;
+      res.json({
+        ok: true,
+        venue,
+        symbol,
+        orderId: String(queryRes.data.orderId ?? orderId),
+        status: String(queryRes.data.status ?? 'UNKNOWN').toUpperCase(),
+        executedQty,
+        avgPrice,
+        order: queryRes.data,
+      });
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed to query order status',
       });
     }
   });
@@ -2053,6 +2133,8 @@ async function bootstrapServer() {
         res.status(400).json({ error: msg });
         return;
       }
+      const canceledBinanceSide: 'BUY' | 'SELL' =
+        String(cancelRes.data.side ?? 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
       upsertOrderLogs([
         {
           id: `live-cancel-${symbol}-${orderId || orderListId || algoId}-${Date.now()}`,
@@ -2064,8 +2146,8 @@ async function bootstrapServer() {
           accountMode: 'Live',
           source: 'live_proxy',
           lifecycle: 'CANCEL',
-          side: 'Long',
-          binanceSide: 'SELL',
+          side: canceledBinanceSide === 'BUY' ? 'Long' : 'Short',
+          binanceSide: canceledBinanceSide,
           orderType: body.orderType ?? 'ORDER',
           timeInForce: 'GTC',
           status: 'CANCELED',
@@ -2288,23 +2370,38 @@ async function bootstrapServer() {
         };
       } else {
         const targetVenue = venueParam ?? vault.venue;
-        const targetSymbol = symbolParam ?? 'BTCUSDT';
+        const symbolsQuery =
+          typeof req.query.symbols === 'string' && req.query.symbols.trim().length > 0
+            ? req.query.symbols
+                .split(',')
+                .map((s) => s.trim().toUpperCase())
+                .filter(Boolean)
+            : null;
+        const targetSymbols = symbolParam
+          ? [symbolParam]
+          : symbolsQuery && symbolsQuery.length > 0
+            ? symbolsQuery
+            : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'AVAXUSDT'];
         const endpoint = targetVenue === 'Futures' ? '/fapi/v1/allOrders' : '/api/v3/allOrders';
         try {
-          const allOrdersRes = await signedBinanceRequest(
-            'GET',
-            endpoint,
-            { symbol: targetSymbol, limit: '50' },
-            targetVenue
-          );
-          if (!allOrdersRes.ok) {
-            syncResult = {
-              synced: false,
-              latencyMs: allOrdersRes.latencyMs,
+          let totalSynced = 0;
+          let lastLatencyMs: number | undefined;
+          let firstError: string | undefined;
+
+          for (const targetSymbol of targetSymbols) {
+            const allOrdersRes = await signedBinanceRequest(
+              'GET',
               endpoint,
-              error: `Binance ${allOrdersRes.data.code ?? allOrdersRes.status}: ${String(allOrdersRes.data.msg ?? 'Query failed')}`,
-            };
-          } else {
+              { symbol: targetSymbol, limit: '50' },
+              targetVenue
+            );
+            lastLatencyMs = allOrdersRes.latencyMs;
+            if (!allOrdersRes.ok) {
+              if (!firstError) {
+                firstError = `Binance ${allOrdersRes.data.code ?? allOrdersRes.status}: ${String(allOrdersRes.data.msg ?? 'Query failed')}`;
+              }
+              continue;
+            }
             const rawList = Array.isArray(allOrdersRes.data)
               ? (allOrdersRes.data as Array<Record<string, unknown>>)
               : [];
@@ -2386,10 +2483,21 @@ async function bootstrapServer() {
               };
             });
             upsertOrderLogs(mapped);
+            totalSynced += mapped.length;
+          }
+
+          if (totalSynced === 0 && firstError) {
+            syncResult = {
+              synced: false,
+              latencyMs: lastLatencyMs,
+              endpoint,
+              error: firstError,
+            };
+          } else {
             syncResult = {
               synced: true,
-              count: mapped.length,
-              latencyMs: allOrdersRes.latencyMs,
+              count: totalSynced,
+              latencyMs: lastLatencyMs,
               endpoint,
             };
           }

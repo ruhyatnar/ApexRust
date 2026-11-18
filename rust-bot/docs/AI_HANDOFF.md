@@ -6,6 +6,8 @@ This document helps developers and AI coding assistants inspect, modify, and ext
 
 ## 1. Non-Negotiable Invariants
 
+0. **Mandatory WebApp ↔ Desktop Parity (Every Change & Feature)**:
+   - Every change, bugfix, config field, feature toggle, strategy/risk rule, or execution capability MUST be implemented in **both** the WebApp (`src/` + `server.ts`) and the Rust Desktop/Daemon workspace (`rust-bot/`) in the same change set, with matching unit tests on both sides. Never land a feature in only one runtime.
 1. **Pure Logic Isolation & Deterministic Testing**:
    - `bot-indicators`, `bot-strategy`, and `bot-risk` (Rust) and `src/engine/indicators.ts`, `strategy.ts`, `risk.ts`, `quantAnalytics.ts`, `sessionWindows.ts`, and `configStorage.ts` (TypeScript) MUST remain pure, deterministic, and free of network I/O or hidden `Date.now()` / `Utc::now()` calls. Always pass `nowMs` / `now: DateTime<Utc>` as an explicit parameter.
 2. **Risk Gate & Feature Toggle Precedence**:
@@ -70,10 +72,10 @@ This document helps developers and AI coding assistants inspect, modify, and ext
   - `GET /api/health` -> `{ status, running, transport_mode, failover_count }`
   - `GET /api/config` -> Sanitized `BotConfig` (`exchange.credentials = None`)
   - `GET /api/snapshot` -> Full `EngineSnapshot` (venue, transport, risk, pairs, closed trades, `recent_volatility_alerts`)
-  - `POST /api/control` -> `{ "action": "pause" | "resume" | "trip_cb" | "reset_cb" | "flatten_all", "reason"?: string }`
+  - `POST /api/control` -> `{ "action": "pause" | "resume" | "trip_cb" | "reset_cb" | "flatten_all" | "backup_now" | "manual_order", "reason"?: string, "symbol"?: string, "side"?: "Long" | "Short", "notional_usdt"?: number, "order_method"?: "MARKET" | "LIMIT" | "LIMIT_MAKER" | "OCO", "limit_price"?: number }`
   - `WS /ws/telemetry` -> Broadcast stream of `EngineSnapshot` JSON frames
 - **Express Bridge (`server.ts`, default `:3000`)**:
-  - `GET /api/health`, `GET/POST/DELETE /api/live/config`, `POST /api/live/verify`, `POST /api/live/arm`, `POST/DELETE /api/live/order`, `GET /api/live/trades`, `GET /api/git/status`, `POST /api/git/init`, `POST /api/git/remote`, `POST /api/git/backup`
+  - `GET /api/health`, `GET /api/market/klines`, `GET /api/market/ticker`, `GET/POST/DELETE /api/live/config`, `POST /api/live/verify`, `POST /api/live/arm`, `POST/DELETE /api/live/order`, `GET /api/live/open-orders`, `GET /api/live/order-status`, `POST /api/live/cancel-open-brackets`, `GET /api/live/trades`, `GET/POST/DELETE /api/orders/history`, `GET /api/git/status`, `POST /api/git/init`, `POST /api/git/remote`, `POST /api/git/backup`
 
 ---
 
@@ -84,8 +86,14 @@ This document helps developers and AI coding assistants inspect, modify, and ext
 npm run lint && npm run build
 
 # Pure-logic TypeScript unit tests (node:test via tsx)
-npx --yes tsx --test src/engine/indicators.test.ts src/engine/riskAndStrategy.test.ts src/engine/configStorage.test.ts src/engine/sessionWindows.test.ts
+npx --yes tsx --test \
+  src/engine/indicators.test.ts \
+  src/engine/riskAndStrategy.test.ts \
+  src/engine/configStorage.test.ts \
+  src/engine/sessionWindows.test.ts \
+  src/engine/orderHistoryAnalytics.test.ts \
+  src/engine/liveFillNotifications.test.ts
 
-# Rust workspace tests (when Rust/Cargo toolchain is installed)
-cd rust-bot && cargo test --workspace
+# Rust workspace tests & clippy
+cd rust-bot && cargo test --workspace && cargo clippy --workspace
 ```
