@@ -15,7 +15,6 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-authors = ["ApexRust Quant Contributors"]
 
 [workspace.dependencies]
 # Official Binance Rust Connector SDK (https://developers.binance.com/en/docs/sdks-tools/connectors/rust)

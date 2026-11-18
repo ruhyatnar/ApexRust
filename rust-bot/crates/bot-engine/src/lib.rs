@@ -204,9 +204,23 @@ impl TradingEngine {
         }
     }
 
+    fn find_git_root() -> PathBuf {
+        if let Ok(mut cur) = std::env::current_dir() {
+            for _ in 0..4 {
+                if cur.join(".git").exists() {
+                    return cur;
+                }
+                if !cur.pop() {
+                    break;
+                }
+            }
+        }
+        PathBuf::from(".")
+    }
+
     fn run_git_backup(&self, reason: &str) {
         let sync = GitBackupSync::new(self.cfg.git_backup.clone());
-        let repo_root = PathBuf::from(".");
+        let repo_root = Self::find_git_root();
         match sync.backup_snapshot(&repo_root, reason) {
             Ok(outcome) => info!(summary = %outcome.summary, "Git backup sync completed"),
             Err(err) => warn!(%err, "Git backup sync failed"),
