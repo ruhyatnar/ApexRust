@@ -1,5 +1,5 @@
 {
-  "backedUpAt": "2026-11-18T11:09:17.834Z",
+  "backedUpAt": "2026-11-18T11:09:26.727Z",
   "environment": "Testnet",
   "venue": "Spot",
   "leverage": 3,
@@ -99,8 +99,8 @@
     },
     "features": {
       "automatedTrading": false,
-      "manualTrading": true,
-      "signalGenerator": true,
+      "manualTrading": false,
+      "signalGenerator": false,
       "wsPrimaryFeed": true,
       "restFallback": true,
       "emaTrendFilter": true,
@@ -108,14 +108,14 @@
       "adxStrengthFilter": true,
       "vwapBiasFilter": true,
       "volumeConfirmationFilter": true,
-      "sessionWindowFilter": true,
+      "sessionWindowFilter": false,
       "atrDynamicExits": true,
       "takeProfitLadder": true,
       "breakEvenStop": true,
       "trailingStop": true,
       "circuitBreaker": true,
-      "spotMarket": true,
-      "futuresMarket": true,
+      "spotMarket": false,
+      "futuresMarket": false,
       "gitAutoBackup": true
     }
   },
