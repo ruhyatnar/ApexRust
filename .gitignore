@@ -18,3 +18,4 @@ rust-bot/Cargo.lock
 *.pem
 *.key
 .apexrust-order-logs.json
+rust-bot/config/bot.toml

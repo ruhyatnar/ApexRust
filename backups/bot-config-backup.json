@@ -1,5 +1,5 @@
 {
-  "backedUpAt": "2026-11-17T10:44:26.055Z",
+  "backedUpAt": "2026-11-18T11:09:14.020Z",
   "environment": "Testnet",
   "venue": "Spot",
   "leverage": 3,
@@ -7,10 +7,10 @@
   "config": {
     "trading": {
       "venue": "Spot",
-      "leverage": 10,
-      "marginType": "CROSSED",
+      "leverage": 3,
+      "marginType": "ISOLATED",
       "mode": "scalping",
-      "timeframe": "15m",
+      "timeframe": "5m",
       "pairs": [
         "BTCUSDT",
         "ETHUSDT",
@@ -20,6 +20,7 @@
       ],
       "maxConcurrentPositions": 3,
       "baseRiskPerTradePct": 0.75,
+      "positionSizingMode": "fixed_usdt",
       "initialEquityUsdt": 10000,
       "takerFeeBps": 10
     },
@@ -36,7 +37,12 @@
       "adxPeriod": 14,
       "adxMinTrend": 25,
       "atrPeriod": 14,
-      "requireVwapAlignment": true
+      "requireVwapAlignment": true,
+      "minVolumeExpansionMult": 1.5,
+      "volatilityAlertsEnabled": true,
+      "atrSpikePctThreshold": 0.45,
+      "atrExpansionRatioThreshold": 1.25,
+      "volatilityAlertCooldownSec": 60
     },
     "exits": {
       "atrSlMultiplier": 1.5,
@@ -44,7 +50,7 @@
       "atrTp2Multiplier": 3.75,
       "tp1CloseRatio": 0.5,
       "breakEvenTriggerR": 1,
-      "breakEvenFeeBufferBps": 12,
+      "breakEvenFeeBufferBps": 25,
       "trailingActivationR": 1.2,
       "atrTrailingMultiplier": 1.4
     },
@@ -60,13 +66,36 @@
     "automation": {
       "enabled": true,
       "strategyProfile": "trend_pullback",
-      "directionPolicy": "both",
-      "orderMethod": "OCO",
+      "directionPolicy": "long_only",
+      "orderMethod": "MARKET",
       "limitOffsetBps": 5,
       "timeInForce": "GTC",
       "signalCooldownBars": 2,
       "autoOrderNotionalUsdt": 150,
-      "autoCloseOnExit": true
+      "autoCloseOnExit": true,
+      "sessionWindows": [
+        {
+          "id": "london-open",
+          "label": "London Open",
+          "startUtc": "07:00",
+          "endUtc": "11:00",
+          "enabled": true
+        },
+        {
+          "id": "london-ny-overlap",
+          "label": "London / NY Overlap",
+          "startUtc": "12:30",
+          "endUtc": "16:30",
+          "enabled": true
+        },
+        {
+          "id": "us-close-auction",
+          "label": "US Equities Close",
+          "startUtc": "19:00",
+          "endUtc": "21:00",
+          "enabled": false
+        }
+      ]
     },
     "features": {
       "automatedTrading": true,
@@ -78,6 +107,8 @@
       "rsiMomentumFilter": true,
       "adxStrengthFilter": true,
       "vwapBiasFilter": true,
+      "volumeConfirmationFilter": true,
+      "sessionWindowFilter": true,
       "atrDynamicExits": true,
       "takeProfitLadder": true,
       "breakEvenStop": true,
