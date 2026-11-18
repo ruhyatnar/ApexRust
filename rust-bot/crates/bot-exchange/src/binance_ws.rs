@@ -66,7 +66,28 @@ impl BinanceWsDriver {
             (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
                 "wss://stream.binancefuture.com/stream"
             }
-            (ExchangeVenue::Spot, _) => self.cfg.ws_stream_url.as_str(),
+            (ExchangeVenue::Spot, ExchangeEnvironment::Production) => {
+                if self.cfg.ws_stream_url.trim().is_empty()
+                    || self.cfg.ws_stream_url.contains("testnet")
+                    || self.cfg.ws_stream_url.contains("fstream")
+                    || self.cfg.ws_stream_url.contains("binancefuture")
+                {
+                    "wss://stream.binance.com:9443/stream"
+                } else {
+                    self.cfg.ws_stream_url.as_str()
+                }
+            }
+            (ExchangeVenue::Spot, ExchangeEnvironment::Testnet) => {
+                if self.cfg.ws_stream_url.trim().is_empty()
+                    || self.cfg.ws_stream_url.contains("stream.binance.com")
+                    || self.cfg.ws_stream_url.contains("fstream")
+                    || self.cfg.ws_stream_url.contains("binancefuture")
+                {
+                    "wss://stream.testnet.binance.vision/stream"
+                } else {
+                    self.cfg.ws_stream_url.as_str()
+                }
+            }
         };
         let streams = self
             .pairs

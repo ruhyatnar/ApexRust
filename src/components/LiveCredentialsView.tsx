@@ -66,6 +66,26 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
+  React.useEffect(() => {
+    setEnvironment(liveStatus.environment);
+    setVenue(liveStatus.venue ?? 'Spot');
+    setLeverage(liveStatus.leverage ?? 3);
+    setMarginType(liveStatus.marginType ?? 'ISOLATED');
+    setAuthMethod(liveStatus.authMethod);
+    setRecvWindowMs(liveStatus.recvWindowMs);
+    setMaxOrderNotionalUsdt(liveStatus.maxOrderNotionalUsdt);
+    setRequirePreflight(liveStatus.requirePreflightTestOrder);
+  }, [
+    liveStatus.environment,
+    liveStatus.venue,
+    liveStatus.leverage,
+    liveStatus.marginType,
+    liveStatus.authMethod,
+    liveStatus.recvWindowMs,
+    liveStatus.maxOrderNotionalUsdt,
+    liveStatus.requirePreflightTestOrder,
+  ]);
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusyAction('save');
@@ -313,7 +333,7 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
               spellCheck={false}
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder={liveStatus.apiKeyMasked ?? 'Paste Binance Spot API Key'}
+              placeholder={liveStatus.apiKeyMasked ?? 'Paste Binance Spot / Futures API Key'}
               className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-[#7DF2AD] focus:outline-none"
             />
           </div>

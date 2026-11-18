@@ -145,6 +145,66 @@ pub enum OrderExecutionMethod {
     Oco,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PositionSizingMode {
+    #[default]
+    FixedUsdt,
+    FixedRiskPct,
+    QuarterKelly,
+    HalfKelly,
+    FullKelly,
+}
+
+fn default_time_in_force() -> String {
+    "GTC".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UtcSessionWindow {
+    pub id: String,
+    pub label: String,
+    pub start_utc: String,
+    pub end_utc: String,
+    pub enabled: bool,
+}
+
+fn default_session_windows() -> Vec<UtcSessionWindow> {
+    vec![
+        UtcSessionWindow {
+            id: "london-open".into(),
+            label: "London Open".into(),
+            start_utc: "07:00".into(),
+            end_utc: "11:00".into(),
+            enabled: true,
+        },
+        UtcSessionWindow {
+            id: "london-ny-overlap".into(),
+            label: "London / NY Overlap".into(),
+            start_utc: "12:30".into(),
+            end_utc: "16:30".into(),
+            enabled: true,
+        },
+        UtcSessionWindow {
+            id: "us-close-auction".into(),
+            label: "US Equities Close".into(),
+            start_utc: "19:00".into(),
+            end_utc: "21:00".into(),
+            enabled: false,
+        },
+    ]
+}
+
+fn parse_utc_hhmm_minutes(hhmm: &str) -> Option<u32> {
+    let mut parts = hhmm.trim().split(':');
+    let h: u32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || h > 23 || m > 59 {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationConfig {
     pub enabled: bool,
@@ -152,9 +212,44 @@ pub struct AutomationConfig {
     pub direction_policy: DirectionPolicy,
     pub order_method: OrderExecutionMethod,
     pub limit_offset_bps: f64,
+    #[serde(default = "default_time_in_force")]
+    pub time_in_force: String,
     pub signal_cooldown_bars: u32,
     pub auto_order_notional_usdt: f64,
     pub auto_close_on_exit: bool,
+    #[serde(default = "default_session_windows")]
+    pub session_windows: Vec<UtcSessionWindow>,
+}
+
+impl AutomationConfig {
+    /// Returns true if `now` falls inside at least one enabled daily UTC liquidity window.
+    pub fn is_within_session_windows(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::Timelike;
+        let minute_of_day = now.hour() * 60 + now.minute();
+        let enabled: Vec<&UtcSessionWindow> =
+            self.session_windows.iter().filter(|w| w.enabled).collect();
+        if enabled.is_empty() {
+            return false;
+        }
+        for win in enabled {
+            if let (Some(start), Some(end)) = (
+                parse_utc_hhmm_minutes(&win.start_utc),
+                parse_utc_hhmm_minutes(&win.end_utc),
+            ) {
+                let inside = if start == end {
+                    true
+                } else if start < end {
+                    minute_of_day >= start && minute_of_day < end
+                } else {
+                    minute_of_day >= start || minute_of_day < end
+                };
+                if inside {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 impl Default for AutomationConfig {
@@ -165,9 +260,11 @@ impl Default for AutomationConfig {
             direction_policy: DirectionPolicy::LongOnly,
             order_method: OrderExecutionMethod::Market,
             limit_offset_bps: 5.0,
+            time_in_force: "GTC".into(),
             signal_cooldown_bars: 2,
             auto_order_notional_usdt: 150.0,
             auto_close_on_exit: true,
+            session_windows: default_session_windows(),
         }
     }
 }
@@ -184,6 +281,10 @@ pub struct FeatureToggles {
     pub rsi_momentum_filter: bool,
     pub adx_strength_filter: bool,
     pub vwap_bias_filter: bool,
+    #[serde(default)]
+    pub volume_confirmation_filter: bool,
+    #[serde(default)]
+    pub session_window_filter: bool,
     pub atr_dynamic_exits: bool,
     pub take_profit_ladder: bool,
     pub break_even_stop: bool,
@@ -206,6 +307,8 @@ impl Default for FeatureToggles {
             rsi_momentum_filter: true,
             adx_strength_filter: true,
             vwap_bias_filter: true,
+            volume_confirmation_filter: false,
+            session_window_filter: false,
             atr_dynamic_exits: true,
             take_profit_ladder: true,
             break_even_stop: true,
@@ -246,8 +349,26 @@ pub struct TradingConfig {
     pub pairs: Vec<String>,
     pub max_concurrent_positions: usize,
     pub base_risk_per_trade_pct: f64,
+    #[serde(default)]
+    pub position_sizing_mode: PositionSizingMode,
     pub initial_equity_usdt: f64,
     pub taker_fee_bps: f64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_min_volume_expansion_mult() -> f64 {
+    1.5
+}
+fn default_atr_spike_pct_threshold() -> f64 {
+    0.45
+}
+fn default_atr_expansion_ratio_threshold() -> f64 {
+    1.25
+}
+fn default_volatility_alert_cooldown_sec() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,6 +386,16 @@ pub struct IndicatorConfig {
     pub adx_min_trend: f64,
     pub atr_period: usize,
     pub require_vwap_alignment: bool,
+    #[serde(default = "default_min_volume_expansion_mult")]
+    pub min_volume_expansion_mult: f64,
+    #[serde(default = "default_true")]
+    pub volatility_alerts_enabled: bool,
+    #[serde(default = "default_atr_spike_pct_threshold")]
+    pub atr_spike_pct_threshold: f64,
+    #[serde(default = "default_atr_expansion_ratio_threshold")]
+    pub atr_expansion_ratio_threshold: f64,
+    #[serde(default = "default_volatility_alert_cooldown_sec")]
+    pub volatility_alert_cooldown_sec: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

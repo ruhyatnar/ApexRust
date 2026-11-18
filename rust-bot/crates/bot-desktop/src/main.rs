@@ -20,9 +20,9 @@ struct Cli {
     #[arg(short, long, default_value = "config/bot.example.toml")]
     config: PathBuf,
 
-    /// Optional WebApp telemetry bind port (e.g. 8080). Set 0 to disable web server.
-    #[arg(long, default_value_t = 8080)]
-    web_port: u16,
+    /// Optional WebApp telemetry bind port override (e.g. 8080). Set 0 to disable web server; omit to use config web.bind_addr.
+    #[arg(long)]
+    web_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -35,8 +35,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let cfg = BotConfig::from_toml_file(&cli.config)
-        .with_context(|| format!("Unable to load config at {}", cli.config.display()))?;
+    let config_path = if !cli.config.exists()
+        && cli.config == PathBuf::from("config/bot.example.toml")
+        && PathBuf::from("rust-bot/config/bot.example.toml").exists()
+    {
+        PathBuf::from("rust-bot/config/bot.example.toml")
+    } else {
+        cli.config.clone()
+    };
+    let cfg = BotConfig::from_toml_file(&config_path)
+        .with_context(|| format!("Unable to load config at {}", config_path.display()))?;
 
     info!(
         mode = ?cfg.trading.mode,
@@ -48,9 +56,20 @@ async fn main() -> anyhow::Result<()> {
     let engine = Arc::new(TradingEngine::new(cfg.clone())?);
     let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCommand>(32);
 
-    // Spawn embedded Axum WebApp API & WebSocket bridge if requested
-    if cli.web_port > 0 {
-        let addr = format!("127.0.0.1:{}", cli.web_port);
+    // Spawn embedded Axum WebApp API & WebSocket bridge unless disabled with --web-port 0
+    let bind_addr = match cli.web_port {
+        Some(0) => None,
+        Some(port) => Some(format!("127.0.0.1:{port}")),
+        None => {
+            let trimmed = cfg.web.bind_addr.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    };
+    if let Some(addr) = bind_addr {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         let app = bot_web::router(WebState {
             engine: Arc::clone(&engine),

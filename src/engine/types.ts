@@ -35,6 +35,8 @@ export interface ManualOrderInput {
   usdtAmount: number;
   limitPrice?: number;
   timeInForce?: TimeInForce;
+  workingType?: 'MARK_PRICE' | 'CONTRACT_PRICE';
+  reduceOnly?: boolean;
   stopLossMode: 'MARKET' | 'ATR' | 'LIMIT';
   stopLossPct: number;
   useBreakEven: boolean;
@@ -109,6 +111,7 @@ export interface ExitPlan {
   tpTargets?: TakeProfitTarget[];
   tp1Hit: boolean;
   breakEvenArmed: boolean;
+  breakEvenEnabled?: boolean;
   trailingActive: boolean;
   trailingEnabled?: boolean;
   riskDistanceR: number;
@@ -124,10 +127,14 @@ export interface Position {
   lockedMarginUsdt: number;
   unrealizedPnlUsdt: number;
   realizedPnlUsdt: number;
+  feePaidUsdt?: number;
   highestFavorablePrice: number;
   exitPlan: ExitPlan;
   openedAtMs: number;
   rationale: string;
+  exchangeOrderId?: string;
+  exchangeListId?: number;
+  exchangeAlgoIds?: string[];
 }
 
 export interface ClosedTrade {
@@ -190,6 +197,48 @@ export interface BinanceExecutionRecord {
   transactTime: number;
 }
 
+export type OrderExecutionStatus =
+  | 'FILLED'
+  | 'PARTIALLY_FILLED'
+  | 'NEW'
+  | 'CANCELED'
+  | 'REJECTED'
+  | 'EXPIRED';
+
+export interface OrderExecutionLog {
+  id: string;
+  orderId: string;
+  clientOrderId: string;
+  orderListId?: number;
+  algoOrderIds?: string[];
+  symbol: string;
+  venue: ExchangeVenue;
+  environment: 'Testnet' | 'Production';
+  accountMode: ExecutionAccountMode;
+  source: 'paper_engine' | 'live_proxy' | 'binance_all_orders';
+  lifecycle: 'ENTRY' | 'EXIT' | 'CANCEL' | 'PREFLIGHT';
+  side: Side;
+  binanceSide: 'BUY' | 'SELL';
+  orderType: string;
+  timeInForce: string;
+  status: OrderExecutionStatus;
+  price: number;
+  executedQty: number;
+  origQty: number;
+  quoteQty: number;
+  commission: number;
+  commissionAsset: string;
+  isMaker: boolean;
+  realizedPnlUsdt: number | null;
+  rMultiple: number | null;
+  exitReason: string | null;
+  latencyMs: number | null;
+  endpoint: string;
+  rationale: string;
+  errorMessage?: string;
+  timestampMs: number;
+}
+
 export interface EntrySignal {
   symbol: string;
   side: Side;
@@ -230,6 +279,23 @@ export interface IndicatorConfig {
   atrPeriod: number;
   requireVwapAlignment: boolean;
   minVolumeExpansionMult?: number;
+  volatilityAlertsEnabled?: boolean;
+  atrSpikePctThreshold?: number;
+  atrExpansionRatioThreshold?: number;
+  volatilityAlertCooldownSec?: number;
+}
+
+export interface VolatilitySpikeAlert {
+  id: string;
+  symbol: string;
+  price: number;
+  atr: number;
+  atrPctOfPrice: number;
+  atrExpansionRatio: number;
+  candleRangePct: number;
+  severity: 'elevated' | 'extreme';
+  message: string;
+  timestampMs: number;
 }
 
 export interface ExitConfig {
@@ -253,6 +319,14 @@ export interface RiskConfig {
   flattenOnCircuitBreaker: boolean;
 }
 
+export interface UtcTimeWindow {
+  id: string;
+  label: string;
+  startUtc: string; // HH:MM in 24h UTC
+  endUtc: string; // HH:MM in 24h UTC
+  enabled: boolean;
+}
+
 export interface AutomationConfig {
   enabled: boolean;
   strategyProfile: StrategyProfile;
@@ -263,6 +337,7 @@ export interface AutomationConfig {
   signalCooldownBars: number;
   autoOrderNotionalUsdt: number;
   autoCloseOnExit: boolean;
+  sessionWindows?: UtcTimeWindow[];
 }
 
 export interface FeatureToggles {
@@ -276,6 +351,7 @@ export interface FeatureToggles {
   adxStrengthFilter: boolean;
   vwapBiasFilter: boolean;
   volumeConfirmationFilter?: boolean;
+  sessionWindowFilter: boolean;
   atrDynamicExits: boolean;
   takeProfitLadder: boolean;
   breakEvenStop: boolean;
@@ -404,6 +480,7 @@ export interface EngineSnapshot {
   pendingOrders: PendingOrder[];
   recentTrades: ClosedTrade[];
   executionHistory: BinanceExecutionRecord[];
+  volatilityAlerts?: VolatilitySpikeAlert[];
   autoStats: AutoTradingStats;
   eventLog: Array<{ id: string; timestampMs: number; level: 'info' | 'warn' | 'alert'; message: string }>;
 }

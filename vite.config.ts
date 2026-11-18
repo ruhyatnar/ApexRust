@@ -3,12 +3,90 @@ import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
+import {VitePWA} from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
     plugins: [
       react(),
       tailwindcss(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'icon.svg'],
+        manifest: {
+          id: '/',
+          name: 'ApexRust Quant',
+          short_name: 'ApexRust',
+          description:
+            'Multi-pair crypto scalping and intraday trend-following trading bot with WebSocket primary transport, REST fallback, ATR exits, and risk circuit breakers.',
+          theme_color: '#0D1015',
+          background_color: '#0B0F17',
+          display: 'standalone',
+          orientation: 'any',
+          start_url: '/',
+          scope: '/',
+          categories: ['finance', 'productivity'],
+          icons: [
+            {
+              src: '/pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: '/pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: '/pwa-maskable-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'maskable',
+            },
+          ],
+        },
+        workbox: {
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          navigateFallbackDenylist: [/^\/api\//, /^\/_ah\//],
+          runtimeCaching: [
+            {
+              urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'google-fonts-cache',
+                expiration: {
+                  maxEntries: 10,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
+            {
+              urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'gstatic-fonts-cache',
+                expiration: {
+                  maxEntries: 10,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                },
+                cacheableResponse: {
+                  statuses: [0, 200],
+                },
+              },
+            },
+          ],
+        },
+        devOptions: {
+          // Disabled in dev because vite-plugin-pwa's dev SW relies on HMR WebSocket events,
+          // while HMR is intentionally disabled in this runtime (production build still generates sw.js & manifest).
+          enabled: false,
+        },
+      }),
       // Copies src/assets into dist/ so root-relative URLs like
       // "/src/assets/images/..." (e.g. generate_image output) still resolve
       // in production builds. Do not remove.
@@ -19,8 +97,9 @@ export default defineConfig(() => {
           if (error) {
             return;
           }
-          const distDir = path.resolve(__dirname, 'dist');
-          const srcAssets = path.resolve(__dirname, 'src/assets');
+          const rootDir = import.meta.dirname;
+          const distDir = path.resolve(rootDir, 'dist');
+          const srcAssets = path.resolve(rootDir, 'src/assets');
           const distAssets = path.resolve(distDir, 'src/assets');
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
@@ -30,7 +109,7 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
       },
     },
     server: {

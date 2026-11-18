@@ -6,23 +6,27 @@ A modular, production-structured **Rust** cryptocurrency trading bot built on to
 
 ```text
 rust-bot/
-├── Cargo.toml                     # Cargo workspace (binance-sdk 78.x spot + derivatives_trading_usds_futures)
-├── config/bot.example.toml        # Complete Spot/Futures, Automation, FeatureToggles, Risk & Git Backup config
+├── Cargo.toml                     # Cargo workspace (binance-sdk 78.1 Spot + USD-M Futures, Axum, Tokio)
+├── README.md                      # This guide
+├── config/
+│   ├── bot.example.toml           # Complete Spot/Futures, Automation, Session Windows, FeatureToggles, Risk & Git config
+│   └── bot.synced.toml            # Auto-generated sanitized snapshot synced from the Web Command Center (no secrets)
 ├── deploy/
 │   ├── git-backup.sh              # Sanitized Git sync & backup script (never commits keys/secrets)
 │   └── rust-quant-bot.service     # Linux systemd unit for headless 24/7 operation
 ├── docs/
-│   ├── ARCHITECTURE.md            # Crate graph, WS/REST failover, OCO/GTX flows, Futures margin & Git sync
-│   └── AI_HANDOFF.md              # Invariants and extension guide for developers & AI assistants
+│   ├── ARCHITECTURE.md            # Crate graph, Web/Express bridge, WS/REST failover, OCO/GTX & FeatureToggles
+│   ├── STRATEGY_GUIDE.md          # Multi-profile signals, Volume & UTC gates, ATR exits, Volatility alerts & Kelly sizing
+│   └── AI_HANDOFF.md              # Invariants, TS <-> Rust parity map, and extension guide for developers & AI agents
 └── crates/
-    ├── bot-core/                  # Shared models, Spot/Futures config, FeatureToggles, GitBackupConfig
-    ├── bot-indicators/            # Streaming EMA(9/21/50/200), Wilder RSI(14), ADX(14), ATR(14), Session VWAP
-    ├── bot-strategy/              # Multi-profile signal generator + ATR SL/TP/Break-Even/Trailing exits
+    ├── bot-core/                  # Shared models, Spot/Futures config, UtcSessionWindow, FeatureToggles, VolatilitySpikeAlert
+    ├── bot-indicators/            # Streaming EMA(9/21/50/200), Wilder RSI(14), ADX(14), ATR(14), Session VWAP, Vol Avg(20)
+    ├── bot-strategy/              # Multi-profile signals (Pullback/Breakout/VWAP) + ATR SL/TP/Break-Even/Trailing exits
     ├── bot-risk/                  # Drawdown (pair & cumulative), Profit lock, Streak cooldown, Circuit Breaker
     ├── bot-exchange/              # binance-sdk Spot + USD-M Futures (WS primary + REST fallback, MARKET/LIMIT/GTX/OCO)
-    ├── bot-engine/                # Tokio single-writer orchestrator + sanitized git_sync backup module
+    ├── bot-engine/                # Tokio orchestrator: UTC session gating, ATR volatility spike monitor & sanitized git_sync
     ├── bot-web/                   # Embedded Axum HTTP + WebSocket telemetry bridge (:8080)
-    └── bot-desktop/               # Linux Desktop CLI & daemon entry point
+    └── bot-desktop/               # Linux Desktop CLI & systemd daemon entry point
 ```
 
 ## Key Capabilities
@@ -39,23 +43,35 @@ rust-bot/
 3. **Multi-Pair Trend-Following Scalping & Intraday Engine**
    - Concurrent per-symbol state machines (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BNBUSDT`, `AVAXUSDT`, configurable).
    - **Strategies**: `trend_pullback` (EMA stack + RSI curl), `ema_breakout`, and `vwap_reversion`.
-   - **Indicators**: Triple EMA (`9 / 21 / 50 / 200`), `ADX(14)` with `+DI / -DI`, `Wilder RSI(14)`, `ATR(14)`, and `Session VWAP`.
+   - **Indicators**: Triple/Macro EMA (`9 / 21 / 50 / 200`), `ADX(14)` with `+DI / -DI`, `Wilder RSI(14)`, `ATR(14)`, `Session VWAP`, and 20-bar Average Volume expansion confirmation.
 
-4. **ATR-Based Exit Lifecycle (SL, TP, Break-Even, Trailing Stop)**
-   - **Initial Stop Loss**: `Entry ± (atr_sl_mult × ATR)`
-   - **Partial Take Profit Ladder (TP1 / TP2)**: Configurable ATR or percentage targets
-   - **Automatic Break-Even**: Moves SL to `Entry + fee_buffer` once unrealized gain reaches `break_even_trigger_r`
+4. **Daily UTC Liquidity Session Windows**
+   - Optional `features.session_window_filter` restricts new automated entries in `bot-engine` to configured daily `[[automation.session_windows]]` UTC intervals (supporting standard and overnight wrap schedules via `AutomationConfig::is_within_session_windows`).
+   - Open position exit management (`manage_position_tick`) runs **24/7** even outside active UTC windows so existing risk/profit exits are never stranded.
+
+5. **ATR-Based Exit Lifecycle & Volatility Spike Alerts**
+   - **Initial Stop Loss**: `Entry ± (atr_sl_multiplier × ATR)`
+   - **Partial Take Profit Ladder (TP1 / TP2)**: Configurable ATR multipliers and close ratio
+   - **Automatic Break-Even**: Moves SL to `Entry ± fee_buffer` once unrealized gain reaches `break_even_trigger_r`
    - **ATR Trailing Stop**: Monotonically ratchets SL once `trailing_activation_r` is reached
+   - **ATR Volatility Spike Alerts**: Monitors `atr_spike_pct_threshold` (% of price) and `atr_expansion_ratio_threshold` (vs prior ATR / TR) with per-pair `volatility_alert_cooldown_sec`, emitting `VolatilitySpikeAlert` telemetry.
 
-5. **Granular Toggle for Every Feature (`[features]`)**
-   - Independently enable/disable automated trading, manual trading, signal generator, WebSocket primary feed, REST fallback, individual indicators (`EMA`, `RSI`, `ADX`, `VWAP`), exit modules (`ATR Exits`, `TP Ladder`, `Break-Even`, `Trailing Stop`), circuit breaker, Spot/Futures venues, and Git auto-backup.
+6. **Granular Toggle for All 19 Features (`[features]`)**
+   - **Core**: `automated_trading`, `session_window_filter`, `manual_trading`, `signal_generator`
+   - **Venues**: `spot_market`, `futures_market`
+   - **Transport**: `ws_primary_feed`, `rest_fallback`
+   - **Indicators**: `ema_trend_filter`, `rsi_momentum_filter`, `adx_strength_filter`, `vwap_bias_filter`, `volume_confirmation_filter`
+   - **Exits**: `atr_dynamic_exits`, `take_profit_ladder`, `break_even_stop`, `trailing_stop`
+   - **Protection & Backup**: `circuit_breaker`, `git_auto_backup`
 
-6. **Institutional Risk Management & Strict Paper vs Live Isolation**
+7. **Institutional Risk Management, Quantitative Sizing & Strict Isolation**
    - Cumulative max daily drawdown, per-pair daily drawdown quarantine, max daily profit lock, win/lose streak cooldowns, and global Circuit Breaker.
+   - Position sizing modes: `fixed_usdt`, `fixed_risk_pct`, `quarter_kelly`, `half_kelly`, and `full_kelly`.
    - Isolated Paper Sandbox (`paper_trading = true`) vs Armed Live Execution (`armed_for_live_orders = true` + server-side secrets only).
 
-7. **Git Sync Ready for Backup**
-   - Built-in `bot-engine::git_sync` module and `deploy/git-backup.sh` snapshot sanitized TOML/JSON configs and execution metrics to Git while strictly ignoring `.env`, `*.pem`, and `config/bot.toml`.
+8. **Embedded Web Bridge (`bot-web`) & Git Sync Backup**
+   - `bot-web` serves `GET /api/health`, `GET /api/config`, `GET /api/snapshot`, `POST /api/control`, and `WS /ws/telemetry` on `:8080`.
+   - Built-in `bot-engine::git_sync` module and `deploy/git-backup.sh` commit sanitized configs while strictly ignoring `.env`, `*.pem`, `*.key`, and `config/bot.toml`.
 
 ---
 

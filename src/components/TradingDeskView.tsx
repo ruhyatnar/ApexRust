@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   SlidersHorizontal,
 } from 'lucide-react';
+import { evaluateUtcSessionWindows } from '../engine/sessionWindows';
 import type {
   BotConfig,
   EngineSnapshot,
@@ -30,13 +31,14 @@ interface TradingDeskViewProps {
   snapshot: EngineSnapshot;
   config: BotConfig;
   liveStatus: LiveCredentialStatus;
+  liveTicker?: { symbol: string; bid: number; ask: number; last: number } | null;
   selectedSymbol: string;
   onSelectSymbol: (symbol: string) => void;
   onChangeTimeframe: (tf: Timeframe) => void;
   onStepBar: () => void;
   onToggleFeedSource: (source: 'Simulated' | 'BinanceLive') => void;
   onSimulateTransport: (mode: TransportMode) => void;
-  onSubmitOrder: (input: ManualOrderInput) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  onSubmitOrder: (input: ManualOrderInput) => Promise<{ ok: true; warning?: string } | { ok: false; reason: string }>;
   onClosePosition: (symbol: string) => void;
   onFlattenAll: () => void;
   onCancelPendingOrder: (orderId: string) => void;
@@ -70,10 +72,16 @@ function fmtUsd(val: number): string {
   return `${val < 0 ? '-' : ''}$${abs}`;
 }
 
+function fmtPrice(px: number): string {
+  const decimals = px >= 100 ? 2 : px >= 1 ? 4 : 6;
+  return px.toFixed(decimals);
+}
+
 export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
   snapshot,
   config,
   liveStatus,
+  liveTicker,
   selectedSymbol,
   onSelectSymbol,
   onChangeTimeframe,
@@ -102,6 +110,11 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
   const auto = config.automation;
   const enabledFeaturesCount = Object.values(config.features).filter(Boolean).length;
   const totalFeaturesCount = Object.keys(config.features).length;
+  const sessionEval = evaluateUtcSessionWindows(
+    Date.now(),
+    auto.sessionWindows,
+    Boolean(config.features.sessionWindowFilter)
+  );
 
   return (
     <div className="space-y-4">
@@ -155,6 +168,21 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
               {auto.directionPolicy === 'long_only' ? 'Spot Long' : 'Long/Short'}
             </strong>
           </span>
+
+          {config.features.sessionWindowFilter && (
+            <span className="text-slate-400">
+              Session:{' '}
+              <strong
+                className={`font-mono font-semibold ${
+                  sessionEval.allowed ? 'text-[#7DF2AD]' : 'text-amber-400'
+                }`}
+              >
+                {sessionEval.allowed
+                  ? `${sessionEval.activeWindow?.label ?? 'Active'} (${sessionEval.currentUtcHHMM} UTC)`
+                  : `Outside Window (${sessionEval.currentUtcHHMM} UTC)`}
+              </strong>
+            </span>
+          )}
 
           <span className="font-mono text-[11px] tabular-nums text-slate-400">
             Modules {enabledFeaturesCount}/{totalFeaturesCount} · Scans {snapshot.autoStats.scansRun} · Orders{' '}
@@ -286,6 +314,7 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
               config={config}
               activePair={activePair}
               liveStatus={liveStatus}
+              liveTicker={liveTicker}
               onSelectSymbol={onSelectSymbol}
               onSubmitOrder={onSubmitOrder}
               onToggleFeedSource={onToggleFeedSource}
@@ -453,15 +482,15 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
                               </button>
                             </td>
                             <td className="px-4 py-2.5 text-right text-slate-200">
-                              ${pos.entryPrice.toFixed(2)}
+                              ${fmtPrice(pos.entryPrice)}
                             </td>
                             <td className="px-4 py-2.5 text-right text-amber-300">
-                              ${pos.exitPlan.activeStopLoss.toFixed(2)}
+                              ${fmtPrice(pos.exitPlan.activeStopLoss)}
                             </td>
                             <td className="px-4 py-2.5 text-right text-slate-300">
                               {pos.exitPlan.tpTargets
                                 ? `${pos.exitPlan.tpTargets.length} TP Ladder`
-                                : `$${pos.exitPlan.takeProfit1.toFixed(2)} / $${pos.exitPlan.takeProfit2.toFixed(2)}`}
+                                : `$${fmtPrice(pos.exitPlan.takeProfit1)} / $${fmtPrice(pos.exitPlan.takeProfit2)}`}
                             </td>
                             <td className="px-4 py-2.5 text-right font-sans text-slate-300">
                               {exitMode}
@@ -569,7 +598,7 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
                         </td>
                         <td className="px-4 py-2.5 font-sans text-slate-300">{t.reason}</td>
                         <td className="px-4 py-2.5 text-right text-slate-300">
-                          ${t.entryPrice.toFixed(2)} → ${t.exitPrice.toFixed(2)}
+                          ${fmtPrice(t.entryPrice)} → ${fmtPrice(t.exitPrice)}
                         </td>
                         <td
                           className={`px-4 py-2.5 text-right ${

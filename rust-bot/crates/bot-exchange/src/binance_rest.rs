@@ -1,5 +1,5 @@
 use binance_sdk::config::ConfigurationRestApi;
-use binance_sdk::spot::{rest_api::KlinesParams, SpotRestApi};
+use binance_sdk::spot::SpotRestApi;
 use bot_core::{
     BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent, Result,
     TransportMode,
@@ -43,34 +43,42 @@ impl BinanceRestClient {
         })
     }
 
+    pub fn has_authenticated_sdk(&self) -> bool {
+        self.sdk_client.is_some()
+    }
+
     fn effective_base_url(&self) -> &str {
         match (self.cfg.venue, self.cfg.environment) {
             (ExchangeVenue::Futures, ExchangeEnvironment::Production) => "https://fapi.binance.com",
             (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
                 "https://testnet.binancefuture.com"
             }
-            (ExchangeVenue::Spot, _) => &self.cfg.rest_base_url,
+            (ExchangeVenue::Spot, ExchangeEnvironment::Production) => {
+                if self.cfg.rest_base_url.trim().is_empty()
+                    || self.cfg.rest_base_url.contains("testnet")
+                    || self.cfg.rest_base_url.contains("fapi")
+                {
+                    "https://api.binance.com"
+                } else {
+                    &self.cfg.rest_base_url
+                }
+            }
+            (ExchangeVenue::Spot, ExchangeEnvironment::Testnet) => {
+                if self.cfg.rest_base_url.trim().is_empty()
+                    || self.cfg.rest_base_url.contains("api.binance.com")
+                    || self.cfg.rest_base_url.contains("fapi")
+                {
+                    "https://testnet.binance.vision"
+                } else {
+                    &self.cfg.rest_base_url
+                }
+            }
         }
     }
 
-    /// Fetch historical klines via official `SpotRestApi` or public REST endpoint
+    /// Fetch historical klines via public REST endpoint
     /// (automatically selects `/api/v3/klines` for Spot or `/fapi/v1/klines` for USD-M Futures).
     pub async fn fetch_klines(&self, symbol: &str, interval: &str, limit: usize) -> Result<Vec<Candle>> {
-        if self.cfg.venue == ExchangeVenue::Spot {
-            if let Some(client) = &self.sdk_client {
-                let params = KlinesParams::builder(symbol.to_string(), interval.to_string())
-                    .limit(limit as i32)
-                    .build()
-                    .map_err(|e| BotError::RestApi(format!("KlinesParams error: {e}")))?;
-
-                let _resp = client
-                    .klines(params)
-                    .await
-                    .map_err(|e| BotError::RestApi(format!("SpotRestApi::klines failed: {e}")))?;
-                debug!(%symbol, %interval, "Fetched klines via official binance-sdk SpotRestApi");
-            }
-        }
-
         let kline_path = match self.cfg.venue {
             ExchangeVenue::Spot => "/api/v3/klines",
             ExchangeVenue::Futures => "/fapi/v1/klines",
@@ -83,19 +91,25 @@ impl BinanceRestClient {
             interval,
             limit
         );
-        let rows: Vec<Vec<serde_json::Value>> = self
+        debug!(%url, "Fetching Binance klines");
+        let resp = self
             .http
             .get(&url)
             .send()
             .await
             .map_err(|e| BotError::RestApi(format!("REST HTTP request failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| BotError::RestApi(format!("REST HTTP status error: {e}")))?;
+
+        let rows: Vec<Vec<serde_json::Value>> = resp
             .json()
             .await
             .map_err(|e| BotError::RestApi(format!("REST JSON decode failed: {e}")))?;
 
+        let now_ms = Utc::now().timestamp_millis();
         let mut candles = Vec::with_capacity(rows.len());
         for row in rows {
-            if row.len() < 6 {
+            if row.len() < 7 {
                 continue;
             }
             let open_time_ms = row[0].as_i64().unwrap_or_default();
@@ -104,6 +118,8 @@ impl BinanceRestClient {
             let low = row[3].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let close = row[4].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let volume = row[5].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let close_time_ms = row[6].as_i64().unwrap_or_default();
+            let is_closed = close_time_ms <= 0 || close_time_ms <= now_ms;
             candles.push(Candle {
                 open_time_ms,
                 open,
@@ -111,7 +127,7 @@ impl BinanceRestClient {
                 low,
                 close,
                 volume,
-                is_closed: true,
+                is_closed,
             });
         }
         Ok(candles)
@@ -136,7 +152,7 @@ impl BinanceRestClient {
             "belowStopPrice": format!("{stop_loss_trigger:.4}"),
             "belowPrice": format!("{:.4}", stop_loss_trigger * 0.998),
             "belowTimeInForce": "GTC",
-            "newOrderRespType": "RESULT"
+            "newOrderRespType": "FULL"
         })
     }
 
@@ -155,9 +171,14 @@ impl BinanceRestClient {
     /// Single fallback poll yielding a `MarketEvent` tagged `TransportMode::RestFallback`.
     pub async fn poll_latest_bar(&self, symbol: &str, interval: &str) -> Result<MarketEvent> {
         let mut bars = self.fetch_klines(symbol, interval, 2).await?;
-        let candle = bars
+        let latest = bars
             .pop()
             .ok_or_else(|| BotError::RestApi(format!("Empty klines for {symbol}")))?;
+        let candle = if !latest.is_closed && !bars.is_empty() {
+            bars.pop().unwrap_or(latest)
+        } else {
+            latest
+        };
 
         Ok(MarketEvent {
             symbol: symbol.to_uppercase(),

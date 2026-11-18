@@ -1,5 +1,5 @@
-import React from 'react';
-import { Bot, Pause, Play, Radar, ShieldCheck } from 'lucide-react';
+import React, { useState } from 'react';
+import { Activity, Bell, Bot, Pause, Play, Radar, RotateCcw, ShieldCheck, Zap } from 'lucide-react';
 import type {
   BotConfig,
   DirectionPolicy,
@@ -18,6 +18,8 @@ interface StrategyConfigViewProps {
   onUpdateConfig: (next: BotConfig) => void;
   onToggleAutomation: () => void;
   onRunAutoScan: () => void;
+  onSimulateVolatilitySpike?: (symbol: string) => void;
+  onResetDefaults?: () => void;
 }
 
 const STRATEGY_PROFILES: Array<{
@@ -63,7 +65,44 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
   onUpdateConfig,
   onToggleAutomation,
   onRunAutoScan,
+  onSimulateVolatilitySpike,
+  onResetDefaults,
 }) => {
+  const [testSpikeSymbol, setTestSpikeSymbol] = useState<string>(
+    config.trading.pairs[0] ?? 'BTCUSDT'
+  );
+  const [notifPermission, setNotifPermission] = useState<string>(() => {
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      return window.Notification.permission;
+    }
+    return 'unsupported';
+  });
+  const [notifFeedback, setNotifFeedback] = useState<string | null>(null);
+
+  const handleRequestNotificationPermission = async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      setNotifPermission('unsupported');
+      setNotifFeedback(
+        'Web Notification API is unavailable in this browser context; in-app volatility push banners are active.'
+      );
+      return;
+    }
+    try {
+      const result = await window.Notification.requestPermission();
+      setNotifPermission(result);
+      if (result === 'granted') {
+        setNotifFeedback('Browser notifications granted — high-volatility ATR spikes will push desktop alerts.');
+      } else {
+        setNotifFeedback(
+          `Browser permission is "${result}". High-volatility ATR spikes will continue pushing in-app alert banners.`
+        );
+      }
+    } catch {
+      setNotifFeedback(
+        'Browser blocked permission prompt in embedded iframe — in-app volatility push banners are active.'
+      );
+    }
+  };
   const updateTrading = <K extends keyof BotConfig['trading']>(
     key: K,
     val: BotConfig['trading'][K]
@@ -120,27 +159,40 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-1 rounded-lg border border-white/[0.08] bg-[#0D1015] p-1">
-          {(['scalping', 'intraday'] as StrategyMode[]).map((mode) => (
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1 rounded-lg border border-white/[0.08] bg-[#0D1015] p-1">
+            {(['scalping', 'intraday'] as StrategyMode[]).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => {
+                  const nextTf: Timeframe = mode === 'scalping' ? '5m' : '15m';
+                  onUpdateConfig({
+                    ...config,
+                    trading: { ...config.trading, mode, timeframe: nextTf },
+                  });
+                }}
+                className={`rounded-md px-3.5 py-1.5 text-xs font-semibold capitalize transition whitespace-nowrap ${
+                  config.trading.mode === mode
+                    ? 'bg-[#7DF2AD] text-[#0B0F17]'
+                    : 'text-slate-400 hover:text-slate-100'
+                }`}
+              >
+                {mode} Mode
+              </button>
+            ))}
+          </div>
+
+          {onResetDefaults && (
             <button
-              key={mode}
               type="button"
-              onClick={() => {
-                const nextTf: Timeframe = mode === 'scalping' ? '5m' : '15m';
-                onUpdateConfig({
-                  ...config,
-                  trading: { ...config.trading, mode, timeframe: nextTf },
-                });
-              }}
-              className={`rounded-md px-3.5 py-1.5 text-xs font-semibold capitalize transition whitespace-nowrap ${
-                config.trading.mode === mode
-                  ? 'bg-[#7DF2AD] text-[#0B0F17]'
-                  : 'text-slate-400 hover:text-slate-100'
-              }`}
+              onClick={onResetDefaults}
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#141820] px-3 py-2 text-xs font-semibold text-slate-300 transition hover:border-amber-400/40 hover:text-amber-200 whitespace-nowrap"
             >
-              {mode} Mode
+              <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+              Reset Defaults
             </button>
-          ))}
+          )}
         </div>
       </div>
 
@@ -706,6 +758,290 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               />
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Volatility-Based ATR Alerts & Browser Push Notifications */}
+      <div className="rounded-xl border border-white/[0.06] bg-[#141820] p-5 space-y-5">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/[0.06] pb-4">
+          <div className="flex items-start gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-amber-400/25 bg-amber-400/10">
+              <Bell className="h-4.5 w-4.5 text-amber-300" aria-hidden="true" />
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <h3 className="text-sm font-semibold text-slate-100">
+                  ATR Volatility Spike Alerts & Browser Push Notifications
+                </h3>
+                <span
+                  className={`font-mono text-[11px] font-semibold ${
+                    config.indicators.volatilityAlertsEnabled !== false
+                      ? 'text-[#7DF2AD]'
+                      : 'text-slate-500'
+                  }`}
+                >
+                  {config.indicators.volatilityAlertsEnabled !== false ? 'MONITORING ACTIVE' : 'DISABLED'}
+                </span>
+                <span className="font-mono text-[11px] text-slate-400">
+                  · Browser Push:{' '}
+                  <strong
+                    className={
+                      notifPermission === 'granted'
+                        ? 'text-[#7DF2AD]'
+                        : notifPermission === 'denied'
+                          ? 'text-amber-300'
+                          : 'text-sky-300'
+                    }
+                  >
+                    {notifPermission.toUpperCase()}
+                  </strong>
+                </span>
+              </div>
+              <p className="mt-0.5 text-xs text-slate-400">
+                Continuously monitors 14-period Wilder ATR as a percentage of spot price and True Range expansion against the rolling baseline, pushing browser notifications and in-app alerts when high-volatility spikes occur.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleRequestNotificationPermission()}
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 text-xs font-semibold text-slate-200 transition hover:border-sky-400/50 hover:text-sky-300 whitespace-nowrap"
+            >
+              <Bell className="h-3.5 w-3.5" aria-hidden="true" />
+              {notifPermission === 'granted' ? 'Push Enabled' : 'Enable Browser Push'}
+            </button>
+
+            <div className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0D1015] px-2 py-1">
+              <select
+                aria-label="Select pair for ATR volatility spike simulation"
+                value={testSpikeSymbol}
+                onChange={(e) => setTestSpikeSymbol(e.target.value)}
+                className="bg-transparent font-mono text-xs text-slate-200 focus:outline-none"
+              >
+                {config.trading.pairs.map((sym) => (
+                  <option key={sym} value={sym} className="bg-[#0D1015] text-slate-100">
+                    {sym}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => onSimulateVolatilitySpike?.(testSpikeSymbol)}
+                disabled={config.indicators.volatilityAlertsEnabled === false}
+                className="flex items-center gap-1 rounded-md bg-amber-400/15 px-2.5 py-1 text-xs font-semibold text-amber-300 transition hover:bg-amber-400/25 disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
+              >
+                <Zap className="h-3.5 w-3.5" aria-hidden="true" />
+                Simulate ATR Spike Alert
+              </button>
+            </div>
+
+            <button
+              type="button"
+              role="switch"
+              aria-checked={config.indicators.volatilityAlertsEnabled !== false}
+              onClick={() =>
+                updateIndicators(
+                  'volatilityAlertsEnabled',
+                  !(config.indicators.volatilityAlertsEnabled !== false)
+                )
+              }
+              className={`rounded-lg px-3.5 py-2 text-xs font-bold transition whitespace-nowrap ${
+                config.indicators.volatilityAlertsEnabled !== false
+                  ? 'border border-[#7DF2AD]/40 bg-[#13261E] text-[#7DF2AD]'
+                  : 'border border-white/[0.08] bg-[#0D1015] text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              {config.indicators.volatilityAlertsEnabled !== false
+                ? 'Alerts Enabled'
+                : 'Enable Alerts'}
+            </button>
+          </div>
+        </div>
+
+        {notifFeedback && (
+          <div className="rounded-lg border border-sky-400/25 bg-sky-500/10 px-3.5 py-2 text-xs text-sky-200">
+            {notifFeedback}
+          </div>
+        )}
+
+        {/* ATR Volatility Alert Threshold Controls */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <div className="rounded-lg border border-white/[0.06] bg-[#0D1015] p-3.5">
+            <label htmlFor="cfg-atr-spike-pct" className="block text-xs font-medium text-slate-300">
+              ATR % of Price Threshold (%)
+            </label>
+            <p className="mt-0.5 text-[11px] text-slate-500">
+              Triggers when 14-bar ATR / Spot Price exceeds this percentage.
+            </p>
+            <input
+              id="cfg-atr-spike-pct"
+              type="number"
+              step="0.05"
+              min="0.10"
+              max="5.00"
+              value={config.indicators.atrSpikePctThreshold ?? 0.45}
+              onChange={(e) =>
+                updateIndicators(
+                  'atrSpikePctThreshold',
+                  Math.max(0.05, Number(e.target.value) || 0.45)
+                )
+              }
+              className="mt-2 w-full rounded-md border border-white/[0.08] bg-[#141820] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+
+          <div className="rounded-lg border border-white/[0.06] bg-[#0D1015] p-3.5">
+            <label htmlFor="cfg-atr-exp-ratio" className="block text-xs font-medium text-slate-300">
+              ATR Expansion Ratio (× Baseline)
+            </label>
+            <p className="mt-0.5 text-[11px] text-slate-500">
+              Triggers when bar True Range or ATR surges above the rolling 10-bar ATR mean.
+            </p>
+            <input
+              id="cfg-atr-exp-ratio"
+              type="number"
+              step="0.05"
+              min="1.05"
+              max="4.00"
+              value={config.indicators.atrExpansionRatioThreshold ?? 1.25}
+              onChange={(e) =>
+                updateIndicators(
+                  'atrExpansionRatioThreshold',
+                  Math.max(1.05, Number(e.target.value) || 1.25)
+                )
+              }
+              className="mt-2 w-full rounded-md border border-white/[0.08] bg-[#141820] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+
+          <div className="rounded-lg border border-white/[0.06] bg-[#0D1015] p-3.5">
+            <label htmlFor="cfg-vol-alert-cooldown" className="block text-xs font-medium text-slate-300">
+              Per-Pair Alert Cooldown (sec)
+            </label>
+            <p className="mt-0.5 text-[11px] text-slate-500">
+              Minimum interval before re-notifying the same symbol during sustained volatility.
+            </p>
+            <input
+              id="cfg-vol-alert-cooldown"
+              type="number"
+              step="15"
+              min="0"
+              max="600"
+              value={config.indicators.volatilityAlertCooldownSec ?? 60}
+              onChange={(e) =>
+                updateIndicators(
+                  'volatilityAlertCooldownSec',
+                  Math.max(0, Number(e.target.value) || 0)
+                )
+              }
+              className="mt-2 w-full rounded-md border border-white/[0.08] bg-[#141820] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+        </div>
+
+        {/* Live Per-Pair ATR Volatility Telemetry Strip */}
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400">
+              <Activity className="h-3.5 w-3.5 text-[#7DF2AD]" aria-hidden="true" />
+              Live Multi-Pair ATR Volatility Telemetry
+            </span>
+            <span className="font-mono text-[11px] text-slate-400">
+              Thresholds: ≥{(config.indicators.atrSpikePctThreshold ?? 0.45).toFixed(2)}% Price · ≥
+              {(config.indicators.atrExpansionRatioThreshold ?? 1.25).toFixed(2)}× Baseline
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-5">
+            {snapshot.pairs.map((p) => {
+              const atr = p.indicators.atr ?? 0;
+              const atrPct = p.lastPrice > 0 ? (atr / p.lastPrice) * 100 : 0;
+              const prevAtrs = p.indicatorHistory
+                .slice(-11, -1)
+                .map((h) => h.atr)
+                .filter((v): v is number => v !== null && v > 0);
+              const baseAtr =
+                prevAtrs.length > 0
+                  ? prevAtrs.reduce((acc, v) => acc + v, 0) / prevAtrs.length
+                  : atr;
+              const lastBar = p.candles[p.candles.length - 1];
+              const barRange = lastBar ? lastBar.high - lastBar.low : 0;
+              const expRatio = baseAtr > 0 ? Math.max(atr / baseAtr, barRange / baseAtr) : 1.0;
+              const pctThresh = config.indicators.atrSpikePctThreshold ?? 0.45;
+              const ratioThresh = config.indicators.atrExpansionRatioThreshold ?? 1.25;
+              const isSpiking =
+                (atrPct >= pctThresh && expRatio >= ratioThresh) ||
+                expRatio >= ratioThresh * 1.18;
+              const decimals = p.lastPrice >= 100 ? 2 : 4;
+
+              return (
+                <div
+                  key={p.symbol}
+                  className={`rounded-lg border p-3 ${
+                    isSpiking
+                      ? 'border-amber-400/50 bg-amber-500/10'
+                      : 'border-white/[0.06] bg-[#0D1015]'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-xs font-bold text-slate-100">{p.symbol}</span>
+                    <span
+                      className={`font-mono text-[10px] font-semibold ${
+                        isSpiking ? 'text-amber-300' : 'text-[#7DF2AD]'
+                      }`}
+                    >
+                      {isSpiking ? 'SPIKE' : 'NORMAL'}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 font-mono text-xs tabular-nums text-slate-200">
+                    ATR ${atr.toFixed(decimals)} ({atrPct.toFixed(2)}%)
+                  </div>
+                  <div className="mt-0.5 font-mono text-[11px] tabular-nums text-slate-400">
+                    Expansion: {expRatio.toFixed(2)}× baseline
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Recent Triggered Volatility Alerts Log */}
+        <div className="border-t border-white/[0.06] pt-4">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+              Recent ATR Volatility Spike Alerts ({(snapshot.volatilityAlerts ?? []).length})
+            </span>
+          </div>
+          {(snapshot.volatilityAlerts ?? []).length === 0 ? (
+            <div className="rounded-lg border border-white/[0.05] bg-[#0D1015] px-4 py-3 text-xs text-slate-400">
+              No high-volatility ATR spikes triggered yet in this session. Click{' '}
+              <strong className="text-amber-300">Simulate ATR Spike Alert</strong> above or step bars during high volatility to test browser push notifications.
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+              {(snapshot.volatilityAlerts ?? []).slice(0, 6).map((alert) => (
+                <div
+                  key={alert.id}
+                  className={`flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3.5 py-2.5 text-xs ${
+                    alert.severity === 'extreme'
+                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-100'
+                      : 'border-amber-400/35 bg-amber-500/10 text-amber-100'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <Zap className="h-3.5 w-3.5 shrink-0 text-amber-300" aria-hidden="true" />
+                    <span className="font-mono font-semibold">{alert.symbol}</span>
+                    <span className="text-slate-200">{alert.message}</span>
+                  </div>
+                  <span className="font-mono text-[11px] text-slate-400">
+                    {new Date(alert.timestampMs).toLocaleTimeString()}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

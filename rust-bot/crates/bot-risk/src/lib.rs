@@ -123,10 +123,10 @@ impl RiskManager {
         self.current_equity += pnl_usdt;
         *self.pair_daily_pnl.entry(symbol.to_string()).or_insert(0.0) += pnl_usdt;
 
-        if pnl_usdt >= 0.0 {
+        if pnl_usdt > 1e-9 {
             self.win_streak += 1;
             self.lose_streak = 0;
-        } else {
+        } else if pnl_usdt < -1e-9 {
             self.lose_streak += 1;
             self.win_streak = 0;
         }
@@ -290,6 +290,8 @@ pub fn compute_expectancy_and_profit_factor(
     let expectancy_r = (p * avg_win_r) - (q * avg_loss_r.abs());
     let profit_factor = if gross_loss_usdt.abs() > f64::EPSILON {
         gross_profit_usdt / gross_loss_usdt.abs()
+    } else if gross_profit_usdt > f64::EPSILON {
+        f64::INFINITY
     } else {
         0.0
     };

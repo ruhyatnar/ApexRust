@@ -32,9 +32,32 @@ impl GitBackupSync {
             });
         }
 
+        let mut args: Vec<&str> = vec!["add"];
+        let backup_path = repo_root.join(&self.cfg.backup_dir);
+        if backup_path.exists() {
+            args.push(self.cfg.backup_dir.as_str());
+        }
+        let synced_rel = if repo_root.join("rust-bot/config/bot.synced.toml").exists() {
+            Some("rust-bot/config/bot.synced.toml")
+        } else if repo_root.join("config/bot.synced.toml").exists() {
+            Some("config/bot.synced.toml")
+        } else {
+            None
+        };
+        if let Some(rel) = synced_rel {
+            args.push(rel);
+        }
+        if args.len() == 1 {
+            return Ok(GitSyncOutcome {
+                committed: false,
+                pushed: false,
+                summary: "No existing backup artifacts found to stage".into(),
+            });
+        }
+
         let add_status = Command::new("git")
             .current_dir(repo_root)
-            .args(["add", &self.cfg.backup_dir, "config/bot.synced.toml"])
+            .args(&args)
             .status()
             .map_err(|e| BotError::Config(format!("Failed to invoke git add: {e}")))?;
 

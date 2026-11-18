@@ -6,6 +6,7 @@ import {
   computePortfolioCorrelationMatrix,
 } from './quantAnalytics';
 import { RiskManager } from './risk';
+import { DEFAULT_UTC_SESSION_WINDOWS, evaluateUtcSessionWindows } from './sessionWindows';
 import { buildExitPlan, evaluateEntrySignal, managePositionTick } from './strategy';
 import type {
   BinanceExecutionRecord,
@@ -26,6 +27,7 @@ import type {
   Timeframe,
   TimeInForce,
   TransportMode,
+  VolatilitySpikeAlert,
 } from './types';
 
 export const DEFAULT_BOT_CONFIG: BotConfig = {
@@ -57,6 +59,10 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     atrPeriod: 14,
     requireVwapAlignment: true,
     minVolumeExpansionMult: 1.5,
+    volatilityAlertsEnabled: true,
+    atrSpikePctThreshold: 0.45,
+    atrExpansionRatioThreshold: 1.25,
+    volatilityAlertCooldownSec: 60,
   },
   exits: {
     atrSlMultiplier: 1.5,
@@ -87,6 +93,7 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     signalCooldownBars: 2,
     autoOrderNotionalUsdt: 150,
     autoCloseOnExit: true,
+    sessionWindows: structuredClone(DEFAULT_UTC_SESSION_WINDOWS),
   },
   features: {
     automatedTrading: true,
@@ -99,6 +106,7 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     adxStrengthFilter: true,
     vwapBiasFilter: true,
     volumeConfirmationFilter: false,
+    sessionWindowFilter: false,
     atrDynamicExits: true,
     takeProfitLadder: true,
     breakEvenStop: true,
@@ -169,7 +177,9 @@ export class SimulationRuntime {
   private pipelines = new Map<string, IndicatorPipeline>();
   private rngMap = new Map<string, () => number>();
   private lastSignalTick = new Map<string, number>();
+  private lastVolatilityAlertAtMs = new Map<string, number>();
   private pendingLiveIntents: LiveAutoIntent[] = [];
+  private pendingVolatilityAlerts: VolatilitySpikeAlert[] = [];
   private lastClockMs: number;
   private nextTradeSeq = 804120;
   private nextOrderSeq = 510940;
@@ -443,6 +453,7 @@ export class SimulationRuntime {
       pendingOrders: [],
       recentTrades,
       executionHistory,
+      volatilityAlerts: [],
       autoStats: {
         scansRun: 0,
         signalsDetected: 0,
@@ -509,11 +520,18 @@ export class SimulationRuntime {
     isMaker?: boolean;
     rationale: string;
     nowMs: number;
+    externalOrderId?: string;
+    externalOcoListId?: number;
+    externalCommission?: number;
   }): BinanceExecutionRecord {
     this.nextTradeSeq += 1;
     this.nextOrderSeq += 1;
     const tradeId = this.nextTradeSeq;
-    const orderId = this.nextOrderSeq;
+    const parsedExternalOrderId = params.externalOrderId ? Number(params.externalOrderId) : NaN;
+    const orderId =
+      Number.isFinite(parsedExternalOrderId) && parsedExternalOrderId > 0
+        ? parsedExternalOrderId
+        : this.nextOrderSeq;
     const venue = this.config.trading.venue;
     const isOco = params.uiOrderType === 'OCO SELL' || params.uiOrderType === 'OCO BUY';
     const isMaker =
@@ -533,12 +551,23 @@ export class SimulationRuntime {
         : isMaker
           ? 0.00075
           : 0.001;
-    const commission = Number((quoteQty * feeRate).toFixed(4));
+    const commission =
+      params.externalCommission !== undefined &&
+      Number.isFinite(params.externalCommission) &&
+      params.externalCommission >= 0
+        ? Number(params.externalCommission.toFixed(6))
+        : Number((quoteQty * feeRate).toFixed(4));
+    const resolvedListId =
+      params.externalOcoListId !== undefined && params.externalOcoListId > 0
+        ? params.externalOcoListId
+        : isOco
+          ? 44000 + (orderId % 5000)
+          : -1;
     const rec: BinanceExecutionRecord = {
       id: `exec-entry-${tradeId}-${params.nowMs}`,
       tradeId,
       orderId,
-      orderListId: isOco ? 44000 + (orderId % 5000) : -1,
+      orderListId: resolvedListId,
       clientOrderId: `apex_entry_${params.symbol.toLowerCase()}_${orderId}`,
       symbol: params.symbol,
       venue,
@@ -587,11 +616,16 @@ export class SimulationRuntime {
     isPartial?: boolean;
     rationale?: string;
     nowMs: number;
+    externalOrderId?: string;
   }): BinanceExecutionRecord {
     this.nextTradeSeq += 1;
     this.nextOrderSeq += 1;
     const tradeId = this.nextTradeSeq;
-    const orderId = this.nextOrderSeq;
+    const parsedExternalOrderId = params.externalOrderId ? Number(params.externalOrderId) : NaN;
+    const orderId =
+      Number.isFinite(parsedExternalOrderId) && parsedExternalOrderId > 0
+        ? parsedExternalOrderId
+        : this.nextOrderSeq;
     const venue = this.config.trading.venue;
     const isTpExit = params.reason === 'TakeProfit1' || params.reason === 'TakeProfit2';
     const isSlExit =
@@ -660,17 +694,33 @@ export class SimulationRuntime {
     return rec;
   }
 
-  recordExternalLiveOrder(input: ManualOrderInput, note: string, nowMs = Date.now()): void {
+  recordExternalLiveOrder(
+    input: ManualOrderInput,
+    note: string,
+    nowMs = Date.now(),
+    fillDetails?: {
+      executedQty?: number;
+      avgPrice?: number;
+      commission?: number;
+      orderId?: string;
+      ocoOrderListId?: number;
+      algoOrderIds?: string[];
+    }
+  ): void {
     const pair = this.snapshot.pairs.find((p) => p.symbol === input.symbol);
     if (!pair) return;
-    const entryPrice = pair.lastPrice;
+    const entryPrice =
+      fillDetails?.avgPrice && fillDetails.avgPrice > 0 ? fillDetails.avgPrice : pair.lastPrice;
     const atr = pair.indicators.atr ?? entryPrice * 0.01;
     const slDist =
       input.stopLossMode === 'ATR'
         ? atr * this.config.exits.atrSlMultiplier
         : entryPrice * (Math.max(0.2, input.stopLossPct) / 100);
     const initialSl = input.side === 'Long' ? entryPrice - slDist : entryPrice + slDist;
-    const qty = input.usdtAmount / Math.max(entryPrice, 1e-6);
+    const qty =
+      fillDetails?.executedQty && fillDetails.executedQty > 0
+        ? fillDetails.executedQty
+        : input.usdtAmount / Math.max(entryPrice, 1e-6);
     const cleanTargets: TakeProfitTarget[] = input.targets
       .filter((t) => t.pctOffset > 0 && t.allocationPct > 0)
       .map((t, idx) => ({
@@ -683,36 +733,14 @@ export class SimulationRuntime {
             : entryPrice * (1 - t.pctOffset / 100),
         hit: false,
       }));
-    const tp1 = cleanTargets[0]?.targetPrice ?? (input.side === 'Long' ? entryPrice + slDist * 1.5 : entryPrice - slDist * 1.5);
-    const tp2 = cleanTargets[cleanTargets.length - 1]?.targetPrice ?? (input.side === 'Long' ? entryPrice + slDist * 2.5 : entryPrice - slDist * 2.5);
+    const tp1 =
+      cleanTargets[0]?.targetPrice ??
+      (input.side === 'Long' ? entryPrice + slDist * 1.5 : entryPrice - slDist * 1.5);
+    const tp2 =
+      cleanTargets[cleanTargets.length - 1]?.targetPrice ??
+      (input.side === 'Long' ? entryPrice + slDist * 2.5 : entryPrice - slDist * 2.5);
 
-    pair.openPosition = {
-      id: `${input.symbol}-live-${nowMs}`,
-      symbol: input.symbol,
-      side: input.side,
-      entryPrice,
-      quantity: qty,
-      remainingQuantity: qty,
-      lockedMarginUsdt: input.usdtAmount,
-      unrealizedPnlUsdt: 0,
-      realizedPnlUsdt: 0,
-      highestFavorablePrice: entryPrice,
-      exitPlan: {
-        initialStopLoss: initialSl,
-        activeStopLoss: initialSl,
-        takeProfit1: tp1,
-        takeProfit2: tp2,
-        tpTargets: cleanTargets.length > 0 ? cleanTargets : undefined,
-        tp1Hit: false,
-        breakEvenArmed: input.useBreakEven,
-        trailingActive: false,
-        trailingEnabled: input.useTrailingStop,
-        riskDistanceR: slDist,
-      },
-      openedAtMs: nowMs,
-      rationale: note,
-    };
-    this.recordEntryExecution({
+    const entryRec = this.recordEntryExecution({
       symbol: input.symbol,
       side: input.side,
       uiOrderType: input.orderType,
@@ -722,7 +750,48 @@ export class SimulationRuntime {
       isMaker: input.orderType === 'LIMIT MAKER',
       rationale: note,
       nowMs,
+      externalOrderId: fillDetails?.orderId,
+      externalOcoListId: fillDetails?.ocoOrderListId,
+      externalCommission: fillDetails?.commission,
     });
+
+    pair.openPosition = {
+      id: `${input.symbol}-live-${nowMs}`,
+      symbol: input.symbol,
+      side: input.side,
+      entryPrice,
+      quantity: qty,
+      remainingQuantity: qty,
+      lockedMarginUsdt:
+        this.config.trading.venue === 'Futures'
+          ? (entryPrice * qty) / Math.max(1, this.config.trading.leverage)
+          : entryPrice * qty,
+      unrealizedPnlUsdt: 0,
+      realizedPnlUsdt: 0,
+      feePaidUsdt:
+        fillDetails?.commission !== undefined && fillDetails.commission > 0
+          ? fillDetails.commission
+          : entryRec.commission,
+      highestFavorablePrice: entryPrice,
+      exitPlan: {
+        initialStopLoss: initialSl,
+        activeStopLoss: initialSl,
+        takeProfit1: tp1,
+        takeProfit2: tp2,
+        tpTargets: cleanTargets.length > 0 ? cleanTargets : undefined,
+        tp1Hit: false,
+        breakEvenArmed: false,
+        breakEvenEnabled: input.useBreakEven && this.config.features.breakEvenStop,
+        trailingActive: false,
+        trailingEnabled: input.useTrailingStop && this.config.features.trailingStop,
+        riskDistanceR: slDist,
+      },
+      openedAtMs: nowMs,
+      rationale: note,
+      exchangeOrderId: fillDetails?.orderId,
+      exchangeListId: fillDetails?.ocoOrderListId,
+      exchangeAlgoIds: fillDetails?.algoOrderIds,
+    };
     this.pushLog('info', note);
     this.syncRiskToSnapshot();
   }
@@ -816,6 +885,144 @@ export class SimulationRuntime {
     return out;
   }
 
+  confirmLiveAutoDispatch(summary: string): void {
+    this.snapshot.autoStats.autoOrdersDispatched += 1;
+    this.snapshot.autoStats.lastActionSummary = summary;
+    this.syncRiskToSnapshot();
+  }
+
+  reportLiveAutoRejected(summary: string): void {
+    this.snapshot.autoStats.lastActionSummary = summary;
+    this.pushLog('warn', summary);
+    this.syncRiskToSnapshot();
+  }
+
+  consumePendingVolatilityAlerts(): VolatilitySpikeAlert[] {
+    const out = this.pendingVolatilityAlerts.slice();
+    this.pendingVolatilityAlerts = [];
+    return out;
+  }
+
+  private evaluatePairVolatilitySpike(
+    pair: PairRuntimeState,
+    candle: Candle,
+    prevClose: number,
+    nowMs: number,
+    forceTrigger = false
+  ): VolatilitySpikeAlert | null {
+    if (this.config.indicators.volatilityAlertsEnabled === false) {
+      return null;
+    }
+    const atr = pair.indicators.atr;
+    if (atr === null || atr <= 0 || pair.lastPrice <= 0) {
+      return null;
+    }
+
+    const cooldownMs = Math.max(0, (this.config.indicators.volatilityAlertCooldownSec ?? 60) * 1000);
+    const lastAlertMs = this.lastVolatilityAlertAtMs.get(pair.symbol) ?? -1e15;
+    if (!forceTrigger && nowMs - lastAlertMs < cooldownMs) {
+      return null;
+    }
+
+    const prevAtrValues = pair.indicatorHistory
+      .slice(-12, -1)
+      .map((h) => h.atr)
+      .filter((v): v is number => v !== null && v > 0);
+    const baselineAtr =
+      prevAtrValues.length > 0
+        ? prevAtrValues.reduce((acc, v) => acc + v, 0) / prevAtrValues.length
+        : atr;
+
+    const trueRange = Math.max(
+      candle.high - candle.low,
+      Math.abs(candle.high - prevClose),
+      Math.abs(candle.low - prevClose)
+    );
+    const atrPctOfPrice = (atr / pair.lastPrice) * 100;
+    const candleRangePct = (trueRange / pair.lastPrice) * 100;
+    const atrExpansionRatio =
+      baselineAtr > 0 ? Math.max(atr / baselineAtr, trueRange / baselineAtr) : 1.0;
+
+    const pctThreshold = this.config.indicators.atrSpikePctThreshold ?? 0.45;
+    const ratioThreshold = this.config.indicators.atrExpansionRatioThreshold ?? 1.25;
+
+    const spikeDetected =
+      forceTrigger ||
+      (atrPctOfPrice >= pctThreshold && atrExpansionRatio >= ratioThreshold) ||
+      atrExpansionRatio >= ratioThreshold * 1.18;
+
+    if (!spikeDetected) {
+      return null;
+    }
+
+    this.lastVolatilityAlertAtMs.set(pair.symbol, nowMs);
+    const severity: VolatilitySpikeAlert['severity'] =
+      atrExpansionRatio >= ratioThreshold * 1.35 || atrPctOfPrice >= pctThreshold * 1.4
+        ? 'extreme'
+        : 'elevated';
+
+    const decimals = pair.lastPrice >= 100 ? 2 : 4;
+    const alert: VolatilitySpikeAlert = {
+      id: `vol-spike-${pair.symbol}-${nowMs}-${Math.random().toString(36).slice(2, 6)}`,
+      symbol: pair.symbol,
+      price: pair.lastPrice,
+      atr,
+      atrPctOfPrice,
+      atrExpansionRatio,
+      candleRangePct,
+      severity,
+      message: `[ATR VOLATILITY SPIKE] ${pair.symbol} @ $${pair.lastPrice.toFixed(decimals)} · ATR $${atr.toFixed(decimals)} (${atrPctOfPrice.toFixed(2)}% of price · ${atrExpansionRatio.toFixed(2)}× expansion)`,
+      timestampMs: nowMs,
+    };
+
+    if (!this.snapshot.volatilityAlerts) {
+      this.snapshot.volatilityAlerts = [];
+    }
+    this.snapshot.volatilityAlerts.unshift(alert);
+    this.snapshot.volatilityAlerts = this.snapshot.volatilityAlerts.slice(0, 25);
+    this.pendingVolatilityAlerts.push(alert);
+    this.pushLog('alert', alert.message);
+    return alert;
+  }
+
+  simulateVolatilitySpike(symbol = 'BTCUSDT', nowMs = Date.now()): VolatilitySpikeAlert | null {
+    if (this.config.indicators.volatilityAlertsEnabled === false) {
+      this.pushLog('warn', 'Volatility spike test skipped: ATR Volatility Alerts are disabled.');
+      return null;
+    }
+    const pair = this.snapshot.pairs.find((p) => p.symbol === symbol) ?? this.snapshot.pairs[0];
+    if (!pair) return null;
+
+    const prev = pair.candles[pair.candles.length - 1];
+    const baseAtr = pair.indicators.atr ?? prev.close * 0.006;
+    const open = prev.close;
+    const close = open + baseAtr * 1.85;
+    const high = close + baseAtr * 0.65;
+    const low = open - baseAtr * 0.45;
+    const spikeCandle: Candle = {
+      openTimeMs: prev.openTimeMs + 300_000,
+      open,
+      high,
+      low,
+      close,
+      volume: prev.volume * 2.15,
+      isClosed: true,
+    };
+
+    const pipe = this.pipelines.get(pair.symbol)!;
+    const nextInd = pipe.update(spikeCandle);
+    pair.candles = [...pair.candles.slice(-219), spikeCandle];
+    pair.indicatorHistory = [...pair.indicatorHistory.slice(-219), nextInd];
+    pair.indicators = nextInd;
+    pair.lastPrice = spikeCandle.close;
+    const firstClose = pair.candles[0]?.close ?? spikeCandle.close;
+    pair.change24hPct = ((spikeCandle.close - firstClose) / firstClose) * 100;
+
+    const alert = this.evaluatePairVolatilitySpike(pair, spikeCandle, prev.close, nowMs, true);
+    this.syncRiskToSnapshot();
+    return alert;
+  }
+
   cancelPendingOrder(orderId: string): boolean {
     const idx = this.snapshot.pendingOrders.findIndex((o) => o.id === orderId);
     if (idx === -1) return false;
@@ -831,7 +1038,8 @@ export class SimulationRuntime {
     exitPrice: number,
     reason: ClosedTrade['reason'],
     note: string,
-    nowMs = Date.now()
+    nowMs = Date.now(),
+    externalOrderId?: string
   ): void {
     const pair = this.snapshot.pairs.find((p) => p.symbol === symbol);
     if (!pair?.openPosition) return;
@@ -869,6 +1077,7 @@ export class SimulationRuntime {
       isPartial: ratio < 0.999,
       rationale: note,
       nowMs,
+      externalOrderId,
     });
     if (ratio >= 0.999) {
       pair.openPosition = null;
@@ -958,6 +1167,13 @@ export class SimulationRuntime {
           ? requestedLimit < pair.lastPrice * 0.9999
           : requestedLimit > pair.lastPrice * 1.0001));
 
+    const tif = input.timeInForce ?? 'GTC';
+    if (shouldRestLimit && isLimitOrder && input.orderType === 'LIMIT' && (tif === 'IOC' || tif === 'FOK')) {
+      const reason = `${tif} LIMIT order on ${input.symbol} ($${requestedLimit.toFixed(2)}) did not cross market immediately ($${pair.lastPrice.toFixed(2)}) and expired.`;
+      this.pushLog('warn', reason);
+      return { ok: false, reason };
+    }
+
     if (shouldRestLimit) {
       const pending: PendingOrder = {
         id: `${input.symbol}-lim-${nowMs}`,
@@ -967,7 +1183,7 @@ export class SimulationRuntime {
         orderMethod: input.orderType === 'LIMIT MAKER' ? 'LIMIT_MAKER' : 'LIMIT',
         usdtAmount: cappedUsdt,
         limitPrice: requestedLimit,
-        timeInForce: input.timeInForce ?? 'GTC',
+        timeInForce: tif,
         stopLossMode: input.stopLossMode,
         stopLossPct: input.stopLossPct,
         useBreakEven: input.useBreakEven,
@@ -988,6 +1204,19 @@ export class SimulationRuntime {
     const pos = this.openPositionFromInput(pair, input, fillPrice, cappedUsdt, nowMs, false);
     this.syncRiskToSnapshot();
     return { ok: true, position: pos };
+  }
+
+  private computeExitCommission(exitPrice: number, closeQty: number, isMakerExit: boolean): number {
+    const venue = this.config.trading.venue;
+    const feeRate =
+      venue === 'Futures'
+        ? isMakerExit
+          ? 0.0002
+          : 0.0004
+        : isMakerExit
+          ? 0.00075
+          : 0.001;
+    return Number((exitPrice * closeQty * feeRate).toFixed(4));
   }
 
   private openPositionFromInput(
@@ -1026,6 +1255,19 @@ export class SimulationRuntime {
       cleanTargets[cleanTargets.length - 1]?.targetPrice ??
       (input.side === 'Long' ? entryPrice + slDist * 2.5 : entryPrice - slDist * 2.5);
 
+    const rationale = `${this.config.trading.venue === 'Futures' ? `FUTURES ${this.config.trading.leverage}x · ` : ''}${input.orderType} · $${cappedUsdt.toFixed(2)} · ${cleanTargets.length || 2} TP targets`;
+    const entryRec = this.recordEntryExecution({
+      symbol: input.symbol,
+      side: input.side,
+      uiOrderType: input.orderType,
+      price: entryPrice,
+      quantity,
+      timeInForce: input.timeInForce,
+      isMaker: isMakerFill || input.orderType === 'LIMIT MAKER',
+      rationale,
+      nowMs,
+    });
+
     const pos: Position = {
       id: `${input.symbol}-ord-${nowMs}`,
       symbol: input.symbol,
@@ -1039,6 +1281,7 @@ export class SimulationRuntime {
           : cappedUsdt,
       unrealizedPnlUsdt: 0,
       realizedPnlUsdt: 0,
+      feePaidUsdt: entryRec.commission,
       highestFavorablePrice: entryPrice,
       exitPlan: {
         initialStopLoss: initialSl,
@@ -1047,28 +1290,18 @@ export class SimulationRuntime {
         takeProfit2: tp2Price,
         tpTargets: cleanTargets.length > 0 ? cleanTargets : undefined,
         tp1Hit: false,
-        breakEvenArmed: input.useBreakEven && this.config.features.breakEvenStop,
+        breakEvenArmed: false,
+        breakEvenEnabled: input.useBreakEven && this.config.features.breakEvenStop,
         trailingActive: false,
         trailingEnabled: input.useTrailingStop && this.config.features.trailingStop,
         riskDistanceR: slDist,
       },
       openedAtMs: nowMs,
-      rationale: `${this.config.trading.venue === 'Futures' ? `FUTURES ${this.config.trading.leverage}x · ` : ''}${input.orderType} · $${cappedUsdt.toFixed(2)} · ${cleanTargets.length || 2} TP targets`,
+      rationale,
     };
 
     pair.openPosition = pos;
     pair.lastSignalNote = pos.rationale;
-    this.recordEntryExecution({
-      symbol: input.symbol,
-      side: input.side,
-      uiOrderType: input.orderType,
-      price: entryPrice,
-      quantity,
-      timeInForce: input.timeInForce,
-      isMaker: isMakerFill || input.orderType === 'LIMIT MAKER',
-      rationale: pos.rationale,
-      nowMs,
-    });
     this.pushLog(
       'info',
       `Filled ${input.orderType} (${input.side}) ${input.symbol} $${cappedUsdt.toFixed(2)} @ $${entryPrice.toFixed(2)}`
@@ -1081,11 +1314,14 @@ export class SimulationRuntime {
     if (!pair?.openPosition) return;
     const pos = pair.openPosition;
     const closeQty = pos.remainingQuantity;
-    const pnl =
+    const grossPnl =
       pos.side === 'Long'
         ? (pair.lastPrice - pos.entryPrice) * closeQty
         : (pos.entryPrice - pair.lastPrice) * closeQty;
-    const rMult = pnl / Math.max(pos.exitPlan.riskDistanceR * pos.quantity, 1e-9);
+    const entryFeePortion = (pos.feePaidUsdt ?? 0) * (closeQty / Math.max(pos.quantity, 1e-9));
+    const exitFee = this.computeExitCommission(pair.lastPrice, closeQty, false);
+    const pnl = grossPnl - entryFeePortion - exitFee;
+    const rMult = pnl / Math.max(pos.exitPlan.riskDistanceR * closeQty, 1e-9);
     this.riskManager.recordRealizedPnl(symbol, pnl, nowMs);
     this.snapshot.recentTrades.unshift({
       id: `${pos.id}-manual`,
@@ -1186,11 +1422,14 @@ export class SimulationRuntime {
       if (pair.openPosition) {
         const pos = pair.openPosition;
         const closeQty = pos.remainingQuantity;
-        const pnl =
+        const grossPnl =
           pos.side === 'Long'
             ? (pair.lastPrice - pos.entryPrice) * closeQty
             : (pos.entryPrice - pair.lastPrice) * closeQty;
-        const rMult = pnl / Math.max(pos.exitPlan.riskDistanceR * pos.quantity, 1e-9);
+        const entryFeePortion = (pos.feePaidUsdt ?? 0) * (closeQty / Math.max(pos.quantity, 1e-9));
+        const exitFee = this.computeExitCommission(pair.lastPrice, closeQty, false);
+        const pnl = grossPnl - entryFeePortion - exitFee;
+        const rMult = pnl / Math.max(pos.exitPlan.riskDistanceR * closeQty, 1e-9);
         this.riskManager.recordRealizedPnl(pair.symbol, pnl, nowMs);
         this.snapshot.recentTrades.unshift({
           id: `${pos.id}-flat`,
@@ -1238,6 +1477,27 @@ export class SimulationRuntime {
       ? this.snapshot.pairs.filter((p) => p.symbol === externalBar.symbol)
       : this.snapshot.pairs;
 
+    const autoActive =
+      this.snapshot.running &&
+      this.config.automation.enabled &&
+      this.config.features.automatedTrading &&
+      this.config.features.signalGenerator;
+
+    const sessionCheck = autoActive
+      ? evaluateUtcSessionWindows(
+          nowMs,
+          this.config.automation.sessionWindows,
+          Boolean(this.config.features.sessionWindowFilter)
+        )
+      : { allowed: true, reason: '' };
+
+    if (autoActive && !sessionCheck.allowed) {
+      this.snapshot.autoStats.lastActionSummary = sessionCheck.reason;
+      this.snapshot.autoStats.lastScanAtMs = nowMs;
+    }
+
+    let closedBarEvaluatedForScan = false;
+
     for (const pair of targets) {
       let nextCandle: Candle;
       if (externalBar) {
@@ -1282,7 +1542,8 @@ export class SimulationRuntime {
         }
       } else {
         pair.candles = [...pair.candles.slice(-219), nextCandle];
-        ind = pipe.update(nextCandle);
+        // Never mutate stateful EMA/RSI/ATR/ADX/VWAP accumulators on unclosed forming bars
+        ind = nextCandle.isClosed ? pipe.update(nextCandle) : pipe.snapshot();
         pair.indicatorHistory = [...pair.indicatorHistory.slice(-219), ind];
       }
 
@@ -1290,7 +1551,16 @@ export class SimulationRuntime {
       pair.lastPrice = nextCandle.close;
       const firstClose = pair.candles[0]?.close ?? nextCandle.close;
       pair.change24hPct = ((nextCandle.close - firstClose) / firstClose) * 100;
-      void prevCandle;
+
+      // Monitor ATR volatility spikes only on confirmed closed candles
+      if (nextCandle.isClosed) {
+        this.evaluatePairVolatilitySpike(
+          pair,
+          nextCandle,
+          prevCandle?.close ?? nextCandle.open,
+          nowMs
+        );
+      }
 
       // 0. Check resting LIMIT / LIMIT_MAKER orders for Paper fills
       if (this.snapshot.accountMode === 'Paper' && !pair.openPosition) {
@@ -1323,7 +1593,7 @@ export class SimulationRuntime {
         }
       }
 
-      // 1. Manage existing open position
+      // 1. Manage existing open position (evaluates every price tick including forming bars)
       if (pair.openPosition) {
         const pos = pair.openPosition;
         const atrVal = ind.atr ?? pos.exitPlan.riskDistanceR;
@@ -1361,10 +1631,14 @@ export class SimulationRuntime {
           }
         } else if (action.type === 'PartialClose') {
           const closeQty = pos.remainingQuantity * action.ratio;
-          const pnl =
+          const grossPnl =
             pos.side === 'Long'
               ? (action.exitPrice - pos.entryPrice) * closeQty
               : (pos.entryPrice - action.exitPrice) * closeQty;
+          const entryFeePortion = (pos.feePaidUsdt ?? 0) * (closeQty / Math.max(pos.quantity, 1e-9));
+          const exitFee = this.computeExitCommission(action.exitPrice, closeQty, true);
+          const pnl = grossPnl - entryFeePortion - exitFee;
+          const tp1RMult = pnl / Math.max(pos.exitPlan.riskDistanceR * closeQty, 1e-9);
           pos.remainingQuantity -= closeQty;
           pos.realizedPnlUsdt += pnl;
           this.riskManager.recordRealizedPnl(pair.symbol, pnl, nowMs);
@@ -1376,7 +1650,7 @@ export class SimulationRuntime {
             exitPrice: action.exitPrice,
             quantity: closeQty,
             pnlUsdt: pnl,
-            rMultiple: 1.5,
+            rMultiple: tp1RMult,
             reason: action.reason,
             closedAtMs: nowMs,
           });
@@ -1388,20 +1662,24 @@ export class SimulationRuntime {
             origQty: pos.quantity,
             executedQty: closeQty,
             pnlUsdt: pnl,
-            rMultiple: 1.5,
+            rMultiple: tp1RMult,
             reason: action.reason,
             isPartial: true,
             rationale: `${pair.symbol} TP1 partial scale-out (${Math.round(action.ratio * 100)}%) @ $${action.exitPrice.toFixed(2)}`,
             nowMs,
           });
-          this.pushLog('info', `${pair.symbol} TP1 partial hit (+$${pnl.toFixed(2)})`);
+          this.pushLog('info', `${pair.symbol} TP1 partial hit (+$${pnl.toFixed(2)} · ${tp1RMult.toFixed(2)}R)`);
         } else if (action.type === 'FullClose') {
           const closeQty = pos.remainingQuantity;
-          const pnl =
+          const grossPnl =
             pos.side === 'Long'
               ? (action.exitPrice - pos.entryPrice) * closeQty
               : (pos.entryPrice - action.exitPrice) * closeQty;
-          const rMult = pnl / Math.max(pos.exitPlan.riskDistanceR * pos.quantity, 1e-9);
+          const entryFeePortion = (pos.feePaidUsdt ?? 0) * (closeQty / Math.max(pos.quantity, 1e-9));
+          const isMakerExit = action.reason === 'TakeProfit1' || action.reason === 'TakeProfit2';
+          const exitFee = this.computeExitCommission(action.exitPrice, closeQty, isMakerExit);
+          const pnl = grossPnl - entryFeePortion - exitFee;
+          const rMult = pnl / Math.max(pos.exitPlan.riskDistanceR * closeQty, 1e-9);
           this.riskManager.recordRealizedPnl(pair.symbol, pnl, nowMs);
           this.snapshot.recentTrades.unshift({
             id: `${pos.id}-exit`,
@@ -1442,22 +1720,17 @@ export class SimulationRuntime {
             this.flattenAllPositions(nowMs);
           }
         }
-      } else if (
-        this.snapshot.running &&
-        this.config.automation.enabled &&
-        this.config.features.automatedTrading &&
-        this.config.features.signalGenerator
-      ) {
-        this.evaluateAutoPair(pair, nextCandle, ind, nowMs);
+      } else if (autoActive && nextCandle.isClosed) {
+        if (sessionCheck.allowed) {
+          closedBarEvaluatedForScan = true;
+          this.evaluateAutoPair(pair, nextCandle, ind, nowMs);
+        } else {
+          pair.lastSignalNote = sessionCheck.reason;
+        }
       }
     }
 
-    if (
-      this.snapshot.running &&
-      this.config.automation.enabled &&
-      this.config.features.automatedTrading &&
-      this.config.features.signalGenerator
-    ) {
+    if (autoActive && sessionCheck.allowed && closedBarEvaluatedForScan) {
       this.snapshot.autoStats.scansRun += 1;
       this.snapshot.autoStats.lastScanAtMs = nowMs;
     }
@@ -1475,13 +1748,27 @@ export class SimulationRuntime {
       this.pushLog('warn', 'Auto-scan skipped: Signal Generator is disabled in Feature Toggles.');
       return { scannedPairs: 0, signalsDetected: 0, dispatched: 0 };
     }
+    const sessionCheck = evaluateUtcSessionWindows(
+      nowMs,
+      this.config.automation.sessionWindows,
+      Boolean(this.config.features.sessionWindowFilter)
+    );
+    if (!sessionCheck.allowed) {
+      this.snapshot.autoStats.lastActionSummary = sessionCheck.reason;
+      this.snapshot.autoStats.lastScanAtMs = nowMs;
+      this.pushLog('warn', `Auto-scan restricted: ${sessionCheck.reason}`);
+      this.syncRiskToSnapshot();
+      return { scannedPairs: 0, signalsDetected: 0, dispatched: 0 };
+    }
     let signalsDetected = 0;
     let dispatched = 0;
     for (const pair of this.snapshot.pairs) {
       if (pair.openPosition) continue;
-      const latestCandle = pair.candles[pair.candles.length - 1];
-      if (!latestCandle) continue;
-      const res = this.evaluateAutoPair(pair, latestCandle, pair.indicators, nowMs, true);
+      const latestClosed =
+        [...pair.candles].reverse().find((c) => c.isClosed) ??
+        pair.candles[pair.candles.length - 1];
+      if (!latestClosed) continue;
+      const res = this.evaluateAutoPair(pair, latestClosed, pair.indicators, nowMs, true);
       if (res.signalDetected) signalsDetected += 1;
       if (res.dispatched) dispatched += 1;
     }
@@ -1499,6 +1786,16 @@ export class SimulationRuntime {
     ignoreCooldown = false
   ): { signalDetected: boolean; dispatched: boolean } {
     if (!this.config.features.signalGenerator) {
+      return { signalDetected: false, dispatched: false };
+    }
+    const sessionCheck = evaluateUtcSessionWindows(
+      nowMs,
+      this.config.automation.sessionWindows,
+      Boolean(this.config.features.sessionWindowFilter)
+    );
+    if (!sessionCheck.allowed) {
+      pair.lastSignalNote = sessionCheck.reason;
+      this.snapshot.autoStats.lastActionSummary = sessionCheck.reason;
       return { signalDetected: false, dispatched: false };
     }
     const activeVenue = this.config.trading.venue;
@@ -1625,6 +1922,17 @@ export class SimulationRuntime {
               : 'OCO BUY'
             : 'MARKET';
 
+    const tp1PctOffset =
+      sig.entryPrice > 0
+        ? Number(((Math.abs(plan.takeProfit1 - sig.entryPrice) / sig.entryPrice) * 100).toFixed(3))
+        : 2.25;
+    const tp2PctOffset =
+      sig.entryPrice > 0
+        ? Number(((Math.abs(plan.takeProfit2 - sig.entryPrice) / sig.entryPrice) * 100).toFixed(3))
+        : 3.75;
+    const tp1Alloc = Math.round(Math.min(95, Math.max(5, this.config.exits.tp1CloseRatio * 100)));
+    const tp2Alloc = Math.max(0, 100 - tp1Alloc);
+
     const autoInput: ManualOrderInput = {
       symbol: sig.symbol,
       orderType,
@@ -1635,14 +1943,21 @@ export class SimulationRuntime {
           ? limitPrice
           : undefined,
       timeInForce: auto.timeInForce,
+      workingType: 'MARK_PRICE',
       stopLossMode: 'ATR',
-      stopLossPct: 1.5,
+      stopLossPct:
+        sig.entryPrice > 0
+          ? Number(((plan.riskDistanceR / sig.entryPrice) * 100).toFixed(3))
+          : 1.5,
       useBreakEven: true,
       useTrailingStop: true,
-      targets: [
-        { pctOffset: 2.25, allocationPct: 50 },
-        { pctOffset: 3.75, allocationPct: 50 },
-      ],
+      targets:
+        tp2Alloc > 0
+          ? [
+              { pctOffset: Math.max(0.1, tp1PctOffset), allocationPct: tp1Alloc },
+              { pctOffset: Math.max(0.2, tp2PctOffset), allocationPct: tp2Alloc },
+            ]
+          : [{ pctOffset: Math.max(0.1, tp1PctOffset), allocationPct: 100 }],
     };
 
     if (this.snapshot.accountMode === 'Live') {
@@ -1659,8 +1974,7 @@ export class SimulationRuntime {
         reason: sig.rationale,
         input: autoInput,
       });
-      this.snapshot.autoStats.autoOrdersDispatched += 1;
-      this.snapshot.autoStats.lastActionSummary = `Queued Live ${auto.orderMethod} ${sig.side} ${sig.symbol} $${desiredNotional.toFixed(2)}`;
+      this.snapshot.autoStats.lastActionSummary = `Queued Live ${auto.orderMethod} ${sig.side} ${sig.symbol} $${desiredNotional.toFixed(2)} (awaiting dispatch)`;
       pair.lastSignalNote = sig.rationale;
       return { signalDetected: true, dispatched: true };
     }

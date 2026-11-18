@@ -23,15 +23,31 @@ export const SummaryCardsRow: React.FC<SummaryCardsRowProps> = ({ snapshot, conf
   const btcEquiv = btcPrice > 0 ? risk.currentEquity / btcPrice : 0;
 
   const openCount = pairs.filter((p) => p.openPosition !== null).length;
-  const closedWins = recentTrades.filter((t) => t.pnlUsdt >= 0).length;
-  const closedLosses = recentTrades.filter((t) => t.pnlUsdt < 0).length;
+  const now = new Date();
+  const startOfUtcDayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const windowCutoffMs =
+    windowRange === '24H' ? startOfUtcDayMs : Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const rangedTrades = recentTrades.filter((t) => t.closedAtMs >= windowCutoffMs);
+
+  const closedWins = rangedTrades.filter((t) => t.pnlUsdt >= 0).length;
+  const closedLosses = rangedTrades.filter((t) => t.pnlUsdt < 0).length;
   const openWins = pairs.filter((p) => p.openPosition && p.openPosition.unrealizedPnlUsdt >= 0).length;
   const openLosses = pairs.filter((p) => p.openPosition && p.openPosition.unrealizedPnlUsdt < 0).length;
 
   const displayWins = tradesFilter === 'Closed' ? closedWins : openWins;
   const displayLosses = tradesFilter === 'Closed' ? closedLosses : openLosses;
-  const displayTotal = tradesFilter === 'Closed' ? recentTrades.length : openCount;
+  const displayTotal = tradesFilter === 'Closed' ? rangedTrades.length : openCount;
   const winRatio = displayTotal > 0 ? displayWins / displayTotal : 0;
+
+  const thirtyDayPnlUsdt = recentTrades
+    .filter((t) => t.closedAtMs >= Date.now() - 30 * 24 * 60 * 60 * 1000)
+    .reduce((sum, t) => sum + t.pnlUsdt, 0);
+  const displayedPeriodPnlUsdt =
+    windowRange === '24H' ? risk.cumulativeDailyPnlUsdt : thirtyDayPnlUsdt;
+  const displayedPeriodPnlPct =
+    windowRange === '24H'
+      ? risk.cumulativeDailyPnlPct
+      : (thirtyDayPnlUsdt / Math.max(config.trading.initialEquityUsdt, 1)) * 100;
 
   // SVG Donut ring geometry (r = 40 -> circumference = 251.33)
   const radius = 40;
@@ -59,6 +75,7 @@ export const SummaryCardsRow: React.FC<SummaryCardsRowProps> = ({ snapshot, conf
   }, [pnlHistory, risk.cumulativeDailyPnlUsdt]);
 
   const pnlPositive = risk.cumulativeDailyPnlUsdt >= 0;
+  const periodPnlPositive = displayedPeriodPnlUsdt >= 0;
 
   return (
     <div className="grid grid-cols-1 gap-3.5 md:grid-cols-3">
@@ -211,14 +228,17 @@ export const SummaryCardsRow: React.FC<SummaryCardsRowProps> = ({ snapshot, conf
         </div>
 
         <div className="mt-1 text-center">
-          <div className="text-[11px] text-slate-400">Total PnL ({windowRange})</div>
+          <div className="text-[11px] text-slate-400">
+            {windowRange === '24H' ? 'Session PnL (24H UTC)' : 'Total Closed PnL (30D)'}
+          </div>
           <div
             className={`mt-0.5 font-mono text-base font-bold tabular-nums ${
-              pnlPositive ? 'text-emerald-400' : 'text-rose-400'
+              periodPnlPositive ? 'text-emerald-400' : 'text-rose-400'
             }`}
           >
-            {pnlPositive ? '+' : '-'}${fmtUsd(risk.cumulativeDailyPnlUsdt)} ({pnlPositive ? '+' : ''}
-            {risk.cumulativeDailyPnlPct.toFixed(2)}%)
+            {periodPnlPositive ? '+' : '-'}${fmtUsd(displayedPeriodPnlUsdt)} (
+            {periodPnlPositive ? '+' : ''}
+            {displayedPeriodPnlPct.toFixed(2)}%)
           </div>
         </div>
 

@@ -163,12 +163,13 @@ export function computeExpectancyStats(
     grossLossUsdt > 1e-6
       ? grossProfitUsdt / grossLossUsdt
       : grossProfitUsdt > 0
-        ? 2.85
+        ? Infinity
         : 0;
 
   let profitFactorRegime: ExpectancyAnalytics['profitFactorRegime'] = 'NoSample';
   if (sampleCount > 0) {
-    if (profitFactor < 1.0) profitFactorRegime = 'NetLosing';
+    if (!Number.isFinite(profitFactor)) profitFactorRegime = 'StrongEdge';
+    else if (profitFactor < 1.0) profitFactorRegime = 'NetLosing';
     else if (profitFactor < 1.3) profitFactorRegime = 'SubThreshold';
     else if (profitFactor <= 2.0) profitFactorRegime = 'ViableEdge';
     else if (profitFactor <= 3.0) profitFactorRegime = 'StrongEdge';

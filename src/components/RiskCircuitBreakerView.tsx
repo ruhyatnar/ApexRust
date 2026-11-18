@@ -430,10 +430,14 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
               <div className="font-sans text-[11px] text-slate-400">Profit Factor (GP / GL)</div>
               <div
                 className={`mt-1 text-base font-bold ${
-                  expectancy.profitFactor >= 1.3 ? 'text-emerald-400' : 'text-amber-300'
+                  !Number.isFinite(expectancy.profitFactor) || expectancy.profitFactor >= 1.3
+                    ? 'text-emerald-400'
+                    : 'text-amber-300'
                 }`}
               >
-                {expectancy.profitFactor.toFixed(2)}
+                {Number.isFinite(expectancy.profitFactor)
+                  ? expectancy.profitFactor.toFixed(2)
+                  : '∞'}
               </div>
               <div className="mt-0.5 text-[10px] text-slate-400">
                 Regime: {expectancy.profitFactorRegime}

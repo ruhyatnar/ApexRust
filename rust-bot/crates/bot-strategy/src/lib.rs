@@ -30,7 +30,7 @@ pub fn evaluate_entry_signal(
     )
 }
 
-/// Evaluates entry signals honoring `StrategyProfile`, `DirectionPolicy`, and `FeatureToggles`.
+/// Evaluates entry signals honoring `StrategyProfile`, `DirectionPolicy`, `FeatureToggles`, and `recent_candles`.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_entry_signal_with_options(
     symbol: &str,
@@ -41,6 +41,34 @@ pub fn evaluate_entry_signal_with_options(
     profile: StrategyProfile,
     direction_policy: DirectionPolicy,
     features: &FeatureToggles,
+    now: DateTime<Utc>,
+) -> Option<EntrySignal> {
+    evaluate_entry_signal_full(
+        symbol,
+        candle,
+        ind,
+        trading_cfg,
+        ind_cfg,
+        profile,
+        direction_policy,
+        features,
+        &[],
+        now,
+    )
+}
+
+/// Evaluates entry signals with full historical candle context for Donchian breakout confirmation.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_entry_signal_full(
+    symbol: &str,
+    candle: &Candle,
+    ind: &IndicatorSnapshot,
+    trading_cfg: &TradingConfig,
+    ind_cfg: &IndicatorConfig,
+    profile: StrategyProfile,
+    direction_policy: DirectionPolicy,
+    features: &FeatureToggles,
+    recent_candles: &[Candle],
     now: DateTime<Utc>,
 ) -> Option<EntrySignal> {
     if !features.signal_generator {
@@ -63,6 +91,19 @@ pub fn evaluate_entry_signal_with_options(
 
     if atr <= 0.0 {
         return None;
+    }
+
+    if features.volume_confirmation_filter {
+        let vol_ratio = ind.volume_ratio.or_else(|| {
+            ind.avg_volume_20
+                .filter(|&a| a > 0.0)
+                .map(|a| candle.volume / a)
+        });
+        if let Some(vr) = vol_ratio {
+            if vr < ind_cfg.min_volume_expansion_mult.max(1.0) {
+                return None;
+            }
+        }
     }
 
     let allow_short = matches!(direction_policy, DirectionPolicy::Both);
@@ -139,6 +180,84 @@ pub fn evaluate_entry_signal_with_options(
         || !ind_cfg.require_vwap_alignment
         || ind.vwap.map_or(true, |v| candle.close <= v);
 
+    if matches!(profile, StrategyProfile::EmaBreakout) {
+        let lookback: Vec<&Candle> = recent_candles
+            .iter()
+            .rev()
+            .skip(if recent_candles.last().map_or(false, |c| c.open_time_ms == candle.open_time_ms) { 1 } else { 0 })
+            .take(10)
+            .collect();
+        let prior_high = if lookback.is_empty() {
+            candle.open
+        } else {
+            lookback.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max)
+        };
+        let prior_low = if lookback.is_empty() {
+            candle.open
+        } else {
+            lookback.iter().map(|c| c.low).fold(f64::INFINITY, f64::min)
+        };
+        let avg_vol = if lookback.is_empty() {
+            ind.avg_volume_20.unwrap_or(candle.volume)
+        } else {
+            lookback.iter().map(|c| c.volume).sum::<f64>() / lookback.len() as f64
+        };
+        let req_vol_mult = if features.volume_confirmation_filter {
+            ind_cfg.min_volume_expansion_mult.max(1.1)
+        } else {
+            1.1
+        };
+        let vol_surge_ok = avg_vol <= f64::EPSILON || candle.volume >= avg_vol * req_vol_mult;
+        let ema_break_long_ok = !features.ema_trend_filter || (ema_fast > ema_mid && ema_mid > ema_slow);
+        let ema_break_short_ok = !features.ema_trend_filter || (ema_fast < ema_mid && ema_mid < ema_slow);
+        let di_long_ok = !features.adx_strength_filter || pdi > mdi;
+        let di_short_ok = !features.adx_strength_filter || mdi > pdi;
+        let rsi_break_long_ok = !features.rsi_momentum_filter || (rsi >= 50.0 && rsi <= 74.0);
+        let rsi_break_short_ok = !features.rsi_momentum_filter || (rsi <= 50.0 && rsi >= 26.0);
+
+        if candle.close > prior_high
+            && ema_break_long_ok
+            && macro_long_ok
+            && di_long_ok
+            && rsi_break_long_ok
+            && vol_surge_ok
+            && vwap_long_ok
+        {
+            return Some(EntrySignal {
+                symbol: symbol.to_string(),
+                side: Side::Long,
+                entry_price: candle.close,
+                atr,
+                adx,
+                rsi,
+                rationale: format!("Momentum Breakout Long · Close > 10-bar High · ADX {adx:.1}"),
+                timestamp: now,
+            });
+        }
+
+        if allow_short
+            && candle.close < prior_low
+            && ema_break_short_ok
+            && macro_short_ok
+            && di_short_ok
+            && rsi_break_short_ok
+            && vol_surge_ok
+            && vwap_short_ok
+        {
+            return Some(EntrySignal {
+                symbol: symbol.to_string(),
+                side: Side::Short,
+                entry_price: candle.close,
+                atr,
+                adx,
+                rsi,
+                rationale: format!("Momentum Breakout Short · Close < 10-bar Low · ADX {adx:.1}"),
+                timestamp: now,
+            });
+        }
+        return None;
+    }
+
     let ema_long_ok = !features.ema_trend_filter
         || (candle.close > ema_mid && ema_fast >= ema_mid && ema_mid > ema_slow);
     let ema_short_ok = !features.ema_trend_filter
@@ -191,9 +310,26 @@ pub fn evaluate_entry_signal_with_options(
 
 /// Build an initial ATR-based `ExitPlan` at trade entry.
 pub fn build_exit_plan(side: Side, entry_price: f64, atr: f64, cfg: &ExitConfig) -> ExitPlan {
-    let sl_dist = atr * cfg.atr_sl_multiplier;
-    let tp1_dist = atr * cfg.atr_tp1_multiplier;
-    let tp2_dist = atr * cfg.atr_tp2_multiplier;
+    build_exit_plan_with_features(side, entry_price, atr, cfg, &FeatureToggles::default())
+}
+
+/// Build an `ExitPlan` honoring `FeatureToggles` (`atr_dynamic_exits`, `break_even_stop`, `trailing_stop`, `take_profit_ladder`).
+pub fn build_exit_plan_with_features(
+    side: Side,
+    entry_price: f64,
+    atr: f64,
+    cfg: &ExitConfig,
+    features: &FeatureToggles,
+) -> ExitPlan {
+    let (sl_dist, tp1_dist, tp2_dist) = if features.atr_dynamic_exits {
+        (
+            atr * cfg.atr_sl_multiplier,
+            atr * cfg.atr_tp1_multiplier,
+            atr * cfg.atr_tp2_multiplier,
+        )
+    } else {
+        (entry_price * 0.015, entry_price * 0.025, entry_price * 0.04)
+    };
 
     match side {
         Side::Long => ExitPlan {
@@ -203,7 +339,10 @@ pub fn build_exit_plan(side: Side, entry_price: f64, atr: f64, cfg: &ExitConfig)
             take_profit_2: entry_price + tp2_dist,
             tp1_hit: false,
             break_even_armed: false,
+            break_even_enabled: features.break_even_stop,
             trailing_active: false,
+            trailing_enabled: features.trailing_stop,
+            tp_ladder_enabled: features.take_profit_ladder,
             risk_distance_r: sl_dist,
         },
         Side::Short => ExitPlan {
@@ -213,7 +352,10 @@ pub fn build_exit_plan(side: Side, entry_price: f64, atr: f64, cfg: &ExitConfig)
             take_profit_2: entry_price - tp2_dist,
             tp1_hit: false,
             break_even_armed: false,
+            break_even_enabled: features.break_even_stop,
             trailing_active: false,
+            trailing_enabled: features.trailing_stop,
+            tp_ladder_enabled: features.take_profit_ladder,
             risk_distance_r: sl_dist,
         },
     }
@@ -266,7 +408,10 @@ pub fn manage_position_tick(
             }
 
             // 3. Check Partial TP1
-            if !pos.exit_plan.tp1_hit && mark_price >= pos.exit_plan.take_profit_1 {
+            if pos.exit_plan.tp_ladder_enabled
+                && !pos.exit_plan.tp1_hit
+                && mark_price >= pos.exit_plan.take_profit_1
+            {
                 pos.exit_plan.tp1_hit = true;
                 return PositionTickAction::PartialClose {
                     ratio: cfg.tp1_close_ratio,
@@ -277,7 +422,10 @@ pub fn manage_position_tick(
 
             // 4. Arm Break-Even at >= break_even_trigger_r
             let r_gain = (mark_price - pos.entry_price) / r;
-            if !pos.exit_plan.break_even_armed && r_gain >= cfg.break_even_trigger_r {
+            if pos.exit_plan.break_even_enabled
+                && !pos.exit_plan.break_even_armed
+                && r_gain >= cfg.break_even_trigger_r
+            {
                 let be_price = pos.entry_price + fee_buffer;
                 if be_price > pos.exit_plan.active_stop_loss {
                     pos.exit_plan.active_stop_loss = be_price;
@@ -286,7 +434,10 @@ pub fn manage_position_tick(
             }
 
             // 5. Monotonic ATR Trailing Stop
-            if r_gain >= cfg.trailing_activation_r && current_atr > 0.0 {
+            if pos.exit_plan.trailing_enabled
+                && r_gain >= cfg.trailing_activation_r
+                && current_atr > 0.0
+            {
                 pos.exit_plan.trailing_active = true;
                 let trail_sl = pos.highest_favorable_price - (current_atr * cfg.atr_trailing_multiplier);
                 if trail_sl > pos.exit_plan.active_stop_loss {
@@ -319,7 +470,10 @@ pub fn manage_position_tick(
                 };
             }
 
-            if !pos.exit_plan.tp1_hit && mark_price <= pos.exit_plan.take_profit_1 {
+            if pos.exit_plan.tp_ladder_enabled
+                && !pos.exit_plan.tp1_hit
+                && mark_price <= pos.exit_plan.take_profit_1
+            {
                 pos.exit_plan.tp1_hit = true;
                 return PositionTickAction::PartialClose {
                     ratio: cfg.tp1_close_ratio,
@@ -329,7 +483,10 @@ pub fn manage_position_tick(
             }
 
             let r_gain = (pos.entry_price - mark_price) / r;
-            if !pos.exit_plan.break_even_armed && r_gain >= cfg.break_even_trigger_r {
+            if pos.exit_plan.break_even_enabled
+                && !pos.exit_plan.break_even_armed
+                && r_gain >= cfg.break_even_trigger_r
+            {
                 let be_price = pos.entry_price - fee_buffer;
                 if be_price < pos.exit_plan.active_stop_loss {
                     pos.exit_plan.active_stop_loss = be_price;
@@ -337,7 +494,10 @@ pub fn manage_position_tick(
                 pos.exit_plan.break_even_armed = true;
             }
 
-            if r_gain >= cfg.trailing_activation_r && current_atr > 0.0 {
+            if pos.exit_plan.trailing_enabled
+                && r_gain >= cfg.trailing_activation_r
+                && current_atr > 0.0
+            {
                 pos.exit_plan.trailing_active = true;
                 let trail_sl = pos.highest_favorable_price + (current_atr * cfg.atr_trailing_multiplier);
                 if trail_sl < pos.exit_plan.active_stop_loss {

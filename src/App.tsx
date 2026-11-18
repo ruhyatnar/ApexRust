@@ -3,6 +3,7 @@ import {
   BarChart2,
   Bot,
   ChevronDown,
+  ClipboardList,
   Code2,
   KeyRound,
   Menu,
@@ -16,11 +17,26 @@ import { FeatureTogglesView } from './components/FeatureTogglesView';
 import { GitBackupView } from './components/GitBackupView';
 import { LiveCredentialsView } from './components/LiveCredentialsView';
 import { MarketsView, SignalsView } from './components/MarketsAndSignalsView';
+import { OrderHistoryView } from './components/OrderHistoryView';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
 import { RiskCircuitBreakerView } from './components/RiskCircuitBreakerView';
 import { RustCodebaseView } from './components/RustCodebaseView';
 import { StrategyConfigView } from './components/StrategyConfigView';
 import { TradingDeskView } from './components/TradingDeskView';
-import { DEFAULT_BOT_CONFIG, SimulationRuntime } from './engine/simulator';
+import {
+  clearPersistedBotConfig,
+  loadPersistedBotConfig,
+  loadPersistedWorkspaceUiState,
+  savePersistedBotConfig,
+  savePersistedWorkspaceUiState,
+  type PersistedWorkspaceUiState,
+} from './engine/configStorage';
+import {
+  collectNewLiveFillNotifications,
+  dispatchDesktopLiveFillNotifications,
+  type LiveExecutionNotificationPayload,
+} from './engine/liveFillNotifications';
+import { SimulationRuntime } from './engine/simulator';
 import type {
   BinanceAuthMethod,
   BinanceExecutionRecord,
@@ -32,11 +48,13 @@ import type {
   LiveCredentialStatus,
   ManualOrderInput,
   MarginType,
+  OrderExecutionLog,
   Timeframe,
   TransportMode,
+  VolatilitySpikeAlert,
 } from './engine/types';
 
-type ActiveSection = 'trade' | 'markets' | 'bot' | 'signal' | 'rust';
+type ActiveSection = 'trade' | 'markets' | 'orders' | 'bot' | 'signal' | 'rust';
 type BotSubTab = 'strategy' | 'features' | 'risk' | 'credentials' | 'git';
 
 const NAV_ITEMS: Array<{
@@ -46,6 +64,7 @@ const NAV_ITEMS: Array<{
 }> = [
   { id: 'trade', label: 'Trade', icon: TrendingUp },
   { id: 'markets', label: 'Markets', icon: BarChart2 },
+  { id: 'orders', label: 'Orders', icon: ClipboardList },
   { id: 'bot', label: 'Bot', icon: Bot },
   { id: 'signal', label: 'Signal', icon: Radio },
   { id: 'rust', label: 'Rust', icon: Code2 },
@@ -73,27 +92,43 @@ const INITIAL_LIVE_STATUS: LiveCredentialStatus = {
 };
 
 export default function App() {
+  // Hydrate persisted bot configuration and workspace UI state once before initializing runtimes
+  const initialConfigRef = useRef<BotConfig | null>(null);
+  if (!initialConfigRef.current) {
+    initialConfigRef.current = loadPersistedBotConfig();
+  }
+  const initialUiRef = useRef<PersistedWorkspaceUiState | null>(null);
+  if (!initialUiRef.current) {
+    initialUiRef.current = loadPersistedWorkspaceUiState();
+  }
+  const initialConfig = initialConfigRef.current;
+  const initialUi = initialUiRef.current;
+  const initialEnv = initialUi.environment ?? 'Testnet';
+
   // Strictly isolated runtime instances: Paper Sandbox vs Live Execution
   const paperRuntimeRef = useRef<SimulationRuntime | null>(null);
   const liveRuntimeRef = useRef<SimulationRuntime | null>(null);
   if (!paperRuntimeRef.current) {
-    paperRuntimeRef.current = new SimulationRuntime(DEFAULT_BOT_CONFIG, Date.now(), {
+    paperRuntimeRef.current = new SimulationRuntime(initialConfig, Date.now(), {
       accountMode: 'Paper',
       seedDemoData: true,
-      environment: 'Testnet',
+      environment: initialEnv,
     });
+    if (initialUi.paperFeedSource === 'BinanceLive') {
+      paperRuntimeRef.current.snapshot.transport.feedSource = 'BinanceLive';
+    }
   }
   if (!liveRuntimeRef.current) {
-    liveRuntimeRef.current = new SimulationRuntime(DEFAULT_BOT_CONFIG, Date.now(), {
+    liveRuntimeRef.current = new SimulationRuntime(initialConfig, Date.now(), {
       accountMode: 'Live',
       seedDemoData: false,
       initialEquityOverride: 0,
-      environment: 'Testnet',
+      environment: initialEnv,
     });
   }
 
-  const [accountMode, setAccountMode] = useState<ExecutionAccountMode>('Paper');
-  const [config, setConfig] = useState<BotConfig>(() => structuredClone(DEFAULT_BOT_CONFIG));
+  const [accountMode, setAccountMode] = useState<ExecutionAccountMode>(initialUi.accountMode);
+  const [config, setConfig] = useState<BotConfig>(() => structuredClone(initialConfig));
   const [paperSnapshot, setPaperSnapshot] = useState<EngineSnapshot>(() =>
     structuredClone(paperRuntimeRef.current!.snapshot)
   );
@@ -102,25 +137,103 @@ export default function App() {
   );
   const [liveStatus, setLiveStatus] = useState<LiveCredentialStatus>(INITIAL_LIVE_STATUS);
 
-  const [section, setSection] = useState<ActiveSection>('trade');
-  const [botSubTab, setBotSubTab] = useState<BotSubTab>('strategy');
-  const [selectedSymbol, setSelectedSymbol] = useState<string>('BTCUSDT');
+  const [section, setSection] = useState<ActiveSection>(initialUi.section);
+  const [botSubTab, setBotSubTab] = useState<BotSubTab>(initialUi.botSubTab);
+  const [selectedSymbol, setSelectedSymbol] = useState<string>(initialUi.selectedSymbol);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [orderLogRefreshKey, setOrderLogRefreshKey] = useState(0);
+  const [volatilityToast, setVolatilityToast] = useState<VolatilitySpikeAlert | null>(null);
+  const [liveFillToast, setLiveFillToast] = useState<LiveExecutionNotificationPayload | null>(null);
+  const [notifPermission, setNotifPermission] = useState<string>(() =>
+    typeof window !== 'undefined' && 'Notification' in window
+      ? window.Notification.permission
+      : 'unsupported'
+  );
+  const [liveTicker, setLiveTicker] = useState<{
+    symbol: string;
+    bid: number;
+    ask: number;
+    last: number;
+  } | null>(null);
 
   const activeRuntimeRef = accountMode === 'Live' ? liveRuntimeRef : paperRuntimeRef;
   const snapshot = accountMode === 'Live' ? liveSnapshot : paperSnapshot;
   const liveStatusRef = useRef<LiveCredentialStatus>(liveStatus);
   liveStatusRef.current = liveStatus;
   const inflightLiveIntentsRef = useRef(false);
+  const hydratedServerVaultRef = useRef(false);
+  const syncedExecIdsRef = useRef<Set<string> | null>(null);
+  if (!syncedExecIdsRef.current) {
+    syncedExecIdsRef.current = new Set([
+      ...paperRuntimeRef.current!.snapshot.executionHistory.map((r) => `Paper:${r.id}`),
+      ...liveRuntimeRef.current!.snapshot.executionHistory.map((r) => `Live:${r.id}`),
+    ]);
+  }
+  const notifiedLiveFillIdsRef = useRef<Set<string> | null>(null);
+  if (!notifiedLiveFillIdsRef.current) {
+    notifiedLiveFillIdsRef.current = new Set(
+      liveRuntimeRef.current!.snapshot.executionHistory.map((r) => r.id)
+    );
+  }
+
+  const dispatchBrowserVolatilityNotifications = useCallback((alerts: VolatilitySpikeAlert[]) => {
+    if (alerts.length === 0) return;
+    const latest = alerts[alerts.length - 1];
+    setVolatilityToast(latest);
+
+    if (
+      typeof window !== 'undefined' &&
+      'Notification' in window &&
+      window.Notification.permission === 'granted'
+    ) {
+      for (const alert of alerts) {
+        try {
+          new window.Notification(`⚡ ATR Volatility Spike: ${alert.symbol}`, {
+            body: alert.message,
+            tag: alert.id,
+          });
+        } catch {
+          // Ignore Notification constructor errors in restricted environments
+        }
+      }
+    }
+  }, []);
+
+  const dispatchBrowserLiveFillNotifications = useCallback(
+    (notifications: LiveExecutionNotificationPayload[]) => {
+      if (notifications.length === 0) return;
+      setLiveFillToast(notifications[notifications.length - 1]);
+      dispatchDesktopLiveFillNotifications(notifications);
+    },
+    []
+  );
 
   const syncSnapshots = useCallback(() => {
+    const newAlerts: VolatilitySpikeAlert[] = [];
+    const newLiveFills: LiveExecutionNotificationPayload[] = [];
     if (paperRuntimeRef.current) {
+      newAlerts.push(...paperRuntimeRef.current.consumePendingVolatilityAlerts());
       setPaperSnapshot(structuredClone(paperRuntimeRef.current.snapshot));
     }
     if (liveRuntimeRef.current) {
+      newAlerts.push(...liveRuntimeRef.current.consumePendingVolatilityAlerts());
+      if (notifiedLiveFillIdsRef.current) {
+        newLiveFills.push(
+          ...collectNewLiveFillNotifications(
+            liveRuntimeRef.current.snapshot.executionHistory,
+            notifiedLiveFillIdsRef.current
+          )
+        );
+      }
       setLiveSnapshot(structuredClone(liveRuntimeRef.current.snapshot));
     }
-  }, []);
+    if (newAlerts.length > 0) {
+      dispatchBrowserVolatilityNotifications(newAlerts);
+    }
+    if (newLiveFills.length > 0) {
+      dispatchBrowserLiveFillNotifications(newLiveFills);
+    }
+  }, [dispatchBrowserVolatilityNotifications, dispatchBrowserLiveFillNotifications]);
 
   const activeVenue = config.trading.venue;
   const activeVenueRef = useRef<ExchangeVenue>(activeVenue);
@@ -137,6 +250,10 @@ export default function App() {
 
     const status = liveStatusRef.current;
     if (!status.configured || !status.armedForLiveOrders) {
+      rt.reportLiveAutoRejected(
+        `Live auto intent skipped (${intents.length}): server credentials not configured or disarmed.`
+      );
+      syncSnapshots();
       return;
     }
 
@@ -150,6 +267,29 @@ export default function App() {
           if (venue === 'Spot' && intent.binanceSide !== 'SELL') {
             continue;
           }
+          const pairBeforeExit = rt.snapshot.pairs.find((p) => p.symbol === intent.symbol);
+          const posBeforeExit = pairBeforeExit?.openPosition;
+          if (
+            posBeforeExit &&
+            (posBeforeExit.exchangeListId != null ||
+              (posBeforeExit.exchangeAlgoIds && posBeforeExit.exchangeAlgoIds.length > 0))
+          ) {
+            try {
+              await fetch('/api/live/cancel-open-brackets', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  symbol: intent.symbol,
+                  venue,
+                  orderListId: posBeforeExit.exchangeListId,
+                  algoOrderIds: posBeforeExit.exchangeAlgoIds,
+                }),
+              });
+            } catch {
+              // Best-effort bracket cleanup before market exit
+            }
+          }
+
           const resp = await fetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -160,11 +300,13 @@ export default function App() {
               side: intent.binanceSide,
               type: 'MARKET',
               quantity: intent.quantity,
+              reduceOnly: venue === 'Futures' ? true : undefined,
               preflightOnly: false,
             }),
           });
           const data = (await resp.json()) as {
             ok?: boolean;
+            orderId?: string;
             avgPrice?: number;
             latencyMs?: number;
             error?: string;
@@ -189,16 +331,20 @@ export default function App() {
                 | 'TakeProfit2'
                 | 'CircuitBreakerFlatten'
                 | 'ManualClose',
-              `[AUTO LIVE EXIT ${venue}] ${intent.symbol} ${intent.reason} @ $${exitPx.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+              `[AUTO LIVE EXIT ${venue}] ${intent.symbol} ${intent.reason} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
+              Date.now(),
+              data.orderId
             );
           } else {
-            rt.snapshot.autoStats.lastActionSummary = `Live EXIT failed: ${data.error ?? 'Rejected'}`;
+            rt.reportLiveAutoRejected(`Live EXIT failed (${intent.symbol}): ${data.error ?? 'Rejected'}`);
           }
         } else {
           // Automated ENTRY
           if (venue === 'Spot' && intent.binanceSide === 'SELL') {
             // Binance Spot API cannot open unhedged Short positions via spot SELL without inventory
-            rt.snapshot.autoStats.lastActionSummary = `Skipped Spot Short ${intent.symbol} (switch to USD-M Futures or Spot Long)`;
+            rt.reportLiveAutoRejected(
+              `Skipped Spot Short ${intent.symbol} (switch to USD-M Futures or Spot Long)`
+            );
             continue;
           }
           const binanceType =
@@ -210,15 +356,18 @@ export default function App() {
                   ? 'LIMIT'
                   : 'MARKET';
           const pair = rt.snapshot.pairs.find((p) => p.symbol === intent.symbol);
-          const refPx = pair?.lastPrice ?? 0;
+          const refPx =
+            intent.limitPrice && intent.limitPrice > 0 ? intent.limitPrice : pair?.lastPrice ?? 0;
           const isLong = intent.binanceSide === 'BUY';
+          const tpPct = intent.input?.targets?.[0]?.pctOffset ?? 2.5;
+          const slPct = intent.input?.stopLossPct ?? 1.5;
           const tpPx =
             binanceType === 'OCO' && refPx > 0
-              ? refPx * (isLong ? 1.025 : 0.975)
+              ? refPx * (1 + (isLong ? 1 : -1) * (tpPct / 100))
               : undefined;
           const slPx =
             binanceType === 'OCO' && refPx > 0
-              ? refPx * (isLong ? 0.985 : 1.015)
+              ? refPx * (1 - (isLong ? 1 : -1) * (slPct / 100))
               : undefined;
 
           const resp = await fetch('/api/live/order', {
@@ -235,6 +384,7 @@ export default function App() {
               timeInForce: intent.timeInForce,
               takeProfitPrice: tpPx,
               stopLossPrice: slPx,
+              workingType: intent.input?.workingType ?? 'MARK_PRICE',
               preflightOnly: false,
             }),
           });
@@ -242,33 +392,49 @@ export default function App() {
             ok?: boolean;
             orderId?: string;
             orderStatus?: string;
+            executedQty?: number;
             avgPrice?: number;
+            commission?: number;
+            ocoOrderListId?: number;
+            algoOrderIds?: string[];
+            ocoWarning?: string;
             ocoNote?: string;
             latencyMs?: number;
             error?: string;
           };
           if (resp.ok && data.ok && intent.input) {
             if (data.orderStatus === 'NEW' && intent.limitPrice) {
+              const summary = `[AUTO LIVE ${venue}] Resting ${binanceType} ${intent.symbol} @ $${intent.limitPrice.toFixed(intent.limitPrice >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`;
               rt.recordExternalLivePendingOrder(
                 intent.input,
                 intent.limitPrice,
                 data.orderId,
-                `[AUTO LIVE ${venue}] Resting ${binanceType} ${intent.symbol} @ $${intent.limitPrice.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+                summary
               );
+              rt.confirmLiveAutoDispatch(summary);
             } else {
-              rt.recordExternalLiveOrder(
-                intent.input,
-                `[AUTO LIVE ${venue}] Filled ${binanceType} ${intent.symbol} $${intent.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`
-              );
+              const summary = `[AUTO LIVE ${venue}] Filled ${binanceType} ${intent.symbol} $${intent.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`;
+              rt.recordExternalLiveOrder(intent.input, summary, Date.now(), {
+                executedQty: data.executedQty,
+                avgPrice: data.avgPrice,
+                commission: data.commission,
+                orderId: data.orderId,
+                ocoOrderListId: data.ocoOrderListId,
+                algoOrderIds: data.algoOrderIds,
+              });
+              rt.confirmLiveAutoDispatch(summary);
             }
           } else {
-            rt.snapshot.autoStats.lastActionSummary = `Live AUTO ${intent.symbol} rejected: ${data.error ?? 'Error'}`;
+            rt.reportLiveAutoRejected(`Live AUTO ${intent.symbol} rejected: ${data.error ?? 'Error'}`);
           }
         }
       }
       syncSnapshots();
-    } catch {
-      // Ignore transient network errors cleanly
+    } catch (err) {
+      rt.reportLiveAutoRejected(
+        `Live AUTO intent error: ${err instanceof Error ? err.message : 'Network error'}`
+      );
+      syncSnapshots();
     } finally {
       inflightLiveIntentsRef.current = false;
     }
@@ -277,6 +443,33 @@ export default function App() {
   const applyLiveStatusToRuntime = useCallback(
     (status: LiveCredentialStatus) => {
       setLiveStatus(status);
+      if (!hydratedServerVaultRef.current) {
+        hydratedServerVaultRef.current = true;
+        setConfig((prev) => {
+          const nextVenue = status.venue ?? prev.trading.venue;
+          const nextLev = status.leverage ?? prev.trading.leverage;
+          const nextMargin = status.marginType ?? prev.trading.marginType;
+          if (
+            nextVenue === prev.trading.venue &&
+            nextLev === prev.trading.leverage &&
+            nextMargin === prev.trading.marginType
+          ) {
+            return prev;
+          }
+          const updated: BotConfig = {
+            ...prev,
+            trading: {
+              ...prev.trading,
+              venue: nextVenue,
+              leverage: nextLev,
+              marginType: nextMargin,
+            },
+          };
+          paperRuntimeRef.current?.updateConfig(updated);
+          liveRuntimeRef.current?.updateConfig(updated);
+          return updated;
+        });
+      }
       if (liveRuntimeRef.current) {
         liveRuntimeRef.current.setEnvironment(status.environment);
         const usdtBal = status.syncedBalances.find((b) => b.asset === 'USDT');
@@ -347,13 +540,6 @@ export default function App() {
       : isTestnet
         ? 'wss://stream.testnet.binance.vision/stream'
         : 'wss://stream.binance.com:9443/stream';
-    const restBase = isFutures
-      ? isTestnet
-        ? 'https://testnet.binancefuture.com/fapi/v1'
-        : 'https://fapi.binance.com/fapi/v1'
-      : isTestnet
-        ? 'https://testnet.binance.vision/api/v3'
-        : 'https://api.binance.com/api/v3';
 
     const streams = config.trading.pairs
       .map((p) => `${p.toLowerCase()}@kline_${config.trading.timeframe}`)
@@ -366,22 +552,50 @@ export default function App() {
         if (cancelled) return;
         try {
           const resp = await fetch(
-            `${restBase}/klines?symbol=${symbol}&interval=${config.trading.timeframe}&limit=2`
+            `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(config.trading.timeframe)}&venue=${encodeURIComponent(config.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}&limit=3`
           );
           if (!resp.ok) continue;
-          const rows = (await resp.json()) as Array<Array<string | number>>;
-          const row = rows[rows.length - 1];
-          if (!row) continue;
-          const candle: Candle = {
-            openTimeMs: Number(row[0]),
-            open: Number(row[1]),
-            high: Number(row[2]),
-            low: Number(row[3]),
-            close: Number(row[4]),
-            volume: Number(row[5]),
-            isClosed: true,
+          const payload = (await resp.json()) as {
+            ok?: boolean;
+            rows?: Array<Array<string | number>>;
           };
-          rt.stepBar(Date.now(), { symbol, candle });
+          const rows = Array.isArray(payload.rows) ? payload.rows : [];
+          if (rows.length === 0) continue;
+
+          const lastRow = rows[rows.length - 1];
+          const prevRow = rows.length >= 2 ? rows[rows.length - 2] : undefined;
+          const nowTs = Date.now();
+          const lastCloseTime = Number(lastRow[6] ?? 0);
+          const lastIsClosed = Number.isFinite(lastCloseTime) && lastCloseTime > 0 ? lastCloseTime <= nowTs : false;
+
+          if (prevRow && !lastIsClosed) {
+            const pairState = rt.snapshot.pairs.find((p) => p.symbol === symbol);
+            const lastClosedCandle = [...(pairState?.candles ?? [])].reverse().find((c) => c.isClosed);
+            const prevOpenTime = Number(prevRow[0]);
+            if (!lastClosedCandle || prevOpenTime > lastClosedCandle.openTimeMs) {
+              const confirmedCandle: Candle = {
+                openTimeMs: prevOpenTime,
+                open: Number(prevRow[1]),
+                high: Number(prevRow[2]),
+                low: Number(prevRow[3]),
+                close: Number(prevRow[4]),
+                volume: Number(prevRow[5]),
+                isClosed: true,
+              };
+              rt.stepBar(nowTs, { symbol, candle: confirmedCandle });
+            }
+          }
+
+          const candle: Candle = {
+            openTimeMs: Number(lastRow[0]),
+            open: Number(lastRow[1]),
+            high: Number(lastRow[2]),
+            low: Number(lastRow[3]),
+            close: Number(lastRow[4]),
+            volume: Number(lastRow[5]),
+            isClosed: lastIsClosed,
+          };
+          rt.stepBar(nowTs, { symbol, candle });
           syncSnapshots();
           if (rt.snapshot.accountMode === 'Live') {
             void drainLiveIntents();
@@ -496,13 +710,226 @@ export default function App() {
     drainLiveIntents,
   ]);
 
+  // Poll live Binance bookTicker when feedSource is BinanceLive
+  useEffect(() => {
+    if (snapshot.transport.feedSource !== 'BinanceLive') {
+      setLiveTicker(null);
+      return;
+    }
+    let cancelled = false;
+    const fetchTicker = async () => {
+      try {
+        const resp = await fetch(
+          `/api/market/ticker?symbol=${encodeURIComponent(selectedSymbol)}&venue=${encodeURIComponent(config.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}`
+        );
+        if (!resp.ok || cancelled) return;
+        const data = (await resp.json()) as {
+          ok?: boolean;
+          symbol?: string;
+          bid?: number;
+          ask?: number;
+          price?: number;
+        };
+        if (data.ok && data.price && data.price > 0 && !cancelled) {
+          setLiveTicker({
+            symbol: data.symbol ?? selectedSymbol,
+            bid: data.bid && data.bid > 0 ? data.bid : data.price,
+            ask: data.ask && data.ask > 0 ? data.ask : data.price,
+            last: data.price,
+          });
+        }
+      } catch {
+        // Ignore transient ticker poll errors
+      }
+    };
+    void fetchTicker();
+    const timer = window.setInterval(fetchTicker, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    snapshot.transport.feedSource,
+    snapshot.transport.environment,
+    selectedSymbol,
+    config.trading.venue,
+  ]);
+
+  // Periodically reconcile resting Live pending orders against Binance openOrders
+  useEffect(() => {
+    if (
+      accountMode !== 'Live' ||
+      !liveStatus.configured ||
+      liveSnapshot.pendingOrders.length === 0
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const reconcileOpenOrders = async () => {
+      const rt = liveRuntimeRef.current;
+      if (!rt || cancelled) return;
+      try {
+        const resp = await fetch(
+          `/api/live/open-orders?venue=${encodeURIComponent(config.trading.venue)}`
+        );
+        if (!resp.ok || cancelled) return;
+        const data = (await resp.json()) as {
+          ok?: boolean;
+          orders?: Array<{ orderId?: number | string; symbol?: string }>;
+        };
+        if (!data.ok || !Array.isArray(data.orders) || cancelled) return;
+        const openIds = new Set(data.orders.map((o) => String(o.orderId ?? '')));
+        let changed = false;
+        const currentPending = [...rt.snapshot.pendingOrders];
+        for (const pending of currentPending) {
+          if (pending.exchangeOrderId && !openIds.has(pending.exchangeOrderId)) {
+            rt.cancelPendingOrder(pending.id);
+            changed = true;
+          }
+        }
+        if (changed) {
+          syncSnapshots();
+        }
+      } catch {
+        // Ignore transient reconciliation error
+      }
+    };
+    const timer = window.setInterval(reconcileOpenOrders, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    accountMode,
+    liveStatus.configured,
+    liveSnapshot.pendingOrders.length,
+    config.trading.venue,
+    syncSnapshots,
+  ]);
+
+  // Persist workspace navigation, account isolation mode, symbol, environment, and paper feed source
+  useEffect(() => {
+    savePersistedWorkspaceUiState({
+      accountMode,
+      section,
+      botSubTab,
+      selectedSymbol,
+      environment: snapshot.transport.environment,
+      paperFeedSource: paperSnapshot.transport.feedSource,
+    });
+  }, [
+    accountMode,
+    section,
+    botSubTab,
+    selectedSymbol,
+    snapshot.transport.environment,
+    paperSnapshot.transport.feedSource,
+  ]);
+
+  // Mirror newly generated Paper and Live execution fills into persistent backend /api/orders/history
+  useEffect(() => {
+    const seen = syncedExecIdsRef.current;
+    if (!seen) return;
+
+    const toOrderLog = (rec: BinanceExecutionRecord): OrderExecutionLog => ({
+      id: `client-${rec.accountMode.toLowerCase()}-${rec.id}`,
+      orderId: String(rec.orderId),
+      clientOrderId: rec.clientOrderId,
+      orderListId: rec.orderListId > 0 ? rec.orderListId : undefined,
+      symbol: rec.symbol,
+      venue: rec.venue,
+      environment: rec.environment,
+      accountMode: rec.accountMode,
+      source: rec.accountMode === 'Live' ? 'live_proxy' : 'paper_engine',
+      lifecycle: rec.lifecycle,
+      side: rec.side,
+      binanceSide: rec.binanceSide,
+      orderType: rec.orderType,
+      timeInForce: rec.timeInForce,
+      status: rec.orderStatus,
+      price: rec.price,
+      executedQty: rec.executedQty,
+      origQty: rec.origQty,
+      quoteQty: rec.cummulativeQuoteQty,
+      commission: rec.commission,
+      commissionAsset: rec.commissionAsset,
+      isMaker: rec.isMaker,
+      realizedPnlUsdt: rec.realizedPnlUsdt,
+      rMultiple: rec.rMultiple,
+      exitReason: rec.exitReason,
+      latencyMs: rec.accountMode === 'Paper' ? 14 : null,
+      endpoint:
+        rec.venue === 'Futures'
+          ? 'POST /fapi/v1/order'
+          : rec.orderListId !== -1
+            ? 'POST /api/v3/orderList/oco'
+            : 'POST /api/v3/order',
+      rationale: rec.strategyRationale,
+      timestampMs: rec.transactTime,
+    });
+
+    const newLogs: OrderExecutionLog[] = [];
+    for (const rec of paperSnapshot.executionHistory) {
+      const key = `Paper:${rec.id}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        newLogs.push(toOrderLog(rec));
+      }
+    }
+    for (const rec of liveSnapshot.executionHistory) {
+      const key = `Live:${rec.id}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        newLogs.push(toOrderLog(rec));
+      }
+    }
+
+    if (notifiedLiveFillIdsRef.current) {
+      const missedLiveFills = collectNewLiveFillNotifications(
+        liveSnapshot.executionHistory,
+        notifiedLiveFillIdsRef.current
+      );
+      if (missedLiveFills.length > 0) {
+        dispatchBrowserLiveFillNotifications(missedLiveFills);
+      }
+    }
+
+    if (newLogs.length === 0) return;
+
+    void fetch('/api/orders/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ logs: newLogs }),
+    })
+      .then((res) => {
+        if (res.ok) {
+          setOrderLogRefreshKey((k) => k + 1);
+        }
+      })
+      .catch(() => {
+        // Ignore transient offline sync failure
+      });
+  }, [
+    paperSnapshot.executionHistory,
+    liveSnapshot.executionHistory,
+    dispatchBrowserLiveFillNotifications,
+  ]);
+
   const handleUpdateConfig = (next: BotConfig) => {
-    setConfig(next);
-    paperRuntimeRef.current?.updateConfig(next);
-    liveRuntimeRef.current?.updateConfig(next);
+    const normalized: BotConfig = {
+      ...next,
+      automation: {
+        ...next.automation,
+        enabled: next.features.automatedTrading,
+      },
+    };
+    setConfig(normalized);
+    savePersistedBotConfig(normalized);
+    paperRuntimeRef.current?.updateConfig(normalized);
+    liveRuntimeRef.current?.updateConfig(normalized);
     syncSnapshots();
 
-    if (next.features.gitAutoBackup) {
+    if (normalized.features.gitAutoBackup) {
       if (gitBackupTimerRef.current !== null) {
         window.clearTimeout(gitBackupTimerRef.current);
       }
@@ -511,13 +938,23 @@ export default function App() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            commitMessage: `chore(backup): auto-sync ${next.trading.venue} config`,
+            commitMessage: `chore(backup): auto-sync ${normalized.trading.venue} config`,
             push: false,
-            config: next,
+            config: normalized,
           }),
         }).catch(() => undefined);
       }, 1500);
     }
+  };
+
+  const handleResetConfigDefaults = () => {
+    const defaults = clearPersistedBotConfig();
+    setConfig(defaults);
+    paperRuntimeRef.current?.setVenue(defaults.trading.venue);
+    liveRuntimeRef.current?.setVenue(defaults.trading.venue);
+    paperRuntimeRef.current?.updateConfig(defaults);
+    liveRuntimeRef.current?.updateConfig(defaults);
+    syncSnapshots();
   };
 
   const handleUpdateVenue = (venue: ExchangeVenue) => {
@@ -549,11 +986,16 @@ export default function App() {
   };
 
   const handleToggleAutomation = () => {
+    const nextEnabled = !config.automation.enabled;
     const next: BotConfig = {
       ...config,
       automation: {
         ...config.automation,
-        enabled: !config.automation.enabled,
+        enabled: nextEnabled,
+      },
+      features: {
+        ...config.features,
+        automatedTrading: nextEnabled,
       },
     };
     handleUpdateConfig(next);
@@ -569,12 +1011,20 @@ export default function App() {
     }
   };
 
+  const handleSimulateVolatilitySpike = (symbol: string) => {
+    const rt = activeRuntimeRef.current;
+    if (!rt) return;
+    rt.simulateVolatilitySpike(symbol, Date.now());
+    syncSnapshots();
+  };
+
   const handleChangeTimeframe = (tf: Timeframe) => {
     const nextConfig: BotConfig = {
       ...config,
       trading: { ...config.trading, timeframe: tf },
     };
     setConfig(nextConfig);
+    savePersistedBotConfig(nextConfig);
     paperRuntimeRef.current?.setTimeframe(tf);
     liveRuntimeRef.current?.setTimeframe(tf);
     paperRuntimeRef.current?.updateConfig(nextConfig);
@@ -626,11 +1076,23 @@ export default function App() {
       snapshot.transport.environment === 'Testnet' ? 'Production' : 'Testnet';
     activeRuntimeRef.current?.setEnvironment(nextEnv);
     syncSnapshots();
+    void fetch('/api/live/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ environment: nextEnv }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { status?: LiveCredentialStatus } | null) => {
+        if (data?.status) {
+          applyLiveStatusToRuntime(data.status);
+        }
+      })
+      .catch(() => undefined);
   };
 
   const handleSubmitOrder = async (
     input: ManualOrderInput
-  ): Promise<{ ok: true } | { ok: false; reason: string }> => {
+  ): Promise<{ ok: true; warning?: string } | { ok: false; reason: string }> => {
     const rt = activeRuntimeRef.current;
     if (!rt) return { ok: false, reason: 'Engine uninitialized' };
 
@@ -677,7 +1139,8 @@ export default function App() {
               : 'MARKET';
 
       const pair = rt.snapshot.pairs.find((p) => p.symbol === input.symbol);
-      const refPx = pair?.lastPrice ?? 0;
+      const refPx =
+        input.limitPrice && input.limitPrice > 0 ? input.limitPrice : pair?.lastPrice ?? 0;
       const primaryTpPct = input.targets[0]?.pctOffset ?? 2.5;
       const isLong = input.side === 'Long';
       const tpPx =
@@ -704,6 +1167,8 @@ export default function App() {
             timeInForce: input.timeInForce ?? 'GTC',
             takeProfitPrice: tpPx,
             stopLossPrice: slPx,
+            workingType: input.workingType ?? 'MARK_PRICE',
+            reduceOnly: input.reduceOnly,
             preflightOnly: false,
           }),
         });
@@ -713,6 +1178,12 @@ export default function App() {
           latencyMs?: number;
           orderId?: string;
           orderStatus?: string;
+          executedQty?: number;
+          avgPrice?: number;
+          commission?: number;
+          ocoOrderListId?: number;
+          algoOrderIds?: string[];
+          ocoWarning?: string;
           ocoNote?: string;
         };
         if (!resp.ok || !data.ok) {
@@ -723,16 +1194,25 @@ export default function App() {
             input,
             input.limitPrice,
             data.orderId,
-            `Live ${liveStatus.environment} ${venue} resting ${binanceType} ${input.symbol} @ $${input.limitPrice.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+            `Live ${liveStatus.environment} ${venue} resting ${binanceType} ${input.symbol} @ $${input.limitPrice.toFixed(input.limitPrice >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`
           );
         } else {
           rt.recordExternalLiveOrder(
             input,
-            `Live ${liveStatus.environment} ${venue} ${binanceType} ${input.side} ${input.symbol} $${input.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`
+            `Live ${liveStatus.environment} ${venue} ${binanceType} ${input.side} ${input.symbol} $${input.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`,
+            Date.now(),
+            {
+              executedQty: data.executedQty,
+              avgPrice: data.avgPrice,
+              commission: data.commission,
+              orderId: data.orderId,
+              ocoOrderListId: data.ocoOrderListId,
+              algoOrderIds: data.algoOrderIds,
+            }
           );
         }
         syncSnapshots();
-        return { ok: true };
+        return { ok: true, warning: data.ocoWarning };
       } catch (err) {
         return {
           ok: false,
@@ -763,6 +1243,25 @@ export default function App() {
         liveStatus.armedForLiveOrders &&
         (pos.side === 'Long' || venue === 'Futures')
       ) {
+        if (
+          pos.exchangeListId != null ||
+          (pos.exchangeAlgoIds && pos.exchangeAlgoIds.length > 0)
+        ) {
+          try {
+            await fetch('/api/live/cancel-open-brackets', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                symbol,
+                venue,
+                orderListId: pos.exchangeListId,
+                algoOrderIds: pos.exchangeAlgoIds,
+              }),
+            });
+          } catch {
+            // Proceed to close attempt even if bracket cancel fails
+          }
+        }
         const closeSide = pos.side === 'Long' ? 'SELL' : 'BUY';
         try {
           const resp = await fetch('/api/live/order', {
@@ -771,13 +1270,20 @@ export default function App() {
             body: JSON.stringify({
               symbol,
               venue,
+              leverage: config.trading.leverage,
               side: closeSide,
               type: 'MARKET',
               quantity: pos.remainingQuantity,
+              reduceOnly: venue === 'Futures' ? true : undefined,
               preflightOnly: false,
             }),
           });
-          const data = (await resp.json()) as { ok?: boolean; avgPrice?: number; latencyMs?: number };
+          const data = (await resp.json()) as {
+            ok?: boolean;
+            orderId?: string;
+            avgPrice?: number;
+            latencyMs?: number;
+          };
           if (resp.ok && data.ok) {
             const exitPx = data.avgPrice && data.avgPrice > 0 ? data.avgPrice : pair.lastPrice;
             rt.recordExternalLiveExit(
@@ -785,7 +1291,9 @@ export default function App() {
               1,
               exitPx,
               'ManualClose',
-              `Live ${venue} ${closeSide} exit ${symbol} @ $${exitPx.toFixed(2)} (${data.latencyMs ?? 0}ms)`
+              `Live ${venue} ${closeSide} exit ${symbol} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
+              Date.now(),
+              data.orderId
             );
             syncSnapshots();
             return;
@@ -810,6 +1318,26 @@ export default function App() {
         (p) => p.openPosition && (p.openPosition.side === 'Long' || venue === 'Futures')
       );
       for (const p of openPairs) {
+        const pos = p.openPosition!;
+        if (
+          pos.exchangeListId != null ||
+          (pos.exchangeAlgoIds && pos.exchangeAlgoIds.length > 0)
+        ) {
+          try {
+            await fetch('/api/live/cancel-open-brackets', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                symbol: p.symbol,
+                venue,
+                orderListId: pos.exchangeListId,
+                algoOrderIds: pos.exchangeAlgoIds,
+              }),
+            });
+          } catch {
+            // Continue bracket cleanup
+          }
+        }
         try {
           await fetch('/api/live/order', {
             method: 'POST',
@@ -817,9 +1345,11 @@ export default function App() {
             body: JSON.stringify({
               symbol: p.symbol,
               venue,
-              side: p.openPosition!.side === 'Long' ? 'SELL' : 'BUY',
+              leverage: config.trading.leverage,
+              side: pos.side === 'Long' ? 'SELL' : 'BUY',
               type: 'MARKET',
-              quantity: p.openPosition!.remainingQuantity,
+              quantity: pos.remainingQuantity,
+              reduceOnly: venue === 'Futures' ? true : undefined,
               preflightOnly: false,
             }),
           });
@@ -1019,6 +1549,8 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           symbol: selectedSymbol,
+          venue: config.trading.venue,
+          leverage: config.trading.leverage,
           side: 'BUY',
           type: 'MARKET',
           quoteOrderQty: 25,
@@ -1148,6 +1680,8 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2.5 shrink-0">
+          <PWAInstallButton />
+
           <button
             type="button"
             onClick={handleOpenLiveCredentials}
@@ -1307,6 +1841,7 @@ export default function App() {
               snapshot={snapshot}
               config={config}
               liveStatus={liveStatus}
+              liveTicker={liveTicker}
               selectedSymbol={selectedSymbol}
               onSelectSymbol={setSelectedSymbol}
               onChangeTimeframe={handleChangeTimeframe}
@@ -1337,6 +1872,17 @@ export default function App() {
               onSelectPairAndTrade={handleSelectPairAndTrade}
               onSimulateTransport={handleSimulateTransport}
               onToggleFeedSource={handleToggleFeedSource}
+            />
+          )}
+
+          {section === 'orders' && (
+            <OrderHistoryView
+              accountMode={accountMode}
+              activeSymbol={selectedSymbol}
+              activeVenue={config.trading.venue}
+              symbols={config.trading.pairs}
+              refreshKey={orderLogRefreshKey}
+              onSelectPairAndTrade={handleSelectPairAndTrade}
             />
           )}
 
@@ -1445,6 +1991,8 @@ export default function App() {
                   onUpdateConfig={handleUpdateConfig}
                   onToggleAutomation={handleToggleAutomation}
                   onRunAutoScan={handleRunAutoScan}
+                  onSimulateVolatilitySpike={handleSimulateVolatilitySpike}
+                  onResetDefaults={handleResetConfigDefaults}
                 />
               )}
 
@@ -1496,6 +2044,94 @@ export default function App() {
           {section === 'rust' && <RustCodebaseView />}
         </main>
       </div>
+
+      {(liveFillToast || volatilityToast) && (
+        <div className="fixed bottom-4 right-4 z-50 flex max-w-md flex-col gap-2.5">
+          {liveFillToast && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="rounded-xl border border-[#7DF2AD]/50 bg-[#141820]/95 p-4 shadow-2xl backdrop-blur"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-xs font-bold uppercase tracking-wider text-[#7DF2AD]">
+                      Live Execution Fill
+                    </span>
+                    <span className="font-mono text-[11px] font-semibold text-slate-200 tabular-nums">
+                      #{liveFillToast.orderId}
+                    </span>
+                    <span className="font-mono text-[11px] font-semibold text-amber-300">
+                      {liveFillToast.symbol}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-slate-200 font-mono tabular-nums">
+                    {liveFillToast.summary}
+                  </p>
+                  {typeof window !== 'undefined' &&
+                    'Notification' in window &&
+                    notifPermission === 'default' &&
+                    window.Notification.permission === 'default' && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void window.Notification.requestPermission().then((res) =>
+                            setNotifPermission(res)
+                          )
+                        }
+                        className="mt-2 rounded-md border border-[#7DF2AD]/40 bg-[#0B0F17] px-2.5 py-1 text-[11px] font-medium text-[#7DF2AD] hover:bg-[#7DF2AD]/10"
+                      >
+                        Enable Desktop Alerts
+                      </button>
+                    )}
+                </div>
+                <button
+                  type="button"
+                  aria-label="Dismiss live execution alert"
+                  onClick={() => setLiveFillToast(null)}
+                  className="rounded-md p-1 text-slate-400 transition hover:bg-white/[0.08] hover:text-slate-100"
+                >
+                  <X className="h-4 w-4" aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {volatilityToast && (
+            <div
+              role="alert"
+              aria-live="assertive"
+              className="rounded-xl border border-amber-400/50 bg-[#141820]/95 p-4 shadow-2xl backdrop-blur"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs font-bold uppercase tracking-wider text-amber-300">
+                      ATR Volatility Spike Push Alert
+                    </span>
+                    <span className="font-mono text-[11px] font-semibold text-[#7DF2AD]">
+                      {volatilityToast.symbol}
+                    </span>
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-slate-200">
+                    {volatilityToast.message}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  aria-label="Dismiss volatility alert"
+                  onClick={() => setVolatilityToast(null)}
+                  className="rounded-md p-1 text-slate-400 transition hover:bg-white/[0.08] hover:text-slate-100"
+                >
+                  <X className="h-4 w-4" aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      <OfflineIndicator />
     </div>
   );
 }

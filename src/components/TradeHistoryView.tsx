@@ -29,6 +29,11 @@ interface TradeHistoryViewProps {
   }>;
 }
 
+function fmtPx(px: number): string {
+  const d = px >= 100 ? 2 : px >= 1 ? 4 : 6;
+  return px.toFixed(d);
+}
+
 function buildBinanceRestPayload(rec: BinanceExecutionRecord): Record<string, unknown> {
   if (rec.venue === 'Futures') {
     // Official Binance USD-M Futures GET /fapi/v1/userTrades schema
@@ -37,7 +42,7 @@ function buildBinanceRestPayload(rec: BinanceExecutionRecord): Record<string, un
       id: rec.tradeId,
       orderId: rec.orderId,
       side: rec.binanceSide,
-      price: rec.price.toFixed(2),
+      price: fmtPx(rec.price),
       qty: rec.executedQty.toFixed(4),
       realizedPnl: (rec.realizedPnlUsdt ?? 0).toFixed(4),
       marginAsset: 'USDT',
@@ -56,7 +61,7 @@ function buildBinanceRestPayload(rec: BinanceExecutionRecord): Record<string, un
     id: rec.tradeId,
     orderId: rec.orderId,
     orderListId: rec.orderListId,
-    price: rec.price.toFixed(2),
+    price: fmtPx(rec.price),
     qty: rec.executedQty.toFixed(4),
     quoteQty: rec.cummulativeQuoteQty.toFixed(2),
     commission: rec.commission.toFixed(4),
@@ -82,14 +87,14 @@ function buildBinanceWsPayload(rec: BinanceExecutionRecord): Record<string, unkn
         o: rec.orderType,
         f: rec.timeInForce,
         q: rec.origQty.toFixed(4),
-        p: rec.price.toFixed(2),
-        ap: rec.price.toFixed(2),
+        p: fmtPx(rec.price),
+        ap: fmtPx(rec.price),
         x: rec.execType,
         X: rec.orderStatus,
         i: rec.orderId,
         l: rec.executedQty.toFixed(4),
         z: rec.executedQty.toFixed(4),
-        L: rec.price.toFixed(2),
+        L: fmtPx(rec.price),
         n: rec.commission.toFixed(4),
         N: rec.commissionAsset,
         T: rec.transactTime,
@@ -111,14 +116,14 @@ function buildBinanceWsPayload(rec: BinanceExecutionRecord): Record<string, unkn
     o: rec.orderType,
     f: rec.timeInForce,
     q: rec.origQty.toFixed(4),
-    p: rec.price.toFixed(2),
+    p: fmtPx(rec.price),
     x: rec.execType,
     X: rec.orderStatus,
     r: 'NONE',
     i: rec.orderId,
     l: rec.executedQty.toFixed(4),
     z: rec.executedQty.toFixed(4),
-    L: rec.price.toFixed(2),
+    L: fmtPx(rec.price),
     n: rec.commission.toFixed(4),
     N: rec.commissionAsset,
     T: rec.transactTime,
@@ -133,6 +138,27 @@ function buildBinanceWsPayload(rec: BinanceExecutionRecord): Record<string, unkn
 
 function buildBinanceOrderResponsePayload(rec: BinanceExecutionRecord): Record<string, unknown> {
   if (rec.venue === 'Futures') {
+    const isConditionalAlgo =
+      rec.orderType === 'TAKE_PROFIT_MARKET' || rec.orderType === 'STOP_MARKET';
+    if (isConditionalAlgo) {
+      // Official Binance USD-M Futures POST /fapi/v1/algoOrder conditional bracket schema
+      return {
+        endpoint: 'POST /fapi/v1/algoOrder',
+        algoId: rec.orderId,
+        clientAlgoId: rec.clientOrderId,
+        algoType: 'CONDITIONAL',
+        orderType: rec.orderType,
+        symbol: rec.symbol,
+        side: rec.binanceSide,
+        positionSide: rec.positionSide,
+        triggerPrice: fmtPx(rec.price),
+        closePosition: true,
+        workingType: 'MARK_PRICE',
+        priceProtect: true,
+        algoStatus: rec.orderStatus === 'FILLED' ? 'TRIGGERED' : 'NEW',
+        createTime: rec.transactTime,
+      };
+    }
     // Official Binance USD-M Futures POST /fapi/v1/order (newOrderRespType=RESULT) response schema
     return {
       endpoint: 'POST /fapi/v1/order',
@@ -141,9 +167,9 @@ function buildBinanceOrderResponsePayload(rec: BinanceExecutionRecord): Record<s
       cumQuote: rec.cummulativeQuoteQty.toFixed(2),
       executedQty: rec.executedQty.toFixed(4),
       orderId: rec.orderId,
-      avgPrice: rec.price.toFixed(2),
+      avgPrice: fmtPx(rec.price),
       origQty: rec.origQty.toFixed(4),
-      price: rec.orderType === 'MARKET' ? '0' : rec.price.toFixed(2),
+      price: rec.orderType === 'MARKET' ? '0' : fmtPx(rec.price),
       reduceOnly: rec.lifecycle === 'EXIT',
       side: rec.binanceSide,
       positionSide: rec.positionSide,
@@ -151,13 +177,14 @@ function buildBinanceOrderResponsePayload(rec: BinanceExecutionRecord): Record<s
       symbol: rec.symbol,
       timeInForce: rec.timeInForce,
       type: rec.orderType,
-      workingType: 'MARK_PRICE',
-      priceProtect: true,
       updateTime: rec.transactTime,
     };
   }
   if (rec.orderListId !== -1) {
-    // Official Binance Spot POST /api/v3/orderList/oco response schema
+    // Official Binance Spot POST /api/v3/orderList/oco (above/below Spot OCO legs) response schema
+    const tpSide = rec.side === 'Long' ? 'SELL' : 'BUY';
+    const tpPx = rec.side === 'Long' ? rec.price * 1.025 : rec.price * 0.975;
+    const slPx = rec.side === 'Long' ? rec.price * 0.985 : rec.price * 1.015;
     return {
       endpoint: 'POST /api/v3/orderList/oco',
       orderListId: rec.orderListId,
@@ -170,35 +197,51 @@ function buildBinanceOrderResponsePayload(rec: BinanceExecutionRecord): Record<s
       orders: [
         {
           symbol: rec.symbol,
-          orderId: rec.orderId,
-          clientOrderId: rec.clientOrderId,
+          orderId: rec.orderId + 1,
+          clientOrderId: `${rec.clientOrderId}_tp_maker`,
         },
         {
           symbol: rec.symbol,
-          orderId: rec.orderId + 1,
-          clientOrderId: `${rec.clientOrderId}_tp_leg`,
+          orderId: rec.orderId + 2,
+          clientOrderId: `${rec.clientOrderId}_sl_limit`,
         },
       ],
       orderReports: [
         {
           symbol: rec.symbol,
-          orderId: rec.orderId,
+          orderId: rec.orderId + 1,
           orderListId: rec.orderListId,
-          clientOrderId: rec.clientOrderId,
+          clientOrderId: `${rec.clientOrderId}_tp_maker`,
           transactTime: rec.transactTime,
-          price: rec.price.toFixed(2),
+          price: fmtPx(tpPx),
           origQty: rec.origQty.toFixed(4),
-          executedQty: rec.executedQty.toFixed(4),
-          cummulativeQuoteQty: rec.cummulativeQuoteQty.toFixed(2),
-          status: rec.orderStatus,
-          timeInForce: rec.timeInForce,
-          type: rec.orderType,
-          side: rec.binanceSide,
+          executedQty: '0.0000',
+          cummulativeQuoteQty: '0.00',
+          status: 'NEW',
+          timeInForce: 'GTC',
+          type: 'LIMIT_MAKER',
+          side: tpSide,
+        },
+        {
+          symbol: rec.symbol,
+          orderId: rec.orderId + 2,
+          orderListId: rec.orderListId,
+          clientOrderId: `${rec.clientOrderId}_sl_limit`,
+          transactTime: rec.transactTime,
+          price: fmtPx(slPx * 0.998),
+          stopPrice: fmtPx(slPx),
+          origQty: rec.origQty.toFixed(4),
+          executedQty: '0.0000',
+          cummulativeQuoteQty: '0.00',
+          status: 'NEW',
+          timeInForce: 'GTC',
+          type: 'STOP_LOSS_LIMIT',
+          side: tpSide,
         },
       ],
     };
   }
-  // Official Binance Spot POST /api/v3/order (newOrderRespType=RESULT) response schema
+  // Official Binance Spot POST /api/v3/order (newOrderRespType=FULL) response schema
   return {
     endpoint: 'POST /api/v3/order',
     symbol: rec.symbol,
@@ -206,7 +249,7 @@ function buildBinanceOrderResponsePayload(rec: BinanceExecutionRecord): Record<s
     orderListId: -1,
     clientOrderId: rec.clientOrderId,
     transactTime: rec.transactTime,
-    price: rec.orderType === 'MARKET' ? '0.00000000' : rec.price.toFixed(2),
+    price: rec.orderType === 'MARKET' ? '0.00000000' : fmtPx(rec.price),
     origQty: rec.origQty.toFixed(4),
     executedQty: rec.executedQty.toFixed(4),
     cummulativeQuoteQty: rec.cummulativeQuoteQty.toFixed(2),
@@ -218,7 +261,7 @@ function buildBinanceOrderResponsePayload(rec: BinanceExecutionRecord): Record<s
     selfTradePreventionMode: 'EXPIRE_MAKER',
     fills: [
       {
-        price: rec.price.toFixed(2),
+        price: fmtPx(rec.price),
         qty: rec.executedQty.toFixed(4),
         commission: rec.commission.toFixed(4),
         commissionAsset: rec.commissionAsset,
@@ -364,8 +407,8 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
       r.orderType,
       r.orderStatus,
       r.timeInForce,
-      r.price.toFixed(2),
-      r.entryPrice.toFixed(2),
+      fmtPx(r.price),
+      fmtPx(r.entryPrice),
       r.executedQty.toFixed(5),
       r.cummulativeQuoteQty.toFixed(2),
       r.commission.toFixed(4),
@@ -713,11 +756,11 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
                     {/* Fill Price + Entry Ref */}
                     <td className="py-2 px-3 text-right tabular-nums whitespace-nowrap">
                       <div className="text-[#F1F5F9] font-semibold">
-                        ${rec.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        ${fmtPx(rec.price)}
                       </div>
                       {!isEntry && (
                         <div className="text-[10px] text-[#64748B]">
-                          Entry ${rec.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          Entry ${fmtPx(rec.entryPrice)}
                         </div>
                       )}
                     </td>
@@ -832,7 +875,10 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
                 >
                   ORDER (
                   {inspectedRecord.venue === 'Futures'
-                    ? '/fapi/v1/order'
+                    ? inspectedRecord.orderType === 'TAKE_PROFIT_MARKET' ||
+                      inspectedRecord.orderType === 'STOP_MARKET'
+                      ? '/fapi/v1/algoOrder'
+                      : '/fapi/v1/order'
                     : inspectedRecord.orderListId !== -1
                       ? '/api/v3/orderList/oco'
                       : '/api/v3/order'}

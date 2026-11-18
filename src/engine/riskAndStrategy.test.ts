@@ -735,6 +735,129 @@ test('Executive Briefing §2, §3 & §6: Volume Expansion Confirmation, 9-Step S
   assert.ok(validation.invalidationPrice > 0);
 });
 
+test('ATR Volatility Spike Alerts monitor ATR expansion, queue browser notifications, and respect enable toggle', () => {
+  const rt = new SimulationRuntime(DEFAULT_BOT_CONFIG);
+  assert.equal((rt.snapshot.volatilityAlerts ?? []).length, 0);
+
+  // Trigger a simulated ATR spike on ETHUSDT
+  const spike = rt.simulateVolatilitySpike('ETHUSDT', 1_763_300_000_000);
+  assert.ok(spike !== null);
+  assert.equal(spike.symbol, 'ETHUSDT');
+  assert.ok(spike.atr > 0);
+  assert.ok(spike.atrExpansionRatio >= 1.2);
+  assert.equal((rt.snapshot.volatilityAlerts ?? []).length, 1);
+
+  const pending = rt.consumePendingVolatilityAlerts();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].symbol, 'ETHUSDT');
+  assert.equal(rt.consumePendingVolatilityAlerts().length, 0);
+
+  // Disabling volatilityAlertsEnabled prevents new spike alerts
+  rt.updateConfig({
+    ...DEFAULT_BOT_CONFIG,
+    indicators: {
+      ...DEFAULT_BOT_CONFIG.indicators,
+      volatilityAlertsEnabled: false,
+    },
+  });
+  const blockedSpike = rt.simulateVolatilitySpike('SOLUSDT', 1_763_300_120_000);
+  assert.equal(blockedSpike, null);
+  assert.equal(rt.consumePendingVolatilityAlerts().length, 0);
+});
+
+test('Audit fixes: unclosed WS bars do not mutate indicators, breakEvenArmed starts false, IOC/FOK non-crossing limits expire, zero-PnL keeps streaks neutral, and profitFactor returns Infinity', () => {
+  // 1. breakEvenArmed initializes to false and initial SL stop-out reports StopLoss (not BreakEvenStop)
+  const rt = new SimulationRuntime(DEFAULT_BOT_CONFIG);
+  const eth = rt.snapshot.pairs.find((p) => p.symbol === 'ETHUSDT')!;
+  const openRes = rt.submitManualOrder({
+    symbol: 'ETHUSDT',
+    orderType: 'MARKET',
+    side: 'Long',
+    usdtAmount: 200,
+    stopLossMode: 'MARKET',
+    stopLossPct: 2.0,
+    useBreakEven: true,
+    useTrailingStop: false,
+    targets: [{ pctOffset: 4.0, allocationPct: 100 }],
+  });
+  assert.equal(openRes.ok, true);
+  if (openRes.ok && openRes.position) {
+    assert.equal(openRes.position.exitPlan.breakEvenArmed, false);
+    assert.equal(openRes.position.exitPlan.breakEvenEnabled, true);
+    const slPrice = openRes.position.exitPlan.initialStopLoss;
+    const stopTick = managePositionTick(openRes.position, slPrice - 0.1, 10, DEFAULT_BOT_CONFIG.exits);
+    assert.equal(stopTick.type, 'FullClose');
+    if (stopTick.type === 'FullClose') {
+      assert.equal(stopTick.reason, 'StopLoss');
+    }
+  }
+
+  // 2. Non-crossing IOC / FOK LIMIT orders expire immediately instead of resting
+  const sol = rt.snapshot.pairs.find((p) => p.symbol === 'SOLUSDT')!;
+  const iocRes = rt.submitManualOrder({
+    symbol: 'SOLUSDT',
+    orderType: 'LIMIT',
+    side: 'Long',
+    usdtAmount: 150,
+    limitPrice: Number((sol.lastPrice * 0.95).toFixed(2)),
+    timeInForce: 'IOC',
+    stopLossMode: 'ATR',
+    stopLossPct: 1.5,
+    useBreakEven: true,
+    useTrailingStop: true,
+    targets: [{ pctOffset: 2.5, allocationPct: 100 }],
+  });
+  assert.equal(iocRes.ok, false);
+  assert.equal(rt.snapshot.pendingOrders.length, 0);
+
+  // 3. Unclosed WS bar updates do not advance EMA/RSI/scan count
+  const prevRsi = eth.indicators.rsi;
+  const prevScans = rt.snapshot.autoStats.scansRun;
+  const openT = eth.candles[eth.candles.length - 1].openTimeMs + 300_000;
+  rt.stepBar(Date.now(), {
+    symbol: 'ETHUSDT',
+    candle: {
+      openTimeMs: openT,
+      open: eth.lastPrice,
+      high: eth.lastPrice * 1.03,
+      low: eth.lastPrice * 0.99,
+      close: eth.lastPrice * 1.025,
+      volume: 100,
+      isClosed: false,
+    },
+  });
+  assert.equal(eth.indicators.rsi, prevRsi);
+  assert.equal(rt.snapshot.autoStats.scansRun, prevScans);
+
+  // 4. RiskManager zero-PnL close does not increment winStreak or loseStreak
+  const rm = new RiskManager(DEFAULT_BOT_CONFIG.risk, DEFAULT_BOT_CONFIG.trading, 1_763_280_000_000);
+  rm.recordRealizedPnl('BTCUSDT', 0, 1_763_280_001_000);
+  assert.equal(rm.status().winStreak, 0);
+  assert.equal(rm.status().loseStreak, 0);
+
+  // 5. profitFactor returns Infinity when grossProfit > 0 and grossLoss == 0
+  const expInf = computeExpectancyStats(
+    [
+      {
+        id: 't-win',
+        symbol: 'BTCUSDT',
+        side: 'Long',
+        entryPrice: 100,
+        exitPrice: 105,
+        quantity: 2,
+        pnlUsdt: 10,
+        rMultiple: 1.5,
+        reason: 'TakeProfit2',
+        closedAtMs: 1_763_280_000_000,
+      },
+    ],
+    0.75
+  );
+  assert.equal(expInf.profitFactor, Infinity);
+});
+
+
+
 
 
 

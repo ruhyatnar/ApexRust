@@ -25,8 +25,9 @@ interface OrderTicketPanelProps {
   config: BotConfig;
   activePair: PairRuntimeState;
   liveStatus: LiveCredentialStatus;
+  liveTicker?: { symbol: string; bid: number; ask: number; last: number } | null;
   onSelectSymbol: (symbol: string) => void;
-  onSubmitOrder: (input: ManualOrderInput) => Promise<{ ok: true } | { ok: false; reason: string }>;
+  onSubmitOrder: (input: ManualOrderInput) => Promise<{ ok: true; warning?: string } | { ok: false; reason: string }>;
   onToggleFeedSource: (source: 'Simulated' | 'BinanceLive') => void;
   onOpenLiveCredentials: () => void;
   onUpdateVenue: (venue: ExchangeVenue) => void;
@@ -44,6 +45,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   config,
   activePair,
   liveStatus,
+  liveTicker,
   onSelectSymbol,
   onSubmitOrder,
   onToggleFeedSource,
@@ -80,37 +82,60 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   React.useEffect(() => {
+    setSizingMode(config.trading.positionSizingMode ?? 'fixed_usdt');
+  }, [config.trading.positionSizingMode]);
+
+  React.useEffect(() => {
     try {
       const raw = window.localStorage.getItem('apexrust_ticket_preset');
       if (!raw) return;
       const saved = JSON.parse(raw) as Partial<{
         orderType: OrderType;
         side: Side;
+        amountUnit: 'USDT' | '%';
+        usdtAmount: number;
+        allocPct: number;
+        timeInForce: 'GTC' | 'IOC' | 'FOK';
+        sizingMode: PositionSizingMode;
         stopLossMode: 'ATR' | 'MARKET' | 'LIMIT';
         stopLossPct: number;
         useBreakEven: boolean;
         useTrailingStop: boolean;
         tpMode: 'MARKET' | 'ATR';
+        triggerRef: 'LAST' | 'MARK';
         targets: TpDraft[];
       }>;
       if (saved.orderType) setOrderType(saved.orderType);
       if (saved.side) setSide(saved.side);
+      if (saved.amountUnit === 'USDT' || saved.amountUnit === '%') setAmountUnit(saved.amountUnit);
+      if (typeof saved.usdtAmount === 'number' && saved.usdtAmount >= 0) setUsdtAmount(saved.usdtAmount);
+      if (typeof saved.allocPct === 'number' && saved.allocPct >= 0) setAllocPct(saved.allocPct);
+      if (saved.timeInForce === 'GTC' || saved.timeInForce === 'IOC' || saved.timeInForce === 'FOK') {
+        setTimeInForce(saved.timeInForce);
+      }
+      if (saved.sizingMode) setSizingMode(saved.sizingMode);
       if (saved.stopLossMode) setStopLossMode(saved.stopLossMode);
       if (typeof saved.stopLossPct === 'number') setStopLossPct(saved.stopLossPct);
       if (typeof saved.useBreakEven === 'boolean') setUseBreakEven(saved.useBreakEven);
       if (typeof saved.useTrailingStop === 'boolean') setUseTrailingStop(saved.useTrailingStop);
       if (saved.tpMode) setTpMode(saved.tpMode);
+      if (saved.triggerRef === 'LAST' || saved.triggerRef === 'MARK') setTriggerRef(saved.triggerRef);
       if (Array.isArray(saved.targets) && saved.targets.length > 0) setTargets(saved.targets);
     } catch {
       // Ignore invalid localStorage payload
     }
   }, []);
 
-  const last = activePair.lastPrice;
-  const priceDecimals = last >= 100 ? 2 : 4;
-  const spread = last * 0.0025;
-  const bid = last - spread;
-  const ask = last + spread;
+  const hasLiveBook =
+    snapshot.transport.feedSource === 'BinanceLive' &&
+    liveTicker != null &&
+    liveTicker.symbol === activePair.symbol &&
+    liveTicker.last > 0;
+  const last = hasLiveBook ? liveTicker!.last : activePair.lastPrice;
+  const priceDecimals = last >= 100 ? 2 : last >= 1 ? 4 : 6;
+  const spread = last * 0.0002;
+  const bid = hasLiveBook && liveTicker!.bid > 0 ? liveTicker!.bid : last - spread;
+  const ask = hasLiveBook && liveTicker!.ask > 0 ? liveTicker!.ask : last + spread;
 
   const isLimitOrderType = orderType === 'LIMIT' || orderType === 'LIMIT MAKER';
   const defaultLimitStr = (side === 'Long' ? bid : ask).toFixed(priceDecimals);
@@ -120,6 +145,27 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   React.useEffect(() => {
     setIsCustomLimitPrice(false);
   }, [activePair.symbol]);
+
+  // Keep TP targets dynamically scaled to ATR when tpMode === 'ATR'
+  React.useEffect(() => {
+    if (tpMode !== 'ATR' || last <= 0) return;
+    const atr = activePair.indicators.atr ?? last * 0.01;
+    const tp1Pct = Number((((atr * config.exits.atrTp1Multiplier) / last) * 100).toFixed(2));
+    const tp2Pct = Number((((atr * config.exits.atrTp2Multiplier) / last) * 100).toFixed(2));
+    const tp1Alloc = Math.round(config.exits.tp1CloseRatio * 100);
+    setTargets([
+      { id: 't1', pctOffset: Math.max(0.2, tp1Pct), allocationPct: Math.min(95, Math.max(5, tp1Alloc)) },
+      { id: 't2', pctOffset: Math.max(0.4, tp2Pct), allocationPct: Math.max(5, 100 - Math.min(95, Math.max(5, tp1Alloc))) },
+    ]);
+  }, [
+    tpMode,
+    activePair.symbol,
+    activePair.indicators.atr,
+    last,
+    config.exits.atrTp1Multiplier,
+    config.exits.atrTp2Multiplier,
+    config.exits.tp1CloseRatio,
+  ]);
 
   const entryReferencePrice = useMemo(() => {
     const parsedLim = Number(displayedLimitPrice);
@@ -285,6 +331,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
       stopLossPct,
       useBreakEven,
       useTrailingStop,
+      workingType: triggerRef === 'MARK' ? 'MARK_PRICE' : 'CONTRACT_PRICE',
       targets: targets.map((t) => ({
         pctOffset: t.pctOffset,
         allocationPct: t.allocationPct,
@@ -294,12 +341,14 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
     if (res.ok) {
       setFeedback({
         type: 'ok',
-        text: `${snapshot.accountMode} ${activePair.symbol} ${side} ${orderType} submitted`,
+        text: res.warning
+          ? `${snapshot.accountMode} ${activePair.symbol} filled · Warning: ${res.warning}`
+          : `${snapshot.accountMode} ${activePair.symbol} ${side} ${orderType} submitted`,
       });
     } else {
       setFeedback({ type: 'err', text: res.reason });
     }
-    window.setTimeout(() => setFeedback(null), 4000);
+    window.setTimeout(() => setFeedback(null), 5000);
   };
 
   const handleSavePreset = () => {
@@ -309,11 +358,17 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
         JSON.stringify({
           orderType,
           side,
+          amountUnit,
+          usdtAmount,
+          allocPct,
+          timeInForce,
+          sizingMode,
           stopLossMode,
           stopLossPct,
           useBreakEven,
           useTrailingStop,
           tpMode,
+          triggerRef,
           targets,
         })
       );
@@ -559,7 +614,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
                 </select>
               ) : (
                 <span className="flex items-center rounded border border-white/[0.08] bg-[#141820] px-2 font-mono text-[10px] font-semibold text-[#7DF2AD] whitespace-nowrap">
-                  POST ONLY
+                  GTX (POST ONLY)
                 </span>
               )}
             </div>
@@ -866,15 +921,15 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
           <div className="flex items-center justify-between gap-2">
             <span>
               <span className="text-slate-500">Bid </span>
-              <span className="text-emerald-400">{bid.toFixed(last >= 100 ? 2 : 4)}</span>
+              <span className="text-emerald-400">{bid.toFixed(priceDecimals)}</span>
             </span>
             <span>
               <span className="text-slate-500">Last </span>
-              <span className="text-rose-400">{last.toFixed(last >= 100 ? 2 : 4)}</span>
+              <span className="text-rose-400">{last.toFixed(priceDecimals)}</span>
             </span>
             <span>
               <span className="text-slate-500">Ask </span>
-              <span className="text-sky-400">{ask.toFixed(last >= 100 ? 2 : 4)}</span>
+              <span className="text-sky-400">{ask.toFixed(priceDecimals)}</span>
             </span>
           </div>
         </div>

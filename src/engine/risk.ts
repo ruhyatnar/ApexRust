@@ -94,10 +94,10 @@ export class RiskManager {
     this.currentEquity += pnlUsdt;
     this.pairDailyPnl.set(symbol, (this.pairDailyPnl.get(symbol) ?? 0) + pnlUsdt);
 
-    if (pnlUsdt >= 0) {
+    if (pnlUsdt > 1e-9) {
       this.winStreak += 1;
       this.loseStreak = 0;
-    } else {
+    } else if (pnlUsdt < -1e-9) {
       this.loseStreak += 1;
       this.winStreak = 0;
     }

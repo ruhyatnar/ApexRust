@@ -244,6 +244,194 @@ export function evaluateEntrySignal(
   return null;
 }
 
+export interface SignalDiagnosticsResult {
+  bias: string;
+  preferredSide: Side;
+  checks: Array<{ label: string; ok: boolean }>;
+  signal: EntrySignal | null;
+}
+
+export function evaluateSignalDiagnostics(
+  symbol: string,
+  candles: Candle[],
+  ind: IndicatorSnapshot,
+  tradingCfg: TradingConfig,
+  indCfg: IndicatorConfig,
+  nowMs: number,
+  options?: StrategyEvalOptions
+): SignalDiagnosticsResult {
+  const latestCandle: Candle = candles[candles.length - 1] ?? {
+    openTimeMs: nowMs,
+    open: 0,
+    high: 0,
+    low: 0,
+    close: 0,
+    volume: 0,
+    isClosed: false,
+  };
+  const price = latestCandle.close;
+  const profile: StrategyProfile = options?.strategyProfile ?? 'trend_pullback';
+  const longOnly = (options?.directionPolicy ?? 'both') === 'long_only';
+  const useEma = options?.features?.emaTrendFilter !== false;
+  const useRsi = options?.features?.rsiMomentumFilter !== false;
+  const useAdx = options?.features?.adxStrengthFilter !== false;
+  const useVwap = options?.features?.vwapBiasFilter !== false;
+  const useVolConfirm = options?.features?.volumeConfirmationFilter === true;
+
+  const emaBull =
+    ind.emaFast !== null &&
+    ind.emaMid !== null &&
+    ind.emaSlow !== null &&
+    price > ind.emaMid &&
+    ind.emaFast >= ind.emaMid &&
+    ind.emaMid > ind.emaSlow;
+  const emaBear =
+    ind.emaFast !== null &&
+    ind.emaMid !== null &&
+    ind.emaSlow !== null &&
+    price < ind.emaMid &&
+    ind.emaFast <= ind.emaMid &&
+    ind.emaMid < ind.emaSlow;
+
+  const emaStackBull =
+    ind.emaFast !== null &&
+    ind.emaMid !== null &&
+    ind.emaSlow !== null &&
+    ind.emaFast > ind.emaMid &&
+    ind.emaMid > ind.emaSlow;
+  const emaStackBear =
+    ind.emaFast !== null &&
+    ind.emaMid !== null &&
+    ind.emaSlow !== null &&
+    ind.emaFast < ind.emaMid &&
+    ind.emaMid < ind.emaSlow;
+
+  const preferredSide: Side =
+    profile === 'vwap_reversion'
+      ? !longOnly && ind.vwap !== null && price > ind.vwap
+        ? 'Short'
+        : 'Long'
+      : emaBear && !longOnly
+        ? 'Short'
+        : 'Long';
+
+  const bias =
+    profile === 'vwap_reversion'
+      ? preferredSide === 'Short'
+        ? 'Overextended Above VWAP (Short Setup)'
+        : 'Stretched Below VWAP (Long Setup)'
+      : emaBull || emaStackBull
+        ? 'Bullish Trend'
+        : emaBear || emaStackBear
+          ? longOnly
+            ? 'Bearish (Spot Long-Only Filtered)'
+            : 'Bearish Trend'
+          : 'Neutral / Transition';
+
+  const minVolMult = indCfg.minVolumeExpansionMult ?? 1.5;
+  const volRatio = ind.volumeRatio ?? 1.0;
+  const adxVal = ind.adx ?? 0;
+  const adxOk = !useAdx || adxVal >= indCfg.adxMinTrend;
+
+  let checks: Array<{ label: string; ok: boolean }>;
+
+  if (profile === 'ema_breakout') {
+    const recent = candles.slice(-11, -1);
+    const priorHigh = recent.length > 0 ? Math.max(...recent.map((c) => c.high)) : price;
+    const priorLow = recent.length > 0 ? Math.min(...recent.map((c) => c.low)) : price;
+    const avgVol =
+      recent.length > 0 ? recent.reduce((sum, c) => sum + c.volume, 0) / recent.length : latestCandle.volume;
+    const reqVolMult = useVolConfirm ? Math.max(1.1, minVolMult) : 1.1;
+    const volSurgeOk = avgVol > 0 ? latestCandle.volume >= avgVol * reqVolMult : false;
+    const breakoutOk = price > priorHigh || (!longOnly && price < priorLow);
+    const rsiOk =
+      !useRsi ||
+      (ind.rsi !== null &&
+        ((ind.rsi >= 50 && ind.rsi <= 74) || (!longOnly && ind.rsi <= 50 && ind.rsi >= 26)));
+
+    checks = [
+      { label: '10-Bar Donchian Breakout', ok: breakoutOk },
+      { label: 'EMA Stack (9 > 21 > 50)', ok: !useEma || emaStackBull || (!longOnly && emaStackBear) },
+      { label: `ADX ≥ ${indCfg.adxMinTrend} (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk },
+      { label: `RSI Momentum Band (${ind.rsi?.toFixed(1) ?? '—'})`, ok: rsiOk },
+      {
+        label: `Volume ≥ ${reqVolMult.toFixed(1)}× Avg (${(latestCandle.volume / Math.max(avgVol, 1e-9)).toFixed(2)}×)`,
+        ok: volSurgeOk,
+      },
+    ];
+  } else if (profile === 'vwap_reversion') {
+    const atr = ind.atr ?? 0;
+    const refAnchor = useVwap && ind.vwap !== null ? ind.vwap : ind.emaMid;
+    const stretchRatio = refAnchor !== null && atr > 0 ? Math.abs(price - refAnchor) / atr : 0;
+    const rsiExtremeCurl =
+      !useRsi ||
+      (ind.rsi !== null &&
+        ind.prevRsi !== null &&
+        ((ind.rsi <= 38 && ind.rsi > ind.prevRsi) ||
+          (!longOnly && ind.rsi >= 62 && ind.rsi < ind.prevRsi)));
+    const adxMax = Math.max(38, indCfg.adxMinTrend + 12);
+    const boundedAdx = !useAdx || (ind.adx !== null && ind.adx <= adxMax);
+    const revertSideOk =
+      refAnchor !== null &&
+      (price <= refAnchor - atr * 1.1 || (!longOnly && price >= refAnchor + atr * 1.1));
+
+    checks = [
+      { label: `Anchor Stretch ≥ 1.1× ATR (${stretchRatio.toFixed(2)}×)`, ok: stretchRatio >= 1.1 },
+      { label: `RSI Extreme Curl (${ind.rsi?.toFixed(1) ?? '—'})`, ok: rsiExtremeCurl },
+      { label: `Bounded ADX ≤ ${adxMax} (${ind.adx?.toFixed(1) ?? '—'})`, ok: boundedAdx },
+      { label: 'Reversion Side Alignment', ok: revertSideOk },
+    ];
+    if (useVolConfirm) {
+      checks.push({
+        label: `Volume ≥ ${minVolMult.toFixed(1)}× Avg (${volRatio.toFixed(2)}×)`,
+        ok: volRatio >= minVolMult,
+      });
+    }
+  } else {
+    const rsiPullLongOk =
+      ind.rsi !== null &&
+      ind.prevRsi !== null &&
+      ind.rsi >= indCfg.rsiLongPullbackMin &&
+      ind.rsi <= indCfg.rsiLongPullbackMax &&
+      ind.rsi > ind.prevRsi;
+    const rsiPullShortOk =
+      !longOnly &&
+      ind.rsi !== null &&
+      ind.prevRsi !== null &&
+      ind.rsi >= indCfg.rsiShortPullbackMin &&
+      ind.rsi <= indCfg.rsiShortPullbackMax &&
+      ind.rsi < ind.prevRsi;
+    const vwapAlign =
+      !useVwap ||
+      !indCfg.requireVwapAlignment ||
+      ind.vwap === null ||
+      (emaBear && !longOnly ? price <= ind.vwap : price >= ind.vwap);
+
+    checks = [
+      { label: 'EMA Stack & Pullback', ok: !useEma || emaBull || (!longOnly && emaBear) },
+      { label: `ADX ≥ ${indCfg.adxMinTrend} (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk },
+      {
+        label: `RSI Curl Band (${ind.prevRsi?.toFixed(1) ?? '—'} → ${ind.rsi?.toFixed(1) ?? '—'})`,
+        ok: !useRsi || rsiPullLongOk || rsiPullShortOk,
+      },
+      { label: 'Session VWAP Alignment', ok: vwapAlign },
+    ];
+    if (useVolConfirm || volRatio > 0) {
+      checks.push({
+        label: `Volume ${useVolConfirm ? `(Required ≥ ${minVolMult.toFixed(1)}×)` : `(Info ≥ ${minVolMult.toFixed(1)}×)`} (${volRatio.toFixed(2)}×)`,
+        ok: volRatio >= minVolMult,
+      });
+    }
+  }
+
+  const signal = evaluateEntrySignal(symbol, latestCandle, ind, tradingCfg, indCfg, nowMs, {
+    ...options,
+    recentCandles: candles,
+  });
+
+  return { bias, preferredSide, checks, signal };
+}
+
 export function buildExitPlan(
   side: Side,
   entryPrice: number,
@@ -295,7 +483,8 @@ export function managePositionTick(
   const feeBuffer = pos.entryPrice * (cfg.breakEvenFeeBufferBps / 10_000);
   const atrEnabled = features?.atrDynamicExits !== false;
   const tpEnabled = features?.takeProfitLadder !== false;
-  const beEnabled = atrEnabled && features?.breakEvenStop !== false;
+  const beEnabled =
+    atrEnabled && features?.breakEvenStop !== false && pos.exitPlan.breakEvenEnabled !== false;
   const trailEnabled = atrEnabled && features?.trailingStop !== false && pos.exitPlan.trailingEnabled !== false;
 
   if (pos.side === 'Long') {

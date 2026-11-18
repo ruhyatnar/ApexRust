@@ -310,6 +310,45 @@ impl SessionVwap {
     }
 }
 
+/// Rolling 20-bar volume SMA for volume expansion confirmation filters.
+#[derive(Debug, Clone)]
+pub struct RollingVolumeSma {
+    period: usize,
+    window: std::collections::VecDeque<f64>,
+    sum: f64,
+    value: Option<f64>,
+}
+
+impl RollingVolumeSma {
+    pub fn new(period: usize) -> Self {
+        Self {
+            period: period.max(1),
+            window: std::collections::VecDeque::with_capacity(period.max(1)),
+            sum: 0.0,
+            value: None,
+        }
+    }
+
+    pub fn next(&mut self, volume: f64) -> (Option<f64>, Option<f64>) {
+        let prior_avg = self.value;
+        self.window.push_back(volume);
+        self.sum += volume;
+        if self.window.len() > self.period {
+            if let Some(old) = self.window.pop_front() {
+                self.sum -= old;
+            }
+        }
+        if self.window.len() == self.period {
+            self.value = Some(self.sum / self.period as f64);
+        }
+        let ratio = prior_avg
+            .or(self.value)
+            .filter(|&avg| avg > f64::EPSILON)
+            .map(|avg| volume / avg);
+        (self.value, ratio)
+    }
+}
+
 /// Per-pair composite indicator pipeline updated on every closed bar.
 #[derive(Debug, Clone)]
 pub struct IndicatorPipeline {
@@ -321,6 +360,8 @@ pub struct IndicatorPipeline {
     atr: Atr,
     adx: Adx,
     vwap: SessionVwap,
+    volume_sma_20: RollingVolumeSma,
+    prev_atr: Option<f64>,
     latest: IndicatorSnapshot,
 }
 
@@ -335,11 +376,14 @@ impl IndicatorPipeline {
             atr: Atr::new(cfg.atr_period),
             adx: Adx::new(cfg.adx_period),
             vwap: SessionVwap::default(),
+            volume_sma_20: RollingVolumeSma::new(20),
+            prev_atr: None,
             latest: IndicatorSnapshot::default(),
         }
     }
 
     pub fn update(&mut self, candle: &Candle) -> IndicatorSnapshot {
+        let prev_atr = self.latest.atr;
         let ema_fast = self.ema_fast.next(candle.close);
         let ema_mid = self.ema_mid.next(candle.close);
         let ema_slow = self.ema_slow.next(candle.close);
@@ -348,6 +392,8 @@ impl IndicatorPipeline {
         let atr = self.atr.next(candle);
         let (adx, plus_di, minus_di) = self.adx.next(candle);
         let vwap = self.vwap.next(candle);
+        let (avg_volume_20, volume_ratio) = self.volume_sma_20.next(candle.volume);
+        self.prev_atr = prev_atr;
 
         self.latest = IndicatorSnapshot {
             ema_fast,
@@ -360,7 +406,10 @@ impl IndicatorPipeline {
             plus_di,
             minus_di,
             atr,
+            prev_atr: self.prev_atr,
             vwap,
+            avg_volume_20,
+            volume_ratio,
         };
         self.latest
     }

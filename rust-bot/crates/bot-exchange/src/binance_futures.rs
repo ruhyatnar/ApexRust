@@ -100,21 +100,28 @@ impl BinanceFuturesClient {
         );
         debug!(%url, "Fetching USD-M Futures klines");
 
-        let rows: Vec<Vec<serde_json::Value>> = self
+        let resp = self
             .http
             .get(&url)
             .send()
             .await
             .map_err(|e| BotError::RestApi(format!("Futures REST request failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| BotError::RestApi(format!("Futures REST HTTP status error: {e}")))?;
+
+        let rows: Vec<Vec<serde_json::Value>> = resp
             .json()
             .await
             .map_err(|e| BotError::RestApi(format!("Futures JSON decode failed: {e}")))?;
 
+        let now_ms = Utc::now().timestamp_millis();
         let mut candles = Vec::with_capacity(rows.len());
         for row in rows {
-            if row.len() < 6 {
+            if row.len() < 7 {
                 continue;
             }
+            let close_time_ms = row[6].as_i64().unwrap_or_default();
+            let is_closed = close_time_ms <= 0 || close_time_ms <= now_ms;
             candles.push(Candle {
                 open_time_ms: row[0].as_i64().unwrap_or_default(),
                 open: row[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
@@ -122,7 +129,7 @@ impl BinanceFuturesClient {
                 low: row[3].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                 close: row[4].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                 volume: row[5].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
-                is_closed: true,
+                is_closed,
             });
         }
         Ok(candles)
@@ -130,9 +137,14 @@ impl BinanceFuturesClient {
 
     pub async fn poll_latest_futures_bar(&self, symbol: &str, interval: &str) -> Result<MarketEvent> {
         let mut bars = self.fetch_futures_klines(symbol, interval, 2).await?;
-        let candle = bars
+        let latest = bars
             .pop()
             .ok_or_else(|| BotError::RestApi(format!("Empty Futures klines for {symbol}")))?;
+        let candle = if !latest.is_closed && !bars.is_empty() {
+            bars.pop().unwrap_or(latest)
+        } else {
+            latest
+        };
         Ok(MarketEvent {
             symbol: symbol.to_uppercase(),
             price: candle.close,
@@ -142,8 +154,9 @@ impl BinanceFuturesClient {
         })
     }
 
-    /// Translate a `FuturesOrderTicket` into canonical `/fapi/v1/order` JSON payloads
-    /// including Post-Only (`GTX`) and `TAKE_PROFIT_MARKET` + `STOP_MARKET` OCO brackets.
+    /// Translate a `FuturesOrderTicket` into canonical `/fapi/v1/marginType`,
+    /// `/fapi/v1/leverage`, `/fapi/v1/order`, and `/fapi/v1/algoOrder` JSON payloads
+    /// including Post-Only (`GTX`) and `TAKE_PROFIT_MARKET` + `STOP_MARKET` conditional brackets.
     pub fn build_bracket_payloads(ticket: &FuturesOrderTicket) -> Vec<serde_json::Value> {
         let entry_side = match ticket.side {
             Side::Long => "BUY",
@@ -153,59 +166,71 @@ impl BinanceFuturesClient {
             Side::Long => "SELL",
             Side::Short => "BUY",
         };
+        let sym = ticket.symbol.to_uppercase();
 
-        let mut payloads = Vec::new();
+        let mut payloads = vec![
+            serde_json::json!({
+                "endpoint": "/fapi/v1/marginType",
+                "symbol": sym,
+                "marginType": match ticket.margin_type {
+                    MarginType::Isolated => "ISOLATED",
+                    MarginType::Crossed => "CROSSED",
+                }
+            }),
+            serde_json::json!({
+                "endpoint": "/fapi/v1/leverage",
+                "symbol": sym,
+                "leverage": ticket.leverage
+            }),
+        ];
+
         if let Some(limit_px) = ticket.entry_price {
             payloads.push(serde_json::json!({
                 "endpoint": "/fapi/v1/order",
-                "symbol": ticket.symbol.to_uppercase(),
+                "symbol": sym,
                 "side": entry_side,
                 "type": "LIMIT",
                 "timeInForce": if ticket.post_only { "GTX" } else { "GTC" },
                 "quantity": format!("{:.6}", ticket.quantity),
                 "price": format!("{:.4}", limit_px),
-                "leverage": ticket.leverage,
-                "marginType": match ticket.margin_type {
-                    MarginType::Isolated => "ISOLATED",
-                    MarginType::Crossed => "CROSSED",
-                }
+                "newOrderRespType": "RESULT"
             }));
         } else {
             payloads.push(serde_json::json!({
                 "endpoint": "/fapi/v1/order",
-                "symbol": ticket.symbol.to_uppercase(),
+                "symbol": sym,
                 "side": entry_side,
                 "type": "MARKET",
                 "quantity": format!("{:.6}", ticket.quantity),
-                "leverage": ticket.leverage
+                "newOrderRespType": "RESULT"
             }));
         }
 
         if let Some(tp_px) = ticket.take_profit_price {
             payloads.push(serde_json::json!({
-                "endpoint": "/fapi/v1/order",
-                "symbol": ticket.symbol.to_uppercase(),
+                "endpoint": "/fapi/v1/algoOrder",
+                "algoType": "CONDITIONAL",
+                "symbol": sym,
                 "side": exit_side,
                 "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": format!("{:.4}", tp_px),
-                "closePosition": true,
+                "triggerPrice": format!("{:.4}", tp_px),
+                "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "priceProtect": "TRUE",
-                "newOrderRespType": "RESULT"
+                "priceProtect": "TRUE"
             }));
         }
 
         if let Some(sl_px) = ticket.stop_loss_price {
             payloads.push(serde_json::json!({
-                "endpoint": "/fapi/v1/order",
-                "symbol": ticket.symbol.to_uppercase(),
+                "endpoint": "/fapi/v1/algoOrder",
+                "algoType": "CONDITIONAL",
+                "symbol": sym,
                 "side": exit_side,
                 "type": "STOP_MARKET",
-                "stopPrice": format!("{:.4}", sl_px),
-                "closePosition": true,
+                "triggerPrice": format!("{:.4}", sl_px),
+                "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "priceProtect": "TRUE",
-                "newOrderRespType": "RESULT"
+                "priceProtect": "TRUE"
             }));
         }
 

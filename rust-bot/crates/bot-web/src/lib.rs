@@ -6,6 +6,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::{header::CONTENT_TYPE, HeaderValue, Method},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -15,7 +16,7 @@ use bot_engine::{EngineCommand, TradingEngine};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Clone)]
 pub struct WebState {
@@ -40,13 +41,38 @@ pub struct ControlRequest {
 }
 
 pub fn router(state: WebState) -> Router {
+    let origin_raw = state.engine.config().web.allowed_origin.trim().to_string();
+    let cors = if origin_raw.is_empty() || origin_raw == "*" {
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::any())
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([CONTENT_TYPE])
+    } else if let Ok(hv) = HeaderValue::from_str(&origin_raw) {
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::exact(hv))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([CONTENT_TYPE])
+    } else {
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::exact(HeaderValue::from_static("http://localhost:3000")))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([CONTENT_TYPE])
+    };
+
     Router::new()
         .route("/api/health", get(health_handler))
+        .route("/api/config", get(config_handler))
         .route("/api/snapshot", get(snapshot_handler))
         .route("/api/control", post(control_handler))
         .route("/ws/telemetry", get(ws_handler))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
+}
+
+async fn config_handler(State(state): State<WebState>) -> Json<bot_core::BotConfig> {
+    let mut cfg = state.engine.config().clone();
+    cfg.exchange.credentials = None;
+    Json(cfg)
 }
 
 async fn health_handler(State(state): State<WebState>) -> Json<serde_json::Value> {

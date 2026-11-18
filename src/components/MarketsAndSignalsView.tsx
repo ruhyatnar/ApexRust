@@ -1,6 +1,7 @@
 import React from 'react';
 import { ArrowUpRight, CheckCircle2, RefreshCw, Wifi, WifiOff, XCircle } from 'lucide-react';
 import { evaluatePreTradeValidation } from '../engine/quantAnalytics';
+import { evaluateSignalDiagnostics } from '../engine/strategy';
 import type { BotConfig, EngineSnapshot, TransportMode } from '../engine/types';
 
 interface MarketsViewProps {
@@ -252,112 +253,21 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         {snapshot.pairs.map((p) => {
           const ind = p.indicators;
-          const emaBull =
-            ind.emaFast !== null &&
-            ind.emaMid !== null &&
-            ind.emaSlow !== null &&
-            p.lastPrice > ind.emaMid &&
-            ind.emaFast >= ind.emaMid &&
-            ind.emaMid > ind.emaSlow;
-          const emaBear =
-            ind.emaFast !== null &&
-            ind.emaMid !== null &&
-            ind.emaSlow !== null &&
-            p.lastPrice < ind.emaMid &&
-            ind.emaFast <= ind.emaMid &&
-            ind.emaMid < ind.emaSlow;
-          const adxOk = (ind.adx ?? 0) >= config.indicators.adxMinTrend;
-
-          let checks: Array<{ label: string; ok: boolean }>;
-
-          if (profile === 'ema_breakout') {
-            const recent = p.candles.slice(-11, -1);
-            const priorHigh = recent.length > 0 ? Math.max(...recent.map((c) => c.high)) : p.lastPrice;
-            const priorLow = recent.length > 0 ? Math.min(...recent.map((c) => c.low)) : p.lastPrice;
-            const latestCandle = p.candles[p.candles.length - 1];
-            const avgVol =
-              recent.length > 0
-                ? recent.reduce((sum, c) => sum + c.volume, 0) / recent.length
-                : latestCandle?.volume ?? 1;
-            const breakoutOk = latestCandle
-              ? latestCandle.close > priorHigh || (!longOnly && latestCandle.close < priorLow)
-              : false;
-            const volSurge = latestCandle ? latestCandle.volume >= avgVol * 1.1 : false;
-
-            checks = [
-              { label: '10-Bar Donchian Breakout', ok: breakoutOk },
-              { label: 'EMA Stack (9 / 21 / 50)', ok: emaBull || (!longOnly && emaBear) },
-              {
-                label: `ADX ≥ ${config.indicators.adxMinTrend} (${ind.adx?.toFixed(1) ?? '—'})`,
-                ok: adxOk,
-              },
-              {
-                label: `Volume ≥ 1.1× Avg (${latestCandle ? (latestCandle.volume / Math.max(avgVol, 1)).toFixed(2) : '—'}×)`,
-                ok: volSurge,
-              },
-            ];
-          } else if (profile === 'vwap_reversion') {
-            const atr = ind.atr ?? 0;
-            const stretchRatio =
-              ind.vwap !== null && atr > 0 ? Math.abs(p.lastPrice - ind.vwap) / atr : 0;
-            const stretchOk = stretchRatio >= 1.1;
-            const rsiExtremeCurl =
-              ind.rsi !== null &&
-              ind.prevRsi !== null &&
-              ((ind.rsi <= 38 && ind.rsi > ind.prevRsi) ||
-                (!longOnly && ind.rsi >= 62 && ind.rsi < ind.prevRsi));
-            const boundedAdx =
-              ind.adx !== null && ind.adx <= Math.max(38, config.indicators.adxMinTrend + 12);
-            const revertSideOk =
-              ind.vwap !== null &&
-              (p.lastPrice < ind.vwap || (!longOnly && p.lastPrice > ind.vwap));
-
-            checks = [
-              { label: `VWAP Stretch ≥ 1.1× ATR (${stretchRatio.toFixed(2)}×)`, ok: stretchOk },
-              {
-                label: `RSI Extreme Curl (${ind.rsi?.toFixed(1) ?? '—'})`,
-                ok: rsiExtremeCurl,
-              },
-              { label: `Bounded ADX (${ind.adx?.toFixed(1) ?? '—'})`, ok: boundedAdx },
-              { label: 'Mean-Reversion Side Alignment', ok: revertSideOk },
-            ];
-          } else {
-            const rsiPullback =
-              ind.rsi !== null &&
-              ind.rsi >= config.indicators.rsiLongPullbackMin &&
-              ind.rsi <= config.indicators.rsiLongPullbackMax;
-            const vwapAlign =
-              !config.indicators.requireVwapAlignment ||
-              ind.vwap === null ||
-              (emaBear && !longOnly ? p.lastPrice <= ind.vwap : p.lastPrice >= ind.vwap);
-
-            checks = [
-              { label: 'EMA Stack (9 / 21 / 50)', ok: emaBull || (!longOnly && emaBear) },
-              {
-                label: `ADX ≥ ${config.indicators.adxMinTrend} (${ind.adx?.toFixed(1) ?? '—'})`,
-                ok: adxOk,
-              },
-              {
-                label: `RSI Pullback Band (${ind.rsi?.toFixed(1) ?? '—'})`,
-                ok: rsiPullback,
-              },
-              { label: 'Session VWAP Alignment', ok: vwapAlign },
-              {
-                label: `Volume ≥ ${(config.indicators.minVolumeExpansionMult ?? 1.5).toFixed(1)}× Avg (${(ind.volumeRatio ?? 1).toFixed(2)}×)`,
-                ok: (ind.volumeRatio ?? 1) >= (config.indicators.minVolumeExpansionMult ?? 1.5),
-              },
-            ];
-          }
-
-          const bias = emaBull
-            ? 'Bullish Trend'
-            : emaBear
-              ? longOnly
-                ? 'Bearish (Spot Long-Only Filtered)'
-                : 'Bearish Trend'
-              : 'Neutral / Transition';
-
-          const preferredSide = emaBear && !longOnly ? 'Short' : 'Long';
+          const diag = evaluateSignalDiagnostics(
+            p.symbol,
+            p.candles,
+            ind,
+            config.trading,
+            config.indicators,
+            Date.now(),
+            {
+              strategyProfile: profile,
+              directionPolicy: config.automation.directionPolicy,
+              recentCandles: p.candles,
+              features: config.features,
+            }
+          );
+          const { checks, bias, preferredSide } = diag;
           const atrVal = ind.atr ?? p.lastPrice * 0.008;
           const slDist = atrVal * config.exits.atrSlMultiplier;
           const slPrice = preferredSide === 'Long' ? p.lastPrice - slDist : p.lastPrice + slDist;

@@ -44,7 +44,11 @@ pub struct IndicatorSnapshot {
     pub plus_di: Option<f64>,
     pub minus_di: Option<f64>,
     pub atr: Option<f64>,
+    pub prev_atr: Option<f64>,
     pub vwap: Option<f64>,
+    pub avg_volume_20: Option<f64>,
+    #[serde(default)]
+    pub volume_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +69,10 @@ pub struct EntrySignal {
     pub timestamp: DateTime<Utc>,
 }
 
+fn default_true_flag() -> bool {
+    true
+}
+
 /// Active ATR-driven exit brackets attached to every open position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExitPlan {
@@ -74,7 +82,13 @@ pub struct ExitPlan {
     pub take_profit_2: f64,
     pub tp1_hit: bool,
     pub break_even_armed: bool,
+    #[serde(default = "default_true_flag")]
+    pub break_even_enabled: bool,
     pub trailing_active: bool,
+    #[serde(default = "default_true_flag")]
+    pub trailing_enabled: bool,
+    #[serde(default = "default_true_flag")]
+    pub tp_ladder_enabled: bool,
     pub risk_distance_r: f64,
 }
 
@@ -149,6 +163,18 @@ pub struct PairSnapshot {
     pub open_position: Option<Position>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolatilitySpikeAlert {
+    pub id: String,
+    pub symbol: String,
+    pub price: f64,
+    pub atr: f64,
+    pub atr_pct: f64,
+    pub expansion_ratio: f64,
+    pub message: String,
+    pub triggered_at: DateTime<Utc>,
+}
+
 /// Complete immutable snapshot streamed to WebApp clients (`bot-web`) and Desktop UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineSnapshot {
@@ -160,5 +186,7 @@ pub struct EngineSnapshot {
     pub risk: RiskStatus,
     pub pairs: Vec<PairSnapshot>,
     pub recent_trades: Vec<ClosedTrade>,
+    #[serde(default)]
+    pub recent_volatility_alerts: Vec<VolatilitySpikeAlert>,
     pub updated_at: DateTime<Utc>,
 }
