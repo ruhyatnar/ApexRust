@@ -1,11 +1,60 @@
 // Prerequisite and environment checks shared by `setup` and `doctor`.
 import { spawnSync } from 'node:child_process';
 import net from 'node:net';
+import path from 'node:path';
 import { IS_LINUX, IS_MAC, IS_WIN } from './paths.mjs';
 import { NODE_REQUIREMENT, RUST_MINIMUM, nodeSatisfies, rustSatisfies } from './semver.mjs';
 
+function quoteWinCmdArg(arg) {
+  const s = String(arg ?? '');
+  if (/[\r\n]/.test(s)) {
+    throw new Error('Command arguments cannot contain newline characters.');
+  }
+  if (s === '') return '""';
+  if (!/[\s"&()<>^|;=%!]/.test(s)) return s;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+export function isWindowsBatchCommand(cmd) {
+  const base = path.basename(String(cmd ?? '').trim()).toLowerCase();
+  return base.endsWith('.cmd') || base.endsWith('.bat') || base === 'npm' || base === 'npx';
+}
+
+/**
+ * Builds a shell-free spawn specification across POSIX and Windows.
+ * Avoids Node's `DEP0190` warning (`shell: true` with args) by invoking `cmd.exe /d /s /c`
+ * with `windowsVerbatimArguments: true` strictly for `.cmd`/`.bat` shims like `npm`/`npx`.
+ */
+export function buildPlatformSpawnSpec(cmd, args = [], env = process.env, isWin = IS_WIN) {
+  if (!isWin || !isWindowsBatchCommand(cmd)) {
+    return {
+      file: cmd,
+      args,
+      options: { shell: false, windowsHide: true },
+    };
+  }
+  const comspec = env?.ComSpec || env?.COMSPEC || 'cmd.exe';
+  const cmdName = path.basename(cmd).toLowerCase();
+  const resolvedBatch = cmdName === 'npm' || cmdName === 'npx' ? `${cmd}.cmd` : cmd;
+  const line = [resolvedBatch, ...args].map(quoteWinCmdArg).join(' ');
+  return {
+    file: comspec,
+    args: ['/d', '/s', '/c', `"${line}"`],
+    options: { shell: false, windowsVerbatimArguments: true, windowsHide: true },
+  };
+}
+
+export function spawnPlatformSync(cmd, args = [], opts = {}) {
+  const env = opts.env ?? process.env;
+  const spec = buildPlatformSpawnSpec(cmd, args, env, IS_WIN);
+  return spawnSync(spec.file, spec.args, {
+    ...opts,
+    ...spec.options,
+  });
+}
+
 export function runCapture(cmd, args = [], opts = {}) {
-  const res = spawnSync(cmd, args, { encoding: 'utf8', shell: IS_WIN, windowsHide: true, ...opts });
+  const res = spawnPlatformSync(cmd, args, { encoding: 'utf8', ...opts });
   return {
     ok: !res.error && res.status === 0,
     stdout: (res.stdout ?? '').trim(),
@@ -98,8 +147,10 @@ export function checkPrerequisites({ needRust = true } = {}) {
       });
     } else if (IS_WIN) {
       const cl = runCapture('cl.exe', []);
+      const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+      const vswherePath = path.join(pf86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
       const vswhere = runCapture(
-        '"%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe"',
+        vswherePath,
         ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath']
       );
       const msvcOk = cl.ok || (vswhere.ok && vswhere.stdout.length > 0);

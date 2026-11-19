@@ -9,7 +9,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { botPortFromToml, readTomlValue, renderBotToml } from './lib/botToml.mjs';
-import { parseEnv, renderEnv } from './lib/envFile.mjs';
+import {
+  DEFAULT_ENV_TEMPLATE,
+  generateAccessToken,
+  isPrivateOrLoopbackHost,
+  maskAccessToken,
+  parseEnv,
+  renderEnv,
+  validateAccessToken,
+} from './lib/envFile.mjs';
 import {
   COMPONENTS,
   IS_LINUX,
@@ -21,7 +29,7 @@ import {
   detectZeroTrustMeshIps,
   logFile,
 } from './lib/paths.mjs';
-import { checkPrerequisites, isPortFree, nextFreePort, runCapture } from './lib/prereqs.mjs';
+import { checkPrerequisites, isPortFree, nextFreePort, runCapture, spawnPlatformSync } from './lib/prereqs.mjs';
 import {
   ensureRuntimeDirs,
   fetchHealth,
@@ -83,6 +91,7 @@ Commands:
   update                git pull --ff-only, rebuild, and restart running services (--components, --no-restart)
   service <action>      Manage OS auto-start services: install | uninstall [web|bot|both]
   remote <action>       Manage Remote VPS connection: status | connect | use-local | use-vps
+  token <action>        Manage Access Token (APEXRUST_PROXY_TOKEN): status | show | generate | rotate | clear
   uninstall             Stop processes and remove OS services / runtime state (--purge deletes build/config)
   run <component>       Internal foreground supervisor used by detached runner and OS services
 
@@ -107,7 +116,8 @@ Setup / Service Flags:
   --web-port <port>              Express/UI port (default: 3000)
   --bot-port <port>              Rust daemon port (default: 8080)
   --host <ip> / --lan            Bind host (default: 127.0.0.1; --lan sets 0.0.0.0)
-  --token <token>                Access token for non-private binds on start/restart (min 32 chars)
+  --token <token>                Access token for start/restart or token rotate (min 32 chars)
+  --bytes <16-128>               Random byte length for token generate/rotate (default: 24 -> 48 hex chars)
   --no-build                     Skip npm/cargo build steps during setup
   --no-start                     Do not start services after setup
   --service / --no-service       Install OS auto-start service during setup
@@ -126,7 +136,7 @@ function parseCliArgs(argv) {
   const valueFlags = new Set([
     'components', 'role', 'remote-url', 'remote-name', 'remote-token', 'allowed-origins',
     'env', 'venue', 'auth', 'api-key', 'api-secret', 'key-path',
-    'leverage', 'margin', 'web-port', 'bot-port', 'host', 'token', 'web-bind', 'lines', 'log',
+    'leverage', 'margin', 'web-port', 'bot-port', 'host', 'token', 'bytes', 'web-bind', 'lines', 'log',
   ]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -321,12 +331,10 @@ function resolveTargetComponents(target) {
 }
 
 function runStreaming(cmd, args, opts = {}) {
-  const res = spawnSync(cmd, args, {
+  const res = spawnPlatformSync(cmd, args, {
     cwd: opts.cwd ?? REPO_DIR,
     env: opts.env ?? process.env,
     stdio: opts.stdio ?? 'inherit',
-    shell: IS_WIN && !cmd.endsWith('.exe'),
-    windowsHide: true,
   });
   if (res.error) return { ok: false, status: 1, error: res.error.message };
   return { ok: res.status === 0, status: res.status ?? 1 };
@@ -481,20 +489,23 @@ async function cmdSetup(flags) {
   console.log('');
 
   // Configuration choices
+  const skipLocalTradingPrompts = role === 'client' && !needRust;
   const existingEnvName = (readTomlValue(existingToml, 'exchange', 'environment') || existingEnv.BINANCE_ENVIRONMENT || 'testnet').toLowerCase();
   const envFlag = flags.env ? String(flags.env).toLowerCase() : null;
   if (envFlag && envFlag !== 'production' && envFlag !== 'testnet') {
     throw new Error(`Invalid --env "${flags.env}". Choose testnet or production.`);
   }
   const environment = envFlag
-    ?? (await select(
-        'Binance API environment (Paper Trading stays ON in bot.toml for safety):',
-        [
-          { value: 'testnet', label: 'Testnet (Recommended for safe testing)' },
-          { value: 'production', label: 'Production market data / paper mode' },
-        ],
-        existingEnvName === 'production' ? 'production' : 'testnet'
-      ));
+    ?? (skipLocalTradingPrompts
+      ? (existingEnvName === 'production' ? 'production' : 'testnet')
+      : await select(
+          'Binance API environment (Paper Trading stays ON in bot.toml for safety):',
+          [
+            { value: 'testnet', label: 'Testnet (Recommended for safe testing)' },
+            { value: 'production', label: 'Production market data / paper mode' },
+          ],
+          existingEnvName === 'production' ? 'production' : 'testnet'
+        ));
 
   const existingVenue = (readTomlValue(existingToml, 'exchange', 'venue') || existingEnv.BINANCE_VENUE || 'spot').toLowerCase();
   const venueFlag = flags.venue ? String(flags.venue).toLowerCase() : null;
@@ -502,14 +513,16 @@ async function cmdSetup(flags) {
     throw new Error(`Invalid --venue "${flags.venue}". Choose spot or futures.`);
   }
   const venue = venueFlag
-    ?? (await select(
-        'Trading venue:',
-        [
-          { value: 'spot', label: 'Spot' },
-          { value: 'futures', label: 'USD-M Futures' },
-        ],
-        existingVenue === 'futures' ? 'futures' : 'spot'
-      ));
+    ?? (skipLocalTradingPrompts
+      ? (existingVenue === 'futures' ? 'futures' : 'spot')
+      : await select(
+          'Trading venue:',
+          [
+            { value: 'spot', label: 'Spot' },
+            { value: 'futures', label: 'USD-M Futures' },
+          ],
+          existingVenue === 'futures' ? 'futures' : 'spot'
+        ));
 
   let leverage = flags.leverage !== undefined
     ? Number(flags.leverage)
@@ -556,8 +569,8 @@ async function cmdSetup(flags) {
     else throw new Error(`Invalid --auth "${flags.auth}". Choose hmac, ed25519, or paper.`);
   } else if (flags['api-key'] !== undefined) {
     credMode = flags['key-path'] ? 'ed25519' : 'hmac';
-  } else if (!isInteractive()) {
-    credMode = hadKey ? (existingAuth.includes('ed25519') ? 'ed25519' : 'hmac') : 'paper';
+  } else if (!isInteractive() || skipLocalTradingPrompts) {
+    credMode = hadKey && !skipLocalTradingPrompts ? (existingAuth.includes('ed25519') ? 'ed25519' : 'hmac') : 'paper';
   } else {
     credMode = await select(
       'Binance API credentials (you can leave empty and configure later in .env):',
@@ -709,16 +722,19 @@ async function cmdSetup(flags) {
     warn('Skipping build steps (--no-build).');
   }
 
-  // Render .env (backing up any existing one)
-  if (!fs.existsSync(PATHS.envExample)) {
-    throw new Error(`Missing template file: ${PATHS.envExample}`);
-  }
+  // Render .env (backing up any existing one; falls back to built-in template if .env.example is absent)
   if (fs.existsSync(PATHS.env)) {
     fs.copyFileSync(PATHS.env, PATHS.envBackup);
     chmodOwnerOnly(PATHS.envBackup);
     ok(`Backed up existing .env -> ${path.relative(REPO_DIR, PATHS.envBackup)}`);
   }
-  const envTemplate = fs.readFileSync(PATHS.envExample, 'utf8');
+  let envTemplate;
+  if (fs.existsSync(PATHS.envExample)) {
+    envTemplate = fs.readFileSync(PATHS.envExample, 'utf8');
+  } else {
+    warn(`${path.relative(REPO_DIR, PATHS.envExample)} not found; using built-in .env template fallback.`);
+    envTemplate = DEFAULT_ENV_TEMPLATE;
+  }
   const existingProxyTok = (existingEnv.APEXRUST_PROXY_TOKEN || '').trim();
   const proxyToken =
     host === '0.0.0.0'
@@ -843,12 +859,13 @@ async function cmdSetup(flags) {
     console.log(`  VPS Gateway: http://${connectHost}:${webPort} (authority=daemon)`);
     if (proxyToken) {
       console.log(`  Access Token saved to .env (APEXRUST_PROXY_TOKEN) — keep it private!`);
+      console.log(`  Token tools: ${cliHint} token show  |  ${cliHint} token rotate`);
     }
     console.log('  Remember to add this VPS outbound IP to your Binance API key IP whitelist.');
   } else if (role === 'client' && remoteVpsUrl) {
     console.log(`  Connected Remote VPS: ☁️ ${remoteVpsName} (${remoteVpsUrl})`);
   }
-  console.log(`  Useful commands: ${cliHint} status | remote status | logs -f | doctor | stop | uninstall\n`);
+  console.log(`  Useful commands: ${cliHint} status | token | remote status | logs -f | doctor | stop | uninstall\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,7 +1054,7 @@ async function startComponent(component, flags = {}, target = undefined) {
     setRuntimeBindState(component, null);
     const nonPrivateHint =
       launch.bindHost === '0.0.0.0' || launch.bindHost === '::'
-        ? `\nHint: Binding "${launch.bindHost}" requires a >= 32-char token (--token <TOKEN> or ${component === 'web' ? 'APEXRUST_PROXY_TOKEN' : 'APEXRUST_WEB_TOKEN'} in .env), or run \`./apexrust setup --role vps --lan\`.`
+        ? `\nHint: Binding "${launch.bindHost}" requires a >= 32-char token. Run \`./apexrust token rotate\` (or pass \`--token <TOKEN>\`), or bind to your Cloudflare One WARP IP.`
         : '';
     throw new Error(
       `${component} failed health check at ${healthUrl} (${health.error ?? `HTTP ${health.status}`}).${nonPrivateHint}\n` +
@@ -1727,6 +1744,146 @@ async function cmdRemote(positionals, flags) {
   }
 }
 
+async function restartWebAfterTokenChange(flags, hostOverride = undefined) {
+  if (flags.restart === false) {
+    info('Skipped automatic web restart (--no-restart). Run `./apexrust restart web` to apply.');
+    return;
+  }
+  const webSvc = getServiceStatus('web');
+  if (webSvc !== 'not installed') {
+    info('Restarting installed web service...');
+    if (restartInstalledService('web')) {
+      ok('Restarted web OS service.');
+    } else {
+      warn('Could not auto-restart web service; restart manually to apply the updated token.');
+    }
+    return;
+  }
+  if (runningPid('web')) {
+    const active = resolvePorts();
+    await startComponent(
+      'web',
+      {
+        ...flags,
+        forceRestart: true,
+        host: hostOverride ?? active.host,
+        'web-port': active.webPort,
+      },
+      'web'
+    );
+  }
+}
+
+function writeEnvUpdates(updates) {
+  const baseText = fs.existsSync(PATHS.env)
+    ? fs.readFileSync(PATHS.env, 'utf8')
+    : fs.existsSync(PATHS.envExample)
+      ? fs.readFileSync(PATHS.envExample, 'utf8')
+      : DEFAULT_ENV_TEMPLATE;
+  if (fs.existsSync(PATHS.env)) {
+    fs.copyFileSync(PATHS.env, PATHS.envBackup);
+    chmodOwnerOnly(PATHS.envBackup);
+  }
+  const rendered = renderEnv(baseText, updates);
+  fs.writeFileSync(PATHS.env, rendered, 'utf8');
+  chmodOwnerOnly(PATHS.env);
+}
+
+async function cmdToken(positionals, flags) {
+  const action = (positionals[0] || (flags.reveal ? 'show' : 'status')).toLowerCase();
+  const cliHint = IS_WIN ? 'apexrust.cmd' : './apexrust';
+
+  if (action === 'generate' || action === 'gen') {
+    const rawBytes = flags.bytes !== undefined ? Number(flags.bytes) : 24;
+    const generated = generateAccessToken(rawBytes);
+    console.log(generated);
+    return;
+  }
+
+  if (action === 'status') {
+    printBanner();
+    const envMap = readCurrentEnv();
+    const proxyTok = (envMap.APEXRUST_PROXY_TOKEN || '').trim();
+    const webTok = (envMap.APEXRUST_WEB_TOKEN || envMap.APEXRUST_ENGINE_TOKEN || '').trim();
+    const { host, webPort } = resolvePorts();
+    console.log(`${C.bold}Access Token Status (.env)${C.reset}`);
+    console.log(`  Bind Address         : ${formatHostPort(host, webPort)}`);
+    console.log(`  APEXRUST_PROXY_TOKEN : ${flags.reveal ? (proxyTok || '(not set)') : maskAccessToken(proxyTok)}`);
+    console.log(`  APEXRUST_WEB_TOKEN   : ${flags.reveal ? (webTok || '(not set)') : maskAccessToken(webTok)}`);
+    console.log('');
+    console.log(`  Show full token : ${cliHint} token show`);
+    console.log(`  Rotate / change : ${cliHint} token rotate [--token <32+-char-token>]`);
+    console.log(`  Generate random : ${cliHint} token generate`);
+    console.log(`  Disable token   : ${cliHint} token clear --host 127.0.0.1`);
+    console.log('');
+    return;
+  }
+
+  if (action === 'show' || action === 'reveal') {
+    const envMap = readCurrentEnv();
+    const proxyTok = (envMap.APEXRUST_PROXY_TOKEN || '').trim();
+    if (!proxyTok) {
+      warn('APEXRUST_PROXY_TOKEN is not set in .env.');
+      console.log(`Run \`${cliHint} token rotate\` to generate and save a 48-char token.`);
+      return;
+    }
+    console.log(`APEXRUST_PROXY_TOKEN=${proxyTok}`);
+    const webTok = (envMap.APEXRUST_WEB_TOKEN || envMap.APEXRUST_ENGINE_TOKEN || '').trim();
+    if (webTok && (flags.all || flags.reveal)) {
+      console.log(`APEXRUST_WEB_TOKEN=${webTok}`);
+    }
+    return;
+  }
+
+  if (action === 'rotate' || action === 'set' || action === 'new' || action === 'change') {
+    printBanner();
+    const supplied = flags.token !== undefined ? flags.token : positionals[1];
+    const nextToken =
+      supplied !== undefined
+        ? validateAccessToken(supplied)
+        : generateAccessToken(flags.bytes !== undefined ? Number(flags.bytes) : 24);
+    const updates = { APEXRUST_PROXY_TOKEN: nextToken };
+    const nextHost = flags.lan ? '0.0.0.0' : flags.host ? String(flags.host).trim() : undefined;
+    if (nextHost) {
+      updates.HOST = nextHost;
+    }
+    writeEnvUpdates(updates);
+    ok(`Updated APEXRUST_PROXY_TOKEN in ${path.relative(REPO_DIR, PATHS.env)} (${nextToken.length} chars, chmod 600)`);
+    console.log(`  New Token: ${C.bold}${nextToken}${C.reset}`);
+    await restartWebAfterTokenChange(flags, nextHost);
+    console.log('  Paste this token into the browser Unlock bar or Bot -> VPS & Server Connection.');
+    return;
+  }
+
+  if (action === 'clear' || action === 'unset' || action === 'remove' || action === 'disable') {
+    printBanner();
+    const envMap = readCurrentEnv();
+    const active = resolvePorts();
+    const targetHost = flags.host
+      ? String(flags.host).trim()
+      : (envMap.HOST || active.host || '127.0.0.1').trim();
+    const trustMesh = String(envMap.APEXRUST_TRUST_ZERO_TRUST_MESH || '').toLowerCase() === 'true';
+    if (!trustMesh && !isPrivateOrLoopbackHost(targetHost)) {
+      throw new Error(
+        `Refusing to clear APEXRUST_PROXY_TOKEN while HOST="${targetHost}" (non-private binds require a >= 32-char token).\n` +
+          `Pass a safe bind host, e.g.: ${cliHint} token clear --host 127.0.0.1 (or your Cloudflare One WARP IP).`
+      );
+    }
+    const updates = { APEXRUST_PROXY_TOKEN: '' };
+    if (flags.host) {
+      updates.HOST = targetHost;
+    }
+    writeEnvUpdates(updates);
+    ok(`Cleared APEXRUST_PROXY_TOKEN in ${path.relative(REPO_DIR, PATHS.env)} (bind host: ${targetHost})`);
+    await restartWebAfterTokenChange(flags, flags.host ? targetHost : undefined);
+    return;
+  }
+
+  throw new Error(
+    `Unknown token action "${action}". Expected: status, show, generate, rotate, or clear.`
+  );
+}
+
 async function cmdUninstall(flags) {
   printBanner();
   for (const c of COMPONENTS) await stopComponent(c);
@@ -1819,6 +1976,9 @@ async function main() {
       break;
     case 'remote':
       await cmdRemote(positionals, flags);
+      break;
+    case 'token':
+      await cmdToken(positionals, flags);
       break;
     case 'uninstall':
       await cmdUninstall(flags);

@@ -1,6 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatEnvValue, parseEnv, renderEnv } from './envFile.mjs';
+import {
+  DEFAULT_ENV_TEMPLATE,
+  formatEnvValue,
+  generateAccessToken,
+  isPrivateOrLoopbackHost,
+  maskAccessToken,
+  parseEnv,
+  renderEnv,
+  validateAccessToken,
+} from './envFile.mjs';
+import { buildPlatformSpawnSpec, isWindowsBatchCommand } from './prereqs.mjs';
 import { detectZeroTrustMeshIps } from './paths.mjs';
 
 test('parseEnv handles quotes, exports, comments, and roundtrips formatEnvValue', () => {
@@ -92,4 +102,54 @@ test('renderEnv uncomments VPS authority and vault settings from commented .env.
   assert.equal(parsed.APEXRUST_ENGINE_AUTHORITY, 'daemon');
   assert.equal(parsed.APEXRUST_PERSIST_VAULT, 'true');
   assert.equal(parsed.APEXRUST_ALLOWED_ORIGINS, 'http://localhost:3000');
+});
+
+test('access token helpers generate, validate, mask, and check private bind hosts cleanly', () => {
+  const tok = generateAccessToken();
+  assert.equal(tok.length, 48);
+  assert.match(tok, /^[0-9a-f]{48}$/);
+  assert.equal(generateAccessToken(16).length, 32);
+  assert.throws(() => generateAccessToken(8), /between 16/);
+
+  assert.equal(validateAccessToken(`  ${tok}  `), tok);
+  assert.throws(() => validateAccessToken('too-short'), /at least 32/);
+  assert.throws(() => validateAccessToken(`${tok} extra`), /spaces/);
+
+  assert.equal(maskAccessToken(''), '(not set)');
+  assert.equal(maskAccessToken(tok), `${tok.slice(0, 4)}...${tok.slice(-4)} (48 chars)`);
+
+  assert.equal(isPrivateOrLoopbackHost('127.0.0.1'), true);
+  assert.equal(isPrivateOrLoopbackHost('100.96.0.2'), true);
+  assert.equal(isPrivateOrLoopbackHost('192.168.1.50'), true);
+  assert.equal(isPrivateOrLoopbackHost('0.0.0.0'), false);
+  assert.equal(isPrivateOrLoopbackHost('::'), false);
+});
+
+test('DEFAULT_ENV_TEMPLATE and buildPlatformSpawnSpec handle Windows .cmd without shell=true (DEP0190)', () => {
+  const rendered = renderEnv(DEFAULT_ENV_TEMPLATE, {
+    PORT: '3000',
+    HOST: '127.0.0.1',
+    APEXRUST_PROXY_TOKEN: '0123456789abcdef0123456789abcdef',
+  });
+  const parsed = parseEnv(rendered);
+  assert.equal(parsed.PORT, '3000');
+  assert.equal(parsed.HOST, '127.0.0.1');
+  assert.equal(parsed.APEXRUST_PROXY_TOKEN, '0123456789abcdef0123456789abcdef');
+
+  assert.equal(isWindowsBatchCommand('npm'), true);
+  assert.equal(isWindowsBatchCommand('npm.cmd'), true);
+  assert.equal(isWindowsBatchCommand('git'), false);
+
+  const gitSpec = buildPlatformSpawnSpec('git', ['--version'], {}, true);
+  assert.equal(gitSpec.file, 'git');
+  assert.deepEqual(gitSpec.args, ['--version']);
+  assert.equal(gitSpec.options.shell, false);
+
+  const npmSpec = buildPlatformSpawnSpec('npm', ['run', 'build'], { ComSpec: 'C:\\Windows\\System32\\cmd.exe' }, true);
+  assert.equal(npmSpec.file, 'C:\\Windows\\System32\\cmd.exe');
+  assert.equal(npmSpec.options.shell, false);
+  assert.equal(npmSpec.options.windowsVerbatimArguments, true);
+  assert.equal(npmSpec.args[0], '/d');
+  assert.equal(npmSpec.args[2], '/c');
+  assert.match(npmSpec.args[3], /^"npm\.cmd run build"$/);
 });

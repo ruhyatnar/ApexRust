@@ -95,12 +95,13 @@ cargo test --workspace
 cargo run --release -p bot-desktop -- --config config/bot.toml --web-port 8080
 ```
 
-### 4. Auto-Start Service & Backup via Git
+### 4. Auto-Start Service, Access Token & Backup via Git
 
-From the repository root, use the ApexRust CLI to register auto-start services (`systemd --user` on Linux, `launchd` on macOS, Scheduled Tasks on Windows):
+From the repository root, use the ApexRust CLI to manage OS auto-start services (`systemd --user` on Linux, `launchd` on macOS, Scheduled Tasks on Windows) and API access tokens (`APEXRUST_PROXY_TOKEN` / `APEXRUST_WEB_TOKEN`):
 
 ```bash
 cd ..
 ./apexrust service install bot
+./apexrust token status          # view/generate/rotate access tokens (or `bot-desktop remote ...` with --token)
 ./rust-bot/deploy/git-backup.sh
 ```

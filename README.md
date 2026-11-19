@@ -41,6 +41,8 @@ Once installed, manage everything with the bundled CLI (`./apexrust` on Linux/ma
 
 ```bash
 ./apexrust start | stop | restart | status | logs -f | doctor | update
+./apexrust token [status|show|generate|rotate|clear]
+./apexrust remote status | connect | use-local | use-vps
 ./apexrust service install   # systemd --user (with optional --linger) / launchd / Scheduled Tasks
 ./apexrust uninstall         # add --purge to remove .env, bot.toml, node_modules, dist & rust-bot/target
 ```
@@ -102,8 +104,8 @@ BINANCE_VENUE=Spot
 BINANCE_AUTH_METHOD=HMAC-SHA256
 BINANCE_API_KEY=your_api_key
 BINANCE_API_SECRET=your_api_secret
-# Optional shared token protecting mutating /api/live/*, /api/orders/*, /api/git/* routes
-# APEXRUST_PROXY_TOKEN=your_local_secret_token
+# Optional >= 32-char Access Token guarding /api/* reads & writes (required when HOST=0.0.0.0; manage via `./apexrust token`)
+# APEXRUST_PROXY_TOKEN=your_32_plus_char_secret_token
 ```
 
 ### Step 5 — Run the Application
@@ -433,6 +435,28 @@ Express runs on port `3000` (`0.0.0.0:3000`), mounting Vite middleware in develo
 - **Secret Hygiene**:
   - API keys and signing secrets remain strictly in server process memory (`server.ts`) or environment variables / local `bot.toml` (gitignored). `.gitignore` excludes `.env`, `.env.*`, `*.pem`, and `.apexrust-order-logs.json` (and `git-backup.sh` also ensures `*.key`, `config/bot.toml`, and `backups/*.secret*` are ignored).
 
+### Managing the Access Token (`APEXRUST_PROXY_TOKEN`)
+
+When binding `server.ts` on `0.0.0.0` or a public IP (`HOST=0.0.0.0` or `./apexrust start --host 0.0.0.0`), `APEXRUST_PROXY_TOKEN` (**minimum 32 characters**) is required unless running over a loopback (`127.0.0.1`), RFC1918 LAN, or Cloudflare One Zero Trust WARP (`100.64.0.0/10`) IP. When set, every `/api/*` endpoint (except `/api/health` and the unauthenticated check of `/api/connection/info`) requires the token via `Authorization: Bearer <token>` or `X-ApexRust-Token`.
+
+Use the built-in CLI helper on Linux, macOS (`./apexrust`), or Windows (`.\apexrust.cmd`):
+
+| Action | Command | Behavior |
+| :--- | :--- | :--- |
+| **Inspect masked status** | `./apexrust token` | Displays bind host, masked `APEXRUST_PROXY_TOKEN` / `APEXRUST_WEB_TOKEN`, and length |
+| **View full token** | `./apexrust token show` | Prints the current `APEXRUST_PROXY_TOKEN` from `.env` ready to copy |
+| **Generate without saving** | `./apexrust token generate` | Generates a random 48-char hex token (`--bytes 32` for 64 chars) |
+| **Rotate / set & apply** | `./apexrust token rotate` | Generates a fresh 48-char token (or pass `--token <32+-char>`), backs up `.env` -> `.env.bak`, writes `.env` (`chmod 600`), and restarts `web` |
+| **Disable token safely** | `./apexrust token clear --host 127.0.0.1` | Clears `APEXRUST_PROXY_TOKEN` (blocks unsafe removal while `HOST=0.0.0.0`; pass a Cloudflare WARP/loopback `--host`) |
+
+**Unlocking in the WebApp & Desktop Clients:**
+- **Direct browser access (`http://<vps-ip>:3000` or `http://100.96.x.y:3000`)**: An inline **Access Token Unlock** bar appears automatically at the top of the UI when the server requires a token — paste it once to unlock your browser session (`sessionStorage` only).
+- **Local PWA → Remote VPS**: Open **Bot → VPS & Server Connection** and enter the VPS URL and Access Token.
+- **Rust CLI / `bot-desktop`**: Pass `--remote-token <token>` when linking:
+  ```bash
+  ./apexrust remote connect --remote-url http://<vps-ip>:3000 --remote-token "<token>"
+  ```
+
 ---
 
 ## Rust Workspace (`rust-bot/`) & Headless Deployment
@@ -469,7 +493,7 @@ cargo build --release -p bot-desktop
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PORT` | `3000` | HTTP port for Express + Vite / `dist/` server |
-| `HOST` | `0.0.0.0` (`.env` defaults to `127.0.0.1`) | HTTP bind address (`0.0.0.0` when unset; installer sets `127.0.0.1` unless `--lan`) |
+| `HOST` | `127.0.0.1` (`0.0.0.0` on Cloud Run via `K_SERVICE`) | HTTP bind address (`./apexrust setup` defaults to `127.0.0.1`; override with `--lan` or `--host <ip>`) |
 | `BINANCE_ENVIRONMENT` | `Testnet` | `Testnet` or `Production` |
 | `BINANCE_VENUE` | `Spot` | `Spot` or `Futures` |
 | `BINANCE_AUTH_METHOD` | `HMAC-SHA256` | `HMAC-SHA256` or `Ed25519` |
@@ -478,7 +502,9 @@ cargo build --release -p bot-desktop
 | `BINANCE_ED25519_PRIVATE_KEY` | `""` | Optional inline `Ed25519` PEM private key |
 | `BINANCE_PRIVATE_KEY_PATH` | `""` | Optional path to `Ed25519` PEM private key file |
 | `BINANCE_FUTURES_TESTNET_REST` | `""` | Optional override URL for Futures Testnet REST |
-| `APEXRUST_PROXY_TOKEN` | `""` | Optional shared token required on mutating `/api/live/*`, `/api/orders/*`, `/api/git/*` requests (`x-apexrust-token` or `Bearer`) |
+| `APEXRUST_PROXY_TOKEN` | `""` | `>= 32`-char Access Token required on `0.0.0.0`/public binds (optional on loopback / Cloudflare One WARP mesh); guards `/api/*` reads & writes via `Authorization: Bearer` or `X-ApexRust-Token` (`./apexrust token`) |
+| `APEXRUST_WEB_TOKEN` | `""` | Optional Bearer/`X-ApexRust-Token` protecting direct Rust `bot-web` (`:8080`) connections (required on non-private `bot-web` binds) |
+| `APEXRUST_ENGINE_AUTHORITY` | `browser` | `browser` (Desktop executes Live orders) or `daemon` (24/7 Rust daemon owns Live auto/manual entries; browser new-entry `/api/live/order` returns `409`) |
 | `DISABLE_HMR` | `false` | Set `true` to disable Vite HMR & file watching |
 
 ---
@@ -487,16 +513,10 @@ cargo build --release -p bot-desktop
 
 ### TypeScript Engine & Analytics Unit Tests
 
-Run all 6 pure-logic test suites using Node's built-in test runner via `tsx` (after `npm install`):
+Run all TypeScript engine, database, and remote-access test suites using Node's built-in test runner via `tsx` (after `npm install`):
 
 ```bash
-npx --yes tsx --test \
-  src/engine/indicators.test.ts \
-  src/engine/riskAndStrategy.test.ts \
-  src/engine/configStorage.test.ts \
-  src/engine/sessionWindows.test.ts \
-  src/engine/orderHistoryAnalytics.test.ts \
-  src/engine/liveFillNotifications.test.ts
+npx --yes tsx --test src/engine/*.test.ts
 ```
 
 ### Installer & Lifecycle CLI Tests

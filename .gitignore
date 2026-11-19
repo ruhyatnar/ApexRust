@@ -12,9 +12,9 @@ rust-bot/Cargo.lock
 .DS_Store
 *.log
 .env*
-!.env.example
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 .apexrust-order-logs.json
