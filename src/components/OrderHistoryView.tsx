@@ -4,12 +4,18 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   Check,
+  Clock,
   Code2,
   Copy,
+  Database,
   Download,
   Filter,
+  Plus,
   RefreshCw,
   Search,
+  ShieldAlert,
+  Trash2,
+  Upload,
   X,
 } from 'lucide-react';
 import {
@@ -18,11 +24,18 @@ import {
   formatOrderLogsCsv,
   getOrderStatusBadgeMeta,
 } from '../engine/orderHistoryAnalytics';
+import { apiFetch } from '../engine/apiClient';
+import { fmtPx as formatPx, fmtUsdMagnitude } from '../engine/formatters';
 import type {
   ExchangeVenue,
   ExecutionAccountMode,
+  OrderAutoPollInterval,
+  OrderDatabaseSummary,
   OrderExecutionLog,
   OrderExecutionStatus,
+  OrphanPairRecord,
+  OrphanResolutionAction,
+  SyncLookbackPreset,
 } from '../engine/types';
 import { DateRangePicker, type DateRangeValue } from './DateRangePicker';
 
@@ -32,21 +45,17 @@ interface OrderHistoryViewProps {
   activeVenue: ExchangeVenue;
   symbols: string[];
   refreshKey?: number;
+  serverTargetLabel?: string;
   onSelectPairAndTrade: (symbol: string) => void;
+  onAdoptOrphanPair?: (symbol: string) => void;
 }
 
 function fmtPx(px: number): string {
   if (!Number.isFinite(px) || px <= 0) return '0.00';
-  const d = px >= 100 ? 2 : px >= 1 ? 4 : 6;
-  return px.toFixed(d);
+  return formatPx(px);
 }
 
-function fmtUsd(val: number): string {
-  return Math.abs(val).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
+const fmtUsd = fmtUsdMagnitude;
 
 function statusBadgeClassName(status: OrderExecutionStatus): string {
   const { tone } = getOrderStatusBadgeMeta(status);
@@ -68,9 +77,22 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
   activeVenue,
   symbols,
   refreshKey = 0,
+  serverTargetLabel = '🖥️ This Computer',
   onSelectPairAndTrade,
+  onAdoptOrphanPair,
 }) => {
   const [logs, setLogs] = useState<OrderExecutionLog[]>([]);
+  const [dbSummary, setDbSummary] = useState<OrderDatabaseSummary | null>(null);
+  const [orphans, setOrphans] = useState<OrphanPairRecord[]>([]);
+  const [scanningOrphans, setScanningOrphans] = useState<boolean>(false);
+  const [resolvingOrphanKey, setResolvingOrphanKey] = useState<string | null>(null);
+  const [showOrphanPanel, setShowOrphanPanel] = useState<boolean>(false);
+  const [showDbAdmin, setShowDbAdmin] = useState<boolean>(false);
+  const [syncLookback, setSyncLookback] = useState<SyncLookbackPreset>('7d');
+  const [includeOrphansOnSync, setIncludeOrphansOnSync] = useState<boolean>(true);
+  const [autoPollInterval, setAutoPollInterval] = useState<OrderAutoPollInterval>('off');
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const [loading, setLoading] = useState<boolean>(true);
   const [syncingBinance, setSyncingBinance] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -85,12 +107,25 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
   const [inspectedId, setInspectedId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [csvExported, setCsvExported] = useState<boolean>(false);
+  const copyTimerRef = useRef<number | null>(null);
+  const exportTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      if (exportTimerRef.current !== null) window.clearTimeout(exportTimerRef.current);
+    };
+  }, []);
 
   // Follow global account mode switch while allowing explicit ALL inspection
   const symbolFilterRef = useRef(symbolFilter);
   symbolFilterRef.current = symbolFilter;
   const venueFilterRef = useRef(venueFilter);
   venueFilterRef.current = venueFilter;
+  const syncLookbackRef = useRef(syncLookback);
+  syncLookbackRef.current = syncLookback;
+  const includeOrphansRef = useRef(includeOrphansOnSync);
+  includeOrphansRef.current = includeOrphansOnSync;
   const hasLogsRef = useRef(false);
   hasLogsRef.current = logs.length > 0;
 
@@ -98,9 +133,38 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
     setModeFilter(accountMode);
   }, [accountMode]);
 
+  const fetchOrphanPairs = useCallback(async () => {
+    setScanningOrphans(true);
+    try {
+      const curVenue = venueFilterRef.current !== 'ALL' ? venueFilterRef.current : activeVenue;
+      const params = new URLSearchParams({
+        venue: curVenue,
+        configuredPairs: symbols.join(','),
+      });
+      const resp = await apiFetch(`/api/orders/orphans?${params.toString()}`);
+      if (!resp.ok) return;
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        orphans?: OrphanPairRecord[];
+        dbSummary?: OrderDatabaseSummary;
+      };
+      if (data.ok && Array.isArray(data.orphans)) {
+        setOrphans(data.orphans);
+      }
+      if (data.dbSummary) {
+        setDbSummary(data.dbSummary);
+      }
+    } catch {
+      // Ignore offline orphan scan failure
+    } finally {
+      setScanningOrphans(false);
+    }
+  }, [activeVenue, symbols]);
+
   const fetchOrderHistory = useCallback(
-    async (opts?: { syncBinance?: boolean }) => {
+    async (opts?: { syncBinance?: boolean; lookbackOverride?: SyncLookbackPreset }) => {
       const isSync = Boolean(opts?.syncBinance);
+      const effectiveLookback = opts?.lookbackOverride ?? syncLookbackRef.current;
       if (isSync) {
         setSyncingBinance(true);
       } else if (!hasLogsRef.current) {
@@ -112,6 +176,10 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
         const params = new URLSearchParams();
         if (isSync) {
           params.set('syncBinance', '1');
+          params.set('lookback', effectiveLookback);
+          if (includeOrphansRef.current) {
+            params.set('includeOrphans', '1');
+          }
           const curSym = symbolFilterRef.current;
           const curVenue = venueFilterRef.current;
           if (curSym !== 'ALL') {
@@ -125,14 +193,18 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
         }
         const queryStr = params.toString();
         const url = queryStr ? `/api/orders/history?${queryStr}` : '/api/orders/history';
-        const resp = await fetch(url);
+        const resp = await apiFetch(url);
         const data = (await resp.json()) as {
           ok?: boolean;
           error?: string;
           logs?: OrderExecutionLog[];
+          dbSummary?: OrderDatabaseSummary;
           syncResult?: {
             synced: boolean;
             count?: number;
+            lookback?: SyncLookbackPreset;
+            symbolsSynced?: string[];
+            orphanCount?: number;
             latencyMs?: number;
             endpoint?: string;
             error?: string;
@@ -145,13 +217,22 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
 
         const fetchedLogs = Array.isArray(data.logs) ? data.logs : [];
         setLogs(fetchedLogs);
+        if (data.dbSummary) {
+          setDbSummary(data.dbSummary);
+        }
 
         if (isSync && data.syncResult) {
           if (data.syncResult.synced) {
+            const symCount = data.syncResult.symbolsSynced?.length ?? 1;
+            const orphSuffix =
+              (data.syncResult.orphanCount ?? 0) > 0
+                ? ` · ${data.syncResult.orphanCount} orphan pair(s) included`
+                : '';
             setSyncNotice({
               ok: true,
-              text: `Synced ${data.syncResult.count ?? 0} historical order(s) via Binance ${data.syncResult.endpoint ?? ''} (${data.syncResult.latencyMs ?? 0}ms).`,
+              text: `Synced ${data.syncResult.count ?? 0} order(s) across ${symCount} pair(s) (${(data.syncResult.lookback ?? effectiveLookback).toUpperCase()}) via ${data.syncResult.endpoint ?? ''} (${data.syncResult.latencyMs ?? 0}ms)${orphSuffix}.`,
             });
+            void fetchOrphanPairs();
           } else {
             setSyncNotice({
               ok: false,
@@ -170,12 +251,176 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
         setSyncingBinance(false);
       }
     },
-    [activeSymbol, activeVenue, symbols]
+    [activeSymbol, activeVenue, symbols, fetchOrphanPairs]
   );
 
   useEffect(() => {
     void fetchOrderHistory();
-  }, [refreshKey, fetchOrderHistory]);
+    void fetchOrphanPairs();
+  }, [refreshKey, fetchOrderHistory, fetchOrphanPairs]);
+
+  // Optional background auto-polling for Binance order history
+  useEffect(() => {
+    if (autoPollInterval === 'off') return;
+    const intervalMs =
+      autoPollInterval === '1m'
+        ? 60_000
+        : autoPollInterval === '5m'
+          ? 300_000
+          : 900_000;
+    const timer = window.setInterval(() => {
+      void fetchOrderHistory({ syncBinance: true });
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [autoPollInterval, fetchOrderHistory]);
+
+  const handleResolveOrphan = async (
+    symbol: string,
+    venue: ExchangeVenue,
+    action: OrphanResolutionAction
+  ) => {
+    const key = `${symbol}:${action}`;
+    setResolvingOrphanKey(key);
+    try {
+      if (action === 'adopt_pair') {
+        onAdoptOrphanPair?.(symbol);
+      }
+      const resp = await apiFetch('/api/orders/orphans/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol,
+          venue,
+          action,
+          lookback: syncLookback,
+        }),
+      });
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        message?: string;
+        error?: string;
+        dbSummary?: OrderDatabaseSummary;
+      };
+      if (data.dbSummary) setDbSummary(data.dbSummary);
+      setSyncNotice({
+        ok: Boolean(resp.ok && data.ok),
+        text: data.message ?? data.error ?? `${action} completed for ${symbol}`,
+      });
+      await fetchOrderHistory();
+      await fetchOrphanPairs();
+    } catch (err) {
+      setSyncNotice({
+        ok: false,
+        text: err instanceof Error ? err.message : `Failed to run ${action} on ${symbol}`,
+      });
+    } finally {
+      setResolvingOrphanKey(null);
+    }
+  };
+
+  const handlePruneOrClearDb = async (opts: {
+    accountMode?: 'Paper' | 'Live' | 'ALL';
+    olderThanDays?: number;
+  }) => {
+    try {
+      const params = new URLSearchParams();
+      if (opts.accountMode) params.set('accountMode', opts.accountMode);
+      if (opts.accountMode === 'ALL') params.set('confirmAll', 'true');
+      if (opts.olderThanDays) params.set('olderThanDays', String(opts.olderThanDays));
+      const resp = await apiFetch(`/api/orders/history?${params.toString()}`, {
+        method: 'DELETE',
+      });
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        deleted?: number;
+        remaining?: number;
+        dbSummary?: OrderDatabaseSummary;
+      };
+      if (data.dbSummary) setDbSummary(data.dbSummary);
+      setSyncNotice({
+        ok: true,
+        text: `Database maintenance complete: removed ${data.deleted ?? 0} record(s), ${data.remaining ?? 0} remaining.`,
+      });
+      await fetchOrderHistory();
+      await fetchOrphanPairs();
+    } catch {
+      setSyncNotice({ ok: false, text: 'Database maintenance request failed.' });
+    }
+  };
+
+  const handleExportJsonDb = () => {
+    const payload = {
+      version: 2,
+      exportedAtIso: new Date().toISOString(),
+      dbSummary,
+      logs,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8;',
+    });
+    const url = URL.createObjectURL(blob);
+    const dateStamp = new Date().toISOString().slice(0, 10);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `apexrust-order-db-${dateStamp}.json`;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleImportJsonFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text) as { logs?: OrderExecutionLog[] } | OrderExecutionLog[];
+      const importLogs = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.logs)
+          ? parsed.logs
+          : [];
+      if (importLogs.length === 0) {
+        setSyncNotice({ ok: false, text: 'Selected JSON file contains no valid order logs.' });
+        return;
+      }
+      const resp = await apiFetch('/api/orders/history/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: importLogs }),
+      });
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        added?: number;
+        updated?: number;
+        total?: number;
+        error?: string;
+        dbSummary?: OrderDatabaseSummary;
+      };
+      if (!resp.ok || !data.ok) {
+        setSyncNotice({ ok: false, text: data.error ?? 'Failed to import JSON database.' });
+        return;
+      }
+      if (data.dbSummary) setDbSummary(data.dbSummary);
+      setSyncNotice({
+        ok: true,
+        text: `Imported JSON backup: +${data.added ?? 0} new, ${data.updated ?? 0} updated (${data.total ?? 0} total).`,
+      });
+      await fetchOrderHistory();
+    } catch (err) {
+      setSyncNotice({
+        ok: false,
+        text: err instanceof Error ? err.message : 'Invalid JSON backup file.',
+      });
+    }
+  };
+
+  const allAvailableSymbols = useMemo(
+    () => Array.from(new Set([...symbols, ...(dbSummary?.distinctSymbols ?? [])])).sort(),
+    [symbols, dbSummary]
+  );
 
   const accountModeLogs = useMemo(
     () =>
@@ -254,13 +499,15 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
     document.body.removeChild(a);
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     setCsvExported(true);
-    window.setTimeout(() => setCsvExported(false), 1800);
+    if (exportTimerRef.current !== null) window.clearTimeout(exportTimerRef.current);
+    exportTimerRef.current = window.setTimeout(() => setCsvExported(false), 1800);
   };
 
   const handleCopyPayload = (log: OrderExecutionLog) => {
     void navigator.clipboard?.writeText(JSON.stringify(log, null, 2));
     setCopiedId(log.id);
-    window.setTimeout(() => setCopiedId(null), 1800);
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    copyTimerRef.current = window.setTimeout(() => setCopiedId(null), 1800);
   };
 
   const pnlPositive = metrics.netRealizedPnlUsdt >= 0;
@@ -292,17 +539,64 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
               Order Execution History & Performance
             </h1>
             <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-slate-400">
-              <span>Backend Ledger (/api/orders/history)</span>
+              <span className="rounded border border-cyan-400/30 bg-cyan-950/30 px-2 py-0.5 font-semibold text-cyan-200">
+                📂 Database Location: {serverTargetLabel}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>
+                Database ({dbSummary?.engine === 'sqlite_wal' ? 'SQLite WAL' : 'JSONL Store'})
+              </span>
               <span aria-hidden="true">·</span>
               <span>Binance Spot & USD-M Futures Audit</span>
               <span aria-hidden="true">·</span>
               <span className="font-mono tabular-nums text-slate-300">
                 {filteredLogs.length} / {logs.length} Records
               </span>
+              {dbSummary && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono tabular-nums text-amber-300">
+                    Live {dbSummary.liveCount}/{dbSummary.maxLiveQuota}
+                  </span>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono tabular-nums text-[#7DF2AD]">
+                    Paper {dbSummary.paperCount}/{dbSummary.maxPaperQuota}
+                  </span>
+                </>
+              )}
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Lookback Window Selector (1D / 3D / 7D / 1M) */}
+            <div
+              className="flex items-center rounded-lg border border-white/[0.08] bg-[#0E121A] p-0.5"
+              role="group"
+              aria-label="Binance sync lookback period"
+            >
+              {(
+                [
+                  { id: '1d', label: '1D' },
+                  { id: '3d', label: '3D' },
+                  { id: '7d', label: '7D' },
+                  { id: '30d', label: '1M' },
+                ] as const
+              ).map((lb) => (
+                <button
+                  key={lb.id}
+                  type="button"
+                  onClick={() => setSyncLookback(lb.id)}
+                  className={`rounded-md px-2 py-1 font-mono text-[11px] font-semibold transition ${
+                    syncLookback === lb.id
+                      ? 'bg-amber-400 text-[#0B0F17]'
+                      : 'text-slate-400 hover:text-slate-100'
+                  }`}
+                >
+                  {lb.label}
+                </button>
+              ))}
+            </div>
+
             <button
               type="button"
               onClick={() => void fetchOrderHistory({ syncBinance: true })}
@@ -310,14 +604,64 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
               className="flex items-center gap-1.5 rounded-lg border border-amber-400/35 bg-[#0E121A] px-3.5 py-2 text-xs font-semibold text-amber-300 transition hover:border-amber-400/60 hover:bg-amber-950/25 disabled:opacity-50 whitespace-nowrap shrink-0"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${syncingBinance ? 'animate-spin' : ''}`} aria-hidden="true" />
-              <span>{syncingBinance ? 'Syncing Binance…' : 'Sync Binance allOrders'}</span>
+              <span>
+                {syncingBinance
+                  ? `Syncing (${syncLookback.toUpperCase()})…`
+                  : `Sync Binance (${syncLookback === '30d' ? '1M' : syncLookback.toUpperCase()})`}
+              </span>
+            </button>
+
+            {/* Auto-Poll Interval Selector */}
+            <div className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0E121A] px-2.5 py-1.5 text-xs">
+              <Clock className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
+              <label htmlFor="order-auto-poll" className="text-[11px] text-slate-400">
+                Auto-Poll:
+              </label>
+              <select
+                id="order-auto-poll"
+                value={autoPollInterval}
+                onChange={(e) => setAutoPollInterval(e.target.value as OrderAutoPollInterval)}
+                className="bg-transparent font-mono text-xs font-semibold text-[#7DF2AD] focus:outline-none"
+              >
+                <option value="off" className="bg-[#0E121A]">Off</option>
+                <option value="1m" className="bg-[#0E121A]">1m</option>
+                <option value="5m" className="bg-[#0E121A]">5m</option>
+                <option value="15m" className="bg-[#0E121A]">15m</option>
+              </select>
+            </div>
+
+            {/* Orphan Pair Manager Toggle */}
+            <button
+              type="button"
+              onClick={() => {
+                setShowOrphanPanel((v) => !v);
+                void fetchOrphanPairs();
+              }}
+              className={`flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-semibold transition whitespace-nowrap shrink-0 ${
+                orphans.length > 0
+                  ? 'border-rose-400/40 bg-rose-950/30 text-rose-200 hover:bg-rose-950/50'
+                  : 'border-white/[0.08] bg-[#0E121A] text-slate-200 hover:bg-[#1A202C]'
+              }`}
+            >
+              <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Orphan Pairs ({orphans.length})</span>
+            </button>
+
+            {/* Database Management Toggle */}
+            <button
+              type="button"
+              onClick={() => setShowDbAdmin((v) => !v)}
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0E121A] px-3 py-2 text-xs font-medium text-slate-200 transition hover:bg-[#1A202C] whitespace-nowrap shrink-0"
+            >
+              <Database className="h-3.5 w-3.5 text-[#7DF2AD]" aria-hidden="true" />
+              <span>DB Admin</span>
             </button>
 
             <button
               type="button"
               onClick={() => void fetchOrderHistory()}
               disabled={loading}
-              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0E121A] px-3.5 py-2 text-xs font-medium text-slate-200 transition hover:bg-[#1A202C] disabled:opacity-50 whitespace-nowrap shrink-0"
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0E121A] px-3 py-2 text-xs font-medium text-slate-200 transition hover:bg-[#1A202C] disabled:opacity-50 whitespace-nowrap shrink-0"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} aria-hidden="true" />
               <span>Refresh</span>
@@ -414,6 +758,241 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
           </div>
         </section>
       </header>
+
+      {/* Database Management Drawer */}
+      {showDbAdmin && (
+        <section
+          aria-label="Order History Database Administration"
+          className="rounded-xl border border-white/[0.08] bg-[#141820] p-4 space-y-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">
+                Order History Database Management ({dbSummary?.dbPath ?? '.apexrust-orders.sqlite'})
+              </h2>
+              <p className="text-xs text-slate-400">
+                Engine:{' '}
+                <strong className="font-mono text-[#7DF2AD]">
+                  {dbSummary?.engine === 'sqlite_wal' ? 'SQLite WAL (ACID Indexed)' : 'JSONL Fallback'}
+                </strong>{' '}
+                · Partitioned Quotas keep Paper simulation fills from evicting Live Binance audit records.
+              </p>
+            </div>
+            <label className="flex items-center gap-2 text-xs text-slate-300">
+              <input
+                type="checkbox"
+                checked={includeOrphansOnSync}
+                onChange={(e) => setIncludeOrphansOnSync(e.target.checked)}
+                className="h-3.5 w-3.5 rounded border-white/20 bg-[#0B0F17]"
+              />
+              <span>Auto-include discovered orphan pairs during Binance sync</span>
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button
+              type="button"
+              onClick={handleExportJsonDb}
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0E121A] px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-[#7DF2AD]/50 hover:text-[#7DF2AD]"
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Backup JSON DB</span>
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={(e) => void handleImportJsonFile(e)}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0E121A] px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-sky-400/50 hover:text-sky-300"
+            >
+              <Upload className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Restore JSON DB</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void handlePruneOrClearDb({ olderThanDays: 30 })}
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0E121A] px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-amber-400/50 hover:text-amber-200"
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Prune Older Than 30D</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void handlePruneOrClearDb({ accountMode: 'Paper' })}
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0E121A] px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-rose-400/50 hover:text-rose-200"
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Clear Paper Logs</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void handlePruneOrClearDb({ accountMode: 'ALL' })}
+              className="flex items-center gap-1.5 rounded-lg border border-rose-500/35 bg-rose-950/25 px-3 py-1.5 text-xs font-semibold text-rose-200 hover:bg-rose-950/45"
+            >
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Clear All DB Records</span>
+            </button>
+          </div>
+        </section>
+      )}
+
+      {/* Orphan Pair Detection & Reconciliation Panel */}
+      {(showOrphanPanel || orphans.length > 0) && (
+        <section
+          aria-label="Orphan Pair Management"
+          className="rounded-xl border border-amber-500/30 bg-[#141820] p-4 space-y-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="h-4 w-4 text-amber-400" aria-hidden="true" />
+                <h2 className="text-sm font-semibold text-slate-100">
+                  Orphan Pair & Exchange Desync Management ({orphans.length})
+                </h2>
+              </div>
+              <p className="mt-0.5 text-xs text-slate-400">
+                Detects symbols with active Binance orders/positions outside{' '}
+                <code className="font-mono text-slate-300">trading.pairs</code> or local DB orders out of sync with Binance.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={scanningOrphans}
+                onClick={() => void fetchOrphanPairs()}
+                className="flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0E121A] px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-[#7DF2AD]/50 disabled:opacity-40"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${scanningOrphans ? 'animate-spin' : ''}`} aria-hidden="true" />
+                <span>{scanningOrphans ? 'Scanning…' : 'Scan Exchange & DB'}</span>
+              </button>
+              {showOrphanPanel && (
+                <button
+                  type="button"
+                  onClick={() => setShowOrphanPanel(false)}
+                  className="rounded-md p-1 text-slate-400 hover:text-slate-200"
+                  aria-label="Close orphan pair panel"
+                >
+                  <X className="h-4 w-4" aria-hidden="true" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {orphans.length === 0 ? (
+            <div className="rounded-lg border border-emerald-500/25 bg-emerald-950/20 px-3.5 py-2.5 text-xs text-emerald-200">
+              No orphan pairs or stale local orders detected. All exchange open orders, positions, and DB symbols match your active configuration.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {orphans.map((orph) => {
+                const isBusy = resolvingOrphanKey?.startsWith(`${orph.symbol}:`);
+                return (
+                  <div
+                    key={`${orph.venue}:${orph.symbol}`}
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/[0.08] bg-[#0E121A] px-3.5 py-2.5 text-xs"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-sm font-bold text-slate-100">
+                          {orph.symbol}
+                        </span>
+                        <span className="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-[10px] text-slate-300">
+                          {orph.venue} · {orph.environment}
+                        </span>
+                        {orph.kinds.includes('exchange_untracked_pair') && (
+                          <span className="rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-rose-300">
+                            EXCHANGE UNTRACKED PAIR
+                          </span>
+                        )}
+                        {orph.kinds.includes('stale_local_open_order') && (
+                          <span className="rounded border border-amber-400/40 bg-amber-400/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-amber-300">
+                            STALE LOCAL OPEN ORDER
+                          </span>
+                        )}
+                        {orph.kinds.includes('db_unconfigured_pair') && (
+                          <span className="rounded border border-slate-500/40 bg-slate-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-300">
+                            UNCONFIGURED DB PAIR
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-slate-400">{orph.summary}</p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {!orph.inConfiguredPairs && (
+                        <button
+                          type="button"
+                          disabled={Boolean(isBusy)}
+                          onClick={() => void handleResolveOrphan(orph.symbol, orph.venue, 'adopt_pair')}
+                          className="flex items-center gap-1 rounded-md bg-[#7DF2AD] px-2.5 py-1 text-[11px] font-bold text-[#0B0F17] hover:bg-[#95F7BD] disabled:opacity-40"
+                        >
+                          <Plus className="h-3 w-3" aria-hidden="true" />
+                          <span>Adopt Pair</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={Boolean(isBusy)}
+                        onClick={() => void handleResolveOrphan(orph.symbol, orph.venue, 'sync_history')}
+                        className="rounded-md border border-amber-400/40 bg-amber-950/25 px-2.5 py-1 text-[11px] font-semibold text-amber-200 hover:bg-amber-950/45 disabled:opacity-40"
+                      >
+                        Sync ({syncLookback === '30d' ? '1M' : syncLookback.toUpperCase()})
+                      </button>
+                      {orph.localStaleOpenOrderIds.length > 0 && (
+                        <button
+                          type="button"
+                          disabled={Boolean(isBusy)}
+                          onClick={() =>
+                            void handleResolveOrphan(orph.symbol, orph.venue, 'reconcile_orders')
+                          }
+                          className="rounded-md border border-sky-400/40 bg-sky-950/25 px-2.5 py-1 text-[11px] font-semibold text-sky-200 hover:bg-sky-950/45 disabled:opacity-40"
+                        >
+                          Reconcile Orders ({orph.localStaleOpenOrderIds.length})
+                        </button>
+                      )}
+                      {orph.exchangeOpenOrdersCount + orph.exchangeAlgoOrdersCount > 0 && (
+                        <button
+                          type="button"
+                          disabled={Boolean(isBusy)}
+                          onClick={() =>
+                            void handleResolveOrphan(orph.symbol, orph.venue, 'cancel_exchange_orders')
+                          }
+                          className="rounded-md border border-rose-500/40 bg-rose-950/30 px-2.5 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-950/50 disabled:opacity-40"
+                        >
+                          Cancel Exchange Orders
+                        </button>
+                      )}
+                      {orph.localDbOrderCount > 0 &&
+                        orph.exchangeOpenOrdersCount === 0 &&
+                        Math.abs(orph.exchangePositionAmt) === 0 && (
+                          <button
+                            type="button"
+                            disabled={Boolean(isBusy)}
+                            onClick={() =>
+                              void handleResolveOrphan(orph.symbol, orph.venue, 'purge_local_records')
+                            }
+                            className="rounded-md border border-white/[0.1] bg-[#141820] px-2.5 py-1 text-[11px] text-slate-300 hover:border-rose-400/40 hover:text-rose-300 disabled:opacity-40"
+                          >
+                            Purge DB ({orph.localDbOrderCount})
+                          </button>
+                        )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* Sync / API Error Notice */}
       {errorMessage && (
@@ -690,9 +1269,9 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
                 className="bg-transparent text-xs font-mono text-slate-200 focus:outline-none"
               >
                 <option value="ALL" className="bg-[#0B0F17]">
-                  All Pairs ({symbols.length})
+                  All Pairs ({allAvailableSymbols.length})
                 </option>
-                {symbols.map((sym) => (
+                {allAvailableSymbols.map((sym) => (
                   <option key={sym} value={sym} className="bg-[#0B0F17]">
                     {sym}
                   </option>
@@ -795,23 +1374,45 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
             <table className="w-full border-collapse text-left">
               <thead>
                 <tr className="border-b border-white/[0.06] bg-[#0E121A] text-[11px] font-mono text-slate-400">
-                  <th className="px-3.5 py-2.5 font-medium">Time / Order ID</th>
-                  <th className="px-3.5 py-2.5 font-medium">Pair / Account</th>
-                  <th className="px-3.5 py-2.5 font-medium">Side / Type</th>
-                  <th className="px-3.5 py-2.5 font-medium">Status</th>
-                  <th className="px-3.5 py-2.5 text-right font-medium">Price / Qty</th>
-                  <th className="px-3.5 py-2.5 text-right font-medium">Quote / Fee</th>
-                  <th className="px-3.5 py-2.5 text-right font-medium">Latency</th>
-                  <th className="px-3.5 py-2.5 text-right font-medium">Realized PnL</th>
-                  <th className="px-3.5 py-2.5 text-right font-medium">Payload</th>
+                  <th className="px-3 py-2.5 font-medium whitespace-nowrap">Time / Updated</th>
+                  <th className="px-3 py-2.5 font-medium whitespace-nowrap">Symbol / Venue</th>
+                  <th className="px-3 py-2.5 font-medium whitespace-nowrap">Type</th>
+                  <th className="px-3 py-2.5 font-medium whitespace-nowrap">Side</th>
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">Average / Price</th>
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">Executed / Amount</th>
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">Total (USDT)</th>
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">Trigger Conditions</th>
+                  <th className="px-3 py-2.5 font-medium whitespace-nowrap">ReduceOnly / Flags</th>
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">Fee / Realized Profit</th>
+                  <th className="px-3 py-2.5 text-right font-medium whitespace-nowrap">Status</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-white/[0.05] text-xs font-mono tabular-nums">
                 {filteredLogs.map((log) => {
                   const isSelected = log.id === inspectedId;
-                  const dt = new Date(log.timestampMs);
+                  const createdDt = new Date(log.orderTimeMs ?? log.timestampMs);
+                  const updatedDt = new Date(log.updateTimeMs ?? log.timestampMs);
                   const hasPnl = log.realizedPnlUsdt !== null;
                   const rowPnlPos = (log.realizedPnlUsdt ?? 0) >= 0;
+                  const avgPx =
+                    log.avgPrice !== undefined && log.avgPrice > 0
+                      ? log.avgPrice
+                      : log.executedQty > 0 && log.quoteQty > 0
+                        ? log.quoteQty / log.executedQty
+                        : log.price;
+                  const fillPct =
+                    log.origQty > 0 ? Math.min(100, (log.executedQty / log.origQty) * 100) : 0;
+                  const stopPx = log.stopPrice ?? 0;
+                  const triggerLabel =
+                    stopPx > 0
+                      ? `${log.workingType === 'CONTRACT_PRICE' ? 'Last' : 'Mark'} ${
+                          log.binanceSide === 'SELL' ? '<=' : '>='
+                        } $${fmtPx(stopPx)}`
+                      : log.activatePrice && log.activatePrice > 0
+                        ? `Act $${fmtPx(log.activatePrice)}${log.priceRate ? ` (${log.priceRate}%)` : ''}`
+                        : '—';
+                  const isPostOnly =
+                    log.orderType === 'LIMIT_MAKER' || log.timeInForce === 'GTX';
 
                   return (
                     <React.Fragment key={log.id}>
@@ -820,34 +1421,52 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
                           isSelected ? 'bg-[#19202D]' : 'hover:bg-white/[0.025]'
                         }`}
                       >
-                        <td className="px-3.5 py-2.5 whitespace-nowrap">
+                        {/* 1. Time / Updated & Order ID */}
+                        <td className="px-3 py-2.5 whitespace-nowrap">
                           <div className="text-slate-100">
-                            {dt.toISOString().slice(11, 19)} UTC · {dt.toISOString().slice(5, 10)}
+                            {createdDt.toISOString().slice(0, 10)} {createdDt.toISOString().slice(11, 19)}
                           </div>
-                          <div className="text-[11px] text-slate-400">
-                            #{log.orderId}
-                            {log.orderListId && log.orderListId > 0 ? ` · oco:#${log.orderListId}` : ''}
+                          <div className="text-[10px] text-slate-400">
+                            Upd {updatedDt.toISOString().slice(11, 19)} · #{log.orderId}
                           </div>
                         </td>
 
-                        <td className="px-3.5 py-2.5 whitespace-nowrap">
-                          <button
-                            type="button"
-                            onClick={() => onSelectPairAndTrade(log.symbol)}
-                            className="font-sans font-semibold text-slate-100 hover:text-[#7DF2AD] transition-colors"
-                          >
-                            {log.symbol}
-                          </button>
-                          <div className="font-sans text-[11px] text-slate-400">
-                            {log.venue} · {log.environment} ·{' '}
+                        {/* 2. Symbol / Venue */}
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => onSelectPairAndTrade(log.symbol)}
+                              className="font-sans font-semibold text-slate-100 hover:text-[#7DF2AD] transition-colors"
+                            >
+                              {log.symbol}
+                            </button>
+                            <span className="rounded bg-white/[0.06] px-1 py-0.5 font-mono text-[10px] text-slate-300">
+                              {log.venue === 'Futures' ? 'Perp' : 'Spot'}
+                            </span>
+                          </div>
+                          <div className="font-sans text-[10px] text-slate-400">
+                            {log.environment} ·{' '}
                             <span className={log.accountMode === 'Live' ? 'text-amber-300' : 'text-emerald-300'}>
                               {log.accountMode}
                             </span>
+                            {log.orderListId && log.orderListId > 0 ? ` · OCO#${log.orderListId}` : ''}
                           </div>
                         </td>
 
-                        <td className="px-3.5 py-2.5 whitespace-nowrap">
-                          <div className="flex items-center gap-1.5">
+                        {/* 3. Type */}
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <div className="font-semibold text-slate-200">{log.orderType}</div>
+                          {log.origType && log.origType !== log.orderType ? (
+                            <div className="text-[10px] text-slate-400">Orig: {log.origType}</div>
+                          ) : (
+                            <div className="text-[10px] text-slate-500">{log.timeInForce}</div>
+                          )}
+                        </td>
+
+                        {/* 4. Side / PositionSide */}
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <div className="flex items-center gap-1">
                             <span
                               className={`inline-flex items-center gap-0.5 font-semibold ${
                                 log.binanceSide === 'BUY' ? 'text-[#10B981]' : 'text-[#F43F5E]'
@@ -860,100 +1479,142 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
                               )}
                               {log.binanceSide}
                             </span>
-                            <span className="text-slate-500">·</span>
-                            <span className="text-slate-200">{log.orderType}</span>
-                          </div>
-                          <div className="text-[11px] text-slate-400">
-                            {log.lifecycle} · {log.timeInForce}
-                          </div>
-                        </td>
-
-                        <td className="px-3.5 py-2.5 whitespace-nowrap">
-                          {(() => {
-                            const badge = getOrderStatusBadgeMeta(log.status);
-                            return (
-                              <span
-                                title={log.status}
-                                className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-mono font-semibold tracking-wide ${statusBadgeClassName(log.status)}`}
-                              >
-                                {badge.label}
+                            {log.venue === 'Futures' && (
+                              <span className="rounded bg-white/[0.05] px-1 py-0.5 text-[10px] text-slate-300">
+                                {log.positionSide ?? 'BOTH'}
                               </span>
-                            );
-                          })()}
-                          <div className="mt-1 font-sans text-[11px] text-slate-400">
-                            {log.isMaker ? 'Maker' : 'Taker'} · {log.source}
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-400">
+                            {log.lifecycle} ({log.side})
                           </div>
                         </td>
 
-                        <td className="px-3.5 py-2.5 text-right whitespace-nowrap">
+                        {/* 5. Average / Order Price */}
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">
                           <div className="font-semibold text-slate-100">
-                            {log.price > 0 ? `$${fmtPx(log.price)}` : 'Market'}
+                            {avgPx > 0 ? `$${fmtPx(avgPx)}` : '—'}
                           </div>
-                          <div className="text-[11px] text-slate-400">
+                          <div className="text-[10px] text-slate-400">
+                            {log.orderType === 'MARKET' || log.price <= 0
+                              ? 'Market'
+                              : `Lim $${fmtPx(log.price)}`}
+                          </div>
+                        </td>
+
+                        {/* 6. Executed / Amount */}
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                          <div className="text-slate-100">
                             {log.executedQty.toFixed(4)} / {log.origQty.toFixed(4)}
                           </div>
+                          <div className="text-[10px] text-slate-400">{fillPct.toFixed(1)}% Filled</div>
                         </td>
 
-                        <td className="px-3.5 py-2.5 text-right whitespace-nowrap">
-                          <div className="text-slate-100">${fmtUsd(log.quoteQty)}</div>
-                          <div className="text-[11px] text-slate-400">
-                            Fee ${log.commission.toFixed(4)} {log.commissionAsset}
+                        {/* 7. Total (Cum. Quote) */}
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                          <div className="font-semibold text-slate-100">${fmtUsd(log.quoteQty)}</div>
+                          <div className="text-[10px] text-slate-400">USDT</div>
+                        </td>
+
+                        {/* 8. Trigger Conditions */}
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                          <div className="text-slate-200">{triggerLabel}</div>
+                          {log.priceProtect ? (
+                            <div className="text-[10px] text-emerald-400">PriceProtect</div>
+                          ) : null}
+                        </td>
+
+                        {/* 9. ReduceOnly / PostOnly / Flags */}
+                        <td className="px-3 py-2.5 whitespace-nowrap">
+                          <div className="flex flex-wrap items-center gap-1">
+                            {log.reduceOnly && (
+                              <span className="rounded border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[10px] text-amber-300">
+                                ReduceOnly
+                              </span>
+                            )}
+                            {log.closePosition && (
+                              <span className="rounded border border-rose-400/30 bg-rose-400/10 px-1.5 py-0.5 text-[10px] text-rose-300">
+                                CloseAll
+                              </span>
+                            )}
+                            {isPostOnly && (
+                              <span className="rounded border border-sky-400/30 bg-sky-400/10 px-1.5 py-0.5 text-[10px] text-sky-300">
+                                PostOnly
+                              </span>
+                            )}
+                            {!log.reduceOnly && !log.closePosition && !isPostOnly && (
+                              <span className="text-[10px] text-slate-500">
+                                {log.selfTradePreventionMode && log.selfTradePreventionMode !== 'NONE'
+                                  ? `STP:${log.selfTradePreventionMode}`
+                                  : 'Standard'}
+                              </span>
+                            )}
                           </div>
                         </td>
 
-                        <td className="px-3.5 py-2.5 text-right whitespace-nowrap text-slate-300">
-                          {log.latencyMs !== null ? `${Math.round(log.latencyMs)} ms` : '—'}
-                        </td>
-
-                        <td className="px-3.5 py-2.5 text-right whitespace-nowrap">
+                        {/* 10. Fee & Realized Profit */}
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">
                           {hasPnl ? (
-                            <>
-                              <div
-                                className={`font-semibold ${
-                                  rowPnlPos ? 'text-[#7DF2AD]' : 'text-[#F87171]'
-                                }`}
-                              >
-                                {rowPnlPos ? '+' : '-'}${fmtUsd(log.realizedPnlUsdt!)}
-                                {log.rMultiple !== null ? (
-                                  <span className="ml-1 text-[11px] opacity-85">
-                                    ({log.rMultiple >= 0 ? '+' : ''}
-                                    {log.rMultiple.toFixed(2)}R)
-                                  </span>
-                                ) : null}
-                              </div>
-                              <div className="font-sans text-[11px] text-slate-400">
-                                {log.exitReason ?? 'Exit'}
-                              </div>
-                            </>
+                            <div
+                              className={`font-semibold ${
+                                rowPnlPos ? 'text-[#7DF2AD]' : 'text-[#F87171]'
+                              }`}
+                            >
+                              {rowPnlPos ? '+' : '-'}${fmtUsd(log.realizedPnlUsdt!)}
+                              {log.rMultiple !== null ? (
+                                <span className="ml-1 text-[10px] opacity-85">
+                                  ({log.rMultiple >= 0 ? '+' : ''}
+                                  {log.rMultiple.toFixed(2)}R)
+                                </span>
+                              ) : null}
+                            </div>
                           ) : (
-                            <>
-                              <div className="text-slate-500">—</div>
-                              <div className="font-sans text-[11px] text-slate-400">
-                                {log.errorMessage ? 'Rejected' : log.lifecycle}
-                              </div>
-                            </>
+                            <div className="text-slate-400">
+                              {log.exitReason ?? '—'}
+                            </div>
                           )}
+                          <div className="text-[10px] text-slate-400">
+                            Fee {log.commission.toFixed(4)} {log.commissionAsset} ({log.isMaker ? 'M' : 'T'})
+                          </div>
                         </td>
 
-                        <td className="px-3.5 py-2.5 text-right whitespace-nowrap">
-                          <button
-                            type="button"
-                            onClick={() => setInspectedId(isSelected ? null : log.id)}
-                            className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-[11px] font-mono transition-colors ${
-                              isSelected
-                                ? 'border-[#7DF2AD]/50 bg-[#7DF2AD]/15 text-[#7DF2AD]'
-                                : 'border-white/[0.08] bg-[#0B0F17] text-slate-300 hover:text-white'
-                            }`}
-                          >
-                            <Code2 className="h-3 w-3" aria-hidden="true" />
-                            <span>{isSelected ? 'Hide' : 'Inspect'}</span>
-                          </button>
+                        {/* 11. Status & Inspect */}
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">
+                          <div className="flex items-center justify-end gap-1.5">
+                            {(() => {
+                              const badge = getOrderStatusBadgeMeta(log.status);
+                              return (
+                                <span
+                                  title={log.status}
+                                  className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-mono font-semibold tracking-wide ${statusBadgeClassName(log.status)}`}
+                                >
+                                  {badge.label}
+                                </span>
+                              );
+                            })()}
+                            <button
+                              type="button"
+                              onClick={() => setInspectedId(isSelected ? null : log.id)}
+                              className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-mono transition-colors ${
+                                isSelected
+                                  ? 'border-[#7DF2AD]/50 bg-[#7DF2AD]/15 text-[#7DF2AD]'
+                                  : 'border-white/[0.08] bg-[#0B0F17] text-slate-300 hover:text-white'
+                              }`}
+                            >
+                              <Code2 className="h-3 w-3" aria-hidden="true" />
+                              <span>{isSelected ? 'Hide' : 'JSON'}</span>
+                            </button>
+                          </div>
+                          <div className="mt-0.5 text-[10px] text-slate-500">
+                            {log.latencyMs !== null ? `${Math.round(log.latencyMs)}ms · ` : ''}
+                            {log.source}
+                          </div>
                         </td>
                       </tr>
 
                       {isSelected && (
                         <tr className="bg-[#0B0F17]">
-                          <td colSpan={9} className="px-4 py-3.5">
+                          <td colSpan={11} className="px-4 py-3.5">
                             <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 font-sans">
                               <div className="text-xs text-slate-300">
                                 <span className="font-mono font-semibold text-slate-100">

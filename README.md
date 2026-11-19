@@ -148,6 +148,38 @@ curl -s http://127.0.0.1:8080/api/health
   ./apexrust service uninstall      # remove registered auto-start services
   ```
 
+### 24/7 VPS Deployment (Cloudflare One Zero Trust) & Cross-Platform Desktop Connection
+
+You can run the 24/7 Rust Trading Daemon (`bot-desktop --daemon`) and Express Gateway (`server.ts`) continuously on a VPS over your **Cloudflare One Client (Zero Trust WARP Mesh `100.96.0.0/12` or `cloudflared` private tunnel)**, while monitoring, configuring API keys, viewing SQLite Order History, and placing manual orders from your **Windows, macOS, or Linux** computer—with instant switching between **`🖥️ This Computer`** and **`☁️ Remote VPS`**:
+
+1. **On the 24/7 VPS** (auto-detects your Cloudflare One WARP virtual IP and binds `bot-web` strictly to `127.0.0.1:8080`):
+   ```bash
+   ./install.sh --role vps --service
+   # Sets APEXRUST_ENGINE_AUTHORITY=daemon, APEXRUST_PERSIST_VAULT=true, and starts both `web` and `bot`
+   ```
+   - Whitelist your VPS outbound IP in Binance API Management and keep public ports `3000`/`8080` blocked on public `ufw`/`eth0`.
+
+2. **On Your Desktop (Windows / macOS / Linux)**:
+   ```bash
+   # Linux / macOS:
+   ./install.sh --role client --remote-url http://100.96.x.y:3000 --remote-name "Tokyo VPS"
+   # Windows PowerShell:
+   .\install.ps1 -PassThruArgs --role client --remote-url http://100.96.x.y:3000 --remote-name "Tokyo VPS"
+   ```
+   - Open your local Desktop PWA at `http://localhost:3000` and click **`🖥️ This Computer`** / **`☁️ Remote VPS`** in the top header bar (or **`Bot → VPS & Server Connection`**) to switch between local simulation and your 24/7 VPS at any time.
+   - Use the cross-platform CLI on Windows (`apexrust.cmd` / `bot-desktop.exe`), macOS, or Linux:
+     ```bash
+     ./apexrust remote status
+     ./apexrust remote use-local     # switch Desktop PWA + bot-desktop back to This Computer
+     ./apexrust remote use-vps       # switch back to 24/7 Remote VPS
+
+     # Native Rust CLI remote monitor & controls:
+     ./rust-bot/target/release/bot-desktop connect --url http://100.96.x.y:3000 --name "Tokyo VPS"
+     ./rust-bot/target/release/bot-desktop remote watch
+     ./rust-bot/target/release/bot-desktop remote pause
+     ./rust-bot/target/release/bot-desktop remote manual-order --symbol BTCUSDT --side long --notional 150 --yes
+     ```
+
 ---
 
 ## System Architecture

@@ -139,8 +139,14 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
           <button
             type="button"
             onClick={() => onSimulateLoss(snapshot.pairs[0]?.symbol ?? 'BTCUSDT', 135)}
-            disabled={snapshot.accountMode === 'Live'}
-            title={snapshot.accountMode === 'Live' ? 'Simulation stress test is Paper-only' : undefined}
+            disabled={!config.features.circuitBreaker || snapshot.accountMode === 'Live'}
+            title={
+              !config.features.circuitBreaker
+                ? 'Circuit Breaker is disabled in Feature Toggles'
+                : snapshot.accountMode === 'Live'
+                  ? 'Simulation stress test is Paper-only'
+                  : undefined
+            }
             className="rounded-md border border-amber-500/40 bg-amber-950/30 px-3 py-1.5 text-xs font-medium text-amber-200 transition hover:bg-amber-950/50 disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
           >
             Simulate -$135 Loss
@@ -148,8 +154,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
           {risk.state === 'Active' ? (
             <button
               type="button"
+              disabled={!config.features.circuitBreaker}
+              title={!config.features.circuitBreaker ? 'Circuit Breaker is disabled in Feature Toggles' : undefined}
               onClick={onTripCircuitBreaker}
-              className="flex items-center gap-1.5 rounded-md bg-rose-600 px-3.5 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500 whitespace-nowrap"
+              className="flex items-center gap-1.5 rounded-md bg-rose-600 px-3.5 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
             >
               <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
               Trip Circuit Breaker
@@ -157,8 +165,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
           ) : (
             <button
               type="button"
+              disabled={!config.features.circuitBreaker}
+              title={!config.features.circuitBreaker ? 'Circuit Breaker is disabled in Feature Toggles' : undefined}
               onClick={onResetCircuitBreaker}
-              className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-500 whitespace-nowrap"
+              className="flex items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
             >
               <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
               Reset Circuit Breaker
@@ -166,6 +176,15 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
           )}
         </div>
       </div>
+
+      {!config.features.circuitBreaker && (
+        <div
+          role="status"
+          className="rounded-lg border border-amber-500/30 bg-amber-950/25 px-4 py-2.5 text-xs text-amber-200"
+        >
+          Risk Circuit Breaker & Quarantine is currently toggled <strong>OFF</strong> in Bot → Feature Toggles. Guardrail controls are locked.
+        </div>
+      )}
 
       {/* Drawdown & Profit Gauges */}
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
@@ -239,7 +258,7 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
         </div>
 
         {/* Editable Limits */}
-        <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4">
+        <div className={`rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4 ${!config.features.circuitBreaker ? 'opacity-50' : ''}`}>
           <h3 className="text-sm font-semibold text-slate-100">Circuit Breaker Thresholds</h3>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
@@ -252,9 +271,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
                 step="0.25"
                 min="0.5"
                 max="20"
+                disabled={!config.features.circuitBreaker}
                 value={config.risk.maxDailyDrawdownPct}
                 onChange={(e) => updateRisk('maxDailyDrawdownPct', Number(e.target.value) || 3)}
-                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -268,9 +288,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
                 step="0.25"
                 min="0.25"
                 max="10"
+                disabled={!config.features.circuitBreaker}
                 value={config.risk.maxPairDailyDrawdownPct}
                 onChange={(e) => updateRisk('maxPairDailyDrawdownPct', Number(e.target.value) || 1.25)}
-                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -284,9 +305,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
                 step="0.5"
                 min="1"
                 max="25"
+                disabled={!config.features.circuitBreaker}
                 value={config.risk.maxDailyProfitPct}
                 onChange={(e) => updateRisk('maxDailyProfitPct', Number(e.target.value) || 5)}
-                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -299,9 +321,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
                 type="number"
                 min="1"
                 max="10"
+                disabled={!config.features.circuitBreaker}
                 value={config.risk.maxLoseStreak}
                 onChange={(e) => updateRisk('maxLoseStreak', Math.max(1, Number(e.target.value) || 3))}
-                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -314,9 +337,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
                 type="number"
                 min="2"
                 max="15"
+                disabled={!config.features.circuitBreaker}
                 value={config.risk.maxWinStreak}
                 onChange={(e) => updateRisk('maxWinStreak', Math.max(2, Number(e.target.value) || 5))}
-                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -329,11 +353,12 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
                 type="number"
                 min="1"
                 max="240"
+                disabled={!config.features.circuitBreaker}
                 value={config.risk.streakCooldownMinutes}
                 onChange={(e) =>
                   updateRisk('streakCooldownMinutes', Math.max(1, Number(e.target.value) || 30))
                 }
-                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -344,9 +369,10 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
               <input
                 id="risk-flatten"
                 type="checkbox"
+                disabled={!config.features.circuitBreaker}
                 checked={config.risk.flattenOnCircuitBreaker}
                 onChange={(e) => updateRisk('flattenOnCircuitBreaker', e.target.checked)}
-                className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-blue-600 focus:ring-blue-500"
+                className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-blue-600 focus:ring-blue-500 disabled:cursor-not-allowed"
               />
             </div>
           </div>

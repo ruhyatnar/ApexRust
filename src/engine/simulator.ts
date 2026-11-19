@@ -136,7 +136,7 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-export function generateSeedCandles(symbol: string, count = 220, baseTimeMs = 1_763_280_000_000): Candle[] {
+function generateSeedCandles(symbol: string, count = 220, baseTimeMs = 1_763_280_000_000): Candle[] {
   const base = BASE_PRICES[symbol] ?? 100;
   const seed = symbol.split('').reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7);
   const rand = mulberry32(seed);
@@ -693,6 +693,7 @@ export class SimulationRuntime {
       executedQty?: number;
       avgPrice?: number;
       commission?: number;
+      commissionAsset?: string;
       orderId?: string;
       ocoOrderListId?: number;
       algoOrderIds?: string[];
@@ -708,10 +709,24 @@ export class SimulationRuntime {
         ? atr * this.config.exits.atrSlMultiplier
         : entryPrice * (Math.max(0.2, input.stopLossPct) / 100);
     const initialSl = input.side === 'Long' ? entryPrice - slDist : entryPrice + slDist;
-    const qty =
+    const rawQty =
       fillDetails?.executedQty && fillDetails.executedQty > 0
         ? fillDetails.executedQty
         : input.usdtAmount / Math.max(entryPrice, 1e-6);
+    const knownQuotes = ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'BNB', 'ETH', 'BTC'];
+    const upperSym = input.symbol.toUpperCase();
+    const matchedQuote = knownQuotes.find((q) => upperSym.length > q.length && upperSym.endsWith(q));
+    const baseAsset = matchedQuote ? upperSym.slice(0, upperSym.length - matchedQuote.length) : upperSym;
+    const commAssetUpper = fillDetails?.commissionAsset?.trim().toUpperCase();
+    const baseCommissionDeducted =
+      this.config.trading.venue === 'Spot' &&
+      commAssetUpper === baseAsset &&
+      typeof fillDetails?.commission === 'number' &&
+      fillDetails.commission > 0
+        ? fillDetails.commission
+        : 0;
+    const qty = rawQty;
+    const remainingQuantity = Math.max(0, rawQty - baseCommissionDeducted);
     const cleanTargets: TakeProfitTarget[] = input.targets
       .filter((t) => t.pctOffset > 0 && t.allocationPct > 0)
       .map((t, idx) => ({
@@ -752,17 +767,18 @@ export class SimulationRuntime {
       side: input.side,
       entryPrice,
       quantity: qty,
-      remainingQuantity: qty,
+      remainingQuantity,
       lockedMarginUsdt:
         this.config.trading.venue === 'Futures'
           ? (entryPrice * qty) / Math.max(1, this.config.trading.leverage)
-          : entryPrice * qty,
+          : entryPrice * remainingQuantity,
       unrealizedPnlUsdt: 0,
       realizedPnlUsdt: 0,
       feePaidUsdt:
         fillDetails?.commission !== undefined && fillDetails.commission > 0
           ? fillDetails.commission
           : entryRec.commission,
+      commissionAsset: fillDetails?.commissionAsset ?? 'USDT',
       highestFavorablePrice: entryPrice,
       exitPlan: {
         initialStopLoss: initialSl,
@@ -797,6 +813,7 @@ export class SimulationRuntime {
     const pending: PendingOrder = {
       id: `${input.symbol}-live-lim-${nowMs}`,
       symbol: input.symbol,
+      venue: this.config.trading.venue,
       side: input.side,
       orderType: input.orderType,
       orderMethod: input.orderType === 'LIMIT MAKER' ? 'LIMIT_MAKER' : 'LIMIT',
@@ -1153,6 +1170,12 @@ export class SimulationRuntime {
           ? pos.remainingQuantity
           : pos.remainingQuantity * ratio;
     const isPartial = ratio < 0.999 && pos.remainingQuantity - closeQty > 1e-9;
+    if (reason === 'TakeProfit1') {
+      pos.exitPlan.tp1Hit = true;
+      if (isPartial) {
+        pos.exchangeListId = undefined;
+      }
+    }
     this.settleClosedExit({
       pair,
       pos,
@@ -1277,6 +1300,7 @@ export class SimulationRuntime {
       const pending: PendingOrder = {
         id: `${input.symbol}-lim-${nowMs}`,
         symbol: input.symbol,
+        venue: this.config.trading.venue,
         side: input.side,
         orderType: input.orderType,
         orderMethod: input.orderType === 'LIMIT MAKER' ? 'LIMIT_MAKER' : 'LIMIT',
@@ -1486,6 +1510,10 @@ export class SimulationRuntime {
   }
 
   resetCircuitBreaker(): void {
+    if (!this.config.features.circuitBreaker) {
+      this.pushLog('warn', 'Circuit Breaker reset ignored because Circuit Breaker is toggled off');
+      return;
+    }
     this.riskManager.resetCircuitBreaker();
     this.snapshot.risk = this.riskManager.status();
     this.pushLog('info', 'Circuit Breaker reset by operator — engine returned to Active');
@@ -1515,6 +1543,7 @@ export class SimulationRuntime {
    * Deterministic simulation step advancing all pairs by 1 bar (or applying an external live candle).
    */
   stepBar(nowMs = Date.now(), externalBar?: { symbol: string; candle: Candle }): void {
+    this.lastClockMs = nowMs;
     this.snapshot.tickCount += 1;
     if (this.snapshot.transport.mode === 'WsPrimary') {
       this.snapshot.transport.lastWsAgeMs = 35 + (this.snapshot.tickCount % 55);
@@ -1623,7 +1652,9 @@ export class SimulationRuntime {
       // 0. Check resting LIMIT / LIMIT_MAKER orders for Paper fills
       if (this.snapshot.accountMode === 'Paper' && !pair.openPosition) {
         const matchIdx = this.snapshot.pendingOrders.findIndex((o) => {
-          if (o.symbol !== pair.symbol) return false;
+          if (o.symbol !== pair.symbol || (o.venue && o.venue !== this.config.trading.venue)) {
+            return false;
+          }
           return o.side === 'Long' ? nextCandle.low <= o.limitPrice : nextCandle.high >= o.limitPrice;
         });
         if (matchIdx !== -1) {
@@ -1655,6 +1686,7 @@ export class SimulationRuntime {
       if (pair.openPosition) {
         const pos = pair.openPosition;
         const atrVal = ind.atr ?? pos.exitPlan.riskDistanceR;
+        const prevTp1Hit = pos.exitPlan.tp1Hit;
         const action = managePositionTick(
           pos,
           nextCandle.close,
@@ -1664,6 +1696,10 @@ export class SimulationRuntime {
         );
 
         if (this.snapshot.accountMode === 'Live') {
+          if (action.type === 'PartialClose') {
+            // Do not mark TP1 hit until the exchange confirms the Live exit fill.
+            pos.exitPlan.tp1Hit = prevTp1Hit;
+          }
           if (
             (action.type === 'PartialClose' || action.type === 'FullClose') &&
             this.config.automation.autoCloseOnExit
@@ -1753,8 +1789,21 @@ export class SimulationRuntime {
     signalsDetected: number;
     dispatched: number;
   } {
+    this.lastClockMs = nowMs;
+    if (!this.config.features.automatedTrading) {
+      this.pushLog('warn', 'Auto-scan skipped: Automated Trading Engine is disabled in Feature Toggles.');
+      return { scannedPairs: 0, signalsDetected: 0, dispatched: 0 };
+    }
     if (!this.config.features.signalGenerator) {
       this.pushLog('warn', 'Auto-scan skipped: Signal Generator is disabled in Feature Toggles.');
+      return { scannedPairs: 0, signalsDetected: 0, dispatched: 0 };
+    }
+    const activeVenue = this.config.trading.venue;
+    if (
+      (activeVenue === 'Spot' && !this.config.features.spotMarket) ||
+      (activeVenue === 'Futures' && !this.config.features.futuresMarket)
+    ) {
+      this.pushLog('warn', `Auto-scan skipped: ${activeVenue} market venue is disabled in Feature Toggles.`);
       return { scannedPairs: 0, signalsDetected: 0, dispatched: 0 };
     }
     const sessionCheck = evaluateUtcSessionWindows(
@@ -1912,8 +1961,16 @@ export class SimulationRuntime {
       return { signalDetected: true, dispatched: false };
     }
 
+    if (quantSizing.notionalUsdt < 10) {
+      this.pushLog(
+        'warn',
+        `[SIZING] Skipped ${sig.symbol} ${sig.side}: computed notional ($${quantSizing.notionalUsdt.toFixed(2)}) below $10 minimum`
+      );
+      return { signalDetected: true, dispatched: false };
+    }
+
     const desiredNotional = Math.min(
-      Math.max(10, quantSizing.notionalUsdt),
+      quantSizing.notionalUsdt,
       Math.max(0, this.snapshot.availableBalanceUsdt * leverage)
     );
     if (desiredNotional < 10) {
@@ -2000,6 +2057,7 @@ export class SimulationRuntime {
       const pending: PendingOrder = {
         id: `${sig.symbol}-auto-lim-${nowMs}`,
         symbol: sig.symbol,
+        venue: this.config.trading.venue,
         side: sig.side,
         orderType,
         orderMethod: auto.orderMethod,

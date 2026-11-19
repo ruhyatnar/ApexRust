@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { formatEnvValue, parseEnv, renderEnv } from './envFile.mjs';
+import { detectZeroTrustMeshIps } from './paths.mjs';
 
 test('parseEnv handles quotes, exports, comments, and roundtrips formatEnvValue', () => {
   const parsed = parseEnv(`
@@ -21,6 +22,8 @@ INLINE=val # comment
   assert.equal(formatEnvValue('has space'), '"has space"');
   assert.equal(formatEnvValue('has#hash'), '"has#hash"');
   assert.equal(formatEnvValue('a\rb'), '"a\\rb"');
+  const winRoundtrip = parseEnv(`WIN_PATH=${formatEnvValue('C:\\new\\folder\\temp')}`);
+  assert.equal(winRoundtrip.WIN_PATH, 'C:\\new\\folder\\temp');
 });
 
 test('renderEnv preserves template comments and only uncomments non-empty commented keys', () => {
@@ -52,4 +55,41 @@ test('renderEnv preserves template comments and only uncomments non-empty commen
   assert.equal(reParsed.PORT, '3100');
   assert.equal(reParsed.BINANCE_API_KEY, 'my key');
   assert.equal(reParsed.APEXRUST_PROXY_TOKEN, undefined);
+});
+
+test('detectZeroTrustMeshIps recognizes Cloudflare One WARP and CGNAT interfaces across OS networkInterfaces shapes', () => {
+  const detected = detectZeroTrustMeshIps({
+    lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+    eth0: [{ address: '198.51.100.22', family: 4, internal: false }],
+    CloudflareWARP: [{ address: '100.96.14.8', family: 'IPv4', internal: false }],
+    tailscale0: [{ address: '100.88.2.5', family: 4, internal: false }],
+  });
+
+  assert.equal(detected.length, 2);
+  assert.equal(detected[0].ip, '100.96.14.8');
+  assert.match(detected[0].kind, /Cloudflare One/);
+  assert.equal(detected[1].ip, '100.88.2.5');
+});
+
+test('renderEnv uncomments VPS authority and vault settings from commented .env.example defaults', () => {
+  const template = [
+    'HOST=127.0.0.1',
+    '# APEXRUST_ENGINE_AUTHORITY=browser',
+    '# APEXRUST_PERSIST_VAULT=false',
+    '# APEXRUST_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000',
+    '',
+  ].join('\n');
+
+  const rendered = renderEnv(template, {
+    HOST: '100.96.0.2',
+    APEXRUST_ENGINE_AUTHORITY: 'daemon',
+    APEXRUST_PERSIST_VAULT: 'true',
+    APEXRUST_ALLOWED_ORIGINS: 'http://localhost:3000',
+  });
+
+  const parsed = parseEnv(rendered);
+  assert.equal(parsed.HOST, '100.96.0.2');
+  assert.equal(parsed.APEXRUST_ENGINE_AUTHORITY, 'daemon');
+  assert.equal(parsed.APEXRUST_PERSIST_VAULT, 'true');
+  assert.equal(parsed.APEXRUST_ALLOWED_ORIGINS, 'http://localhost:3000');
 });

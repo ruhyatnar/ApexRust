@@ -10,6 +10,9 @@ bot-engine = { path = "../bot-engine" }
 bot-web = { path = "../bot-web" }
 tokio = { workspace = true }
 axum = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

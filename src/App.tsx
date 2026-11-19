@@ -1,11 +1,13 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart2,
   Bot,
   ChevronDown,
   ClipboardList,
+  Cloud,
   Code2,
   KeyRound,
+  Laptop,
   Menu,
   Pause,
   Play,
@@ -19,10 +21,23 @@ import { LiveCredentialsView } from './components/LiveCredentialsView';
 import { MarketsView, SignalsView } from './components/MarketsAndSignalsView';
 import { OrderHistoryView } from './components/OrderHistoryView';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
+import { RemoteEngineView, type ServerConnectionHealth } from './components/RemoteEngineView';
 import { RiskCircuitBreakerView } from './components/RiskCircuitBreakerView';
 import { RustCodebaseView } from './components/RustCodebaseView';
 import { StrategyConfigView } from './components/StrategyConfigView';
 import { TradingDeskView } from './components/TradingDeskView';
+import {
+  type ConnectionProfile,
+  apiFetch,
+  loadConnectionProfile,
+  setActiveConnectionProfile,
+  setLocalAccessToken,
+} from './engine/apiClient';
+import {
+  mapRustEngineSnapshot,
+  mergeRemoteVpsSnapshot,
+  type RemoteVpsEngineSnapshot,
+} from './engine/engineSnapshotAdapter';
 import {
   clearPersistedBotConfig,
   loadPersistedBotConfig,
@@ -55,7 +70,7 @@ import type {
 } from './engine/types';
 
 type ActiveSection = 'trade' | 'markets' | 'orders' | 'bot' | 'signal' | 'rust';
-type BotSubTab = 'strategy' | 'features' | 'risk' | 'credentials' | 'git';
+type BotSubTab = 'strategy' | 'features' | 'risk' | 'credentials' | 'git' | 'vps';
 
 const NAV_ITEMS: Array<{
   id: ActiveSection;
@@ -169,6 +184,7 @@ export default function App() {
       ...liveRuntimeRef.current!.snapshot.executionHistory.map((r) => `Live:${r.id}`),
     ]);
   }
+  const inflightExecIdsRef = useRef<Set<string>>(new Set());
   const notifiedLiveFillIdsRef = useRef<Set<string> | null>(null);
   if (!notifiedLiveFillIdsRef.current) {
     notifiedLiveFillIdsRef.current = new Set(
@@ -240,8 +256,18 @@ export default function App() {
   activeVenueRef.current = activeVenue;
   const activeLeverageRef = useRef<number>(config.trading.leverage);
   activeLeverageRef.current = config.trading.leverage;
+  const configRef = useRef<BotConfig>(config);
+  configRef.current = config;
   const gitBackupTimerRef = useRef<number | null>(null);
   const pendingLiveDrainRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    return () => {
+      if (gitBackupTimerRef.current !== null) {
+        window.clearTimeout(gitBackupTimerRef.current);
+      }
+    };
+  }, []);
 
   const drainLiveIntents = useCallback(async () => {
     const rt = liveRuntimeRef.current;
@@ -264,6 +290,7 @@ export default function App() {
 
     const venue = activeVenueRef.current;
     const leverage = activeLeverageRef.current;
+    const cfg = configRef.current;
 
     inflightLiveIntentsRef.current = true;
     try {
@@ -274,13 +301,16 @@ export default function App() {
           }
           const pairBeforeExit = rt.snapshot.pairs.find((p) => p.symbol === intent.symbol);
           const posBeforeExit = pairBeforeExit?.openPosition;
+          // On Futures partial TP1, keep the protective SL algo bracket intact for the remaining runner.
+          const isFuturesPartialTp1 = venue === 'Futures' && intent.reason === 'TakeProfit1';
           if (
+            !isFuturesPartialTp1 &&
             posBeforeExit &&
             (posBeforeExit.exchangeListId != null ||
               (posBeforeExit.exchangeAlgoIds && posBeforeExit.exchangeAlgoIds.length > 0))
           ) {
             try {
-              await fetch('/api/live/cancel-open-brackets', {
+              await apiFetch('/api/live/cancel-open-brackets', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -295,7 +325,7 @@ export default function App() {
             }
           }
 
-          const resp = await fetch('/api/live/order', {
+          const resp = await apiFetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -349,6 +379,12 @@ export default function App() {
           }
         } else {
           // Automated ENTRY
+          if (connectionHealthRef.current?.engineAuthority === 'daemon') {
+            rt.reportLiveAutoRejected(
+              '☁️ 24/7 Auto-Trading runs on your Remote VPS Daemon — browser Live auto-entry skipped to prevent duplicate orders.'
+            );
+            continue;
+          }
           if (venue === 'Spot' && intent.binanceSide === 'SELL') {
             // Binance Spot API cannot open unhedged Short positions via spot SELL without inventory
             rt.reportLiveAutoRejected(
@@ -376,11 +412,12 @@ export default function App() {
           const tpPct = bracketTarget?.pctOffset ?? 2.5;
           const atrVal = pair?.indicators.atr ?? refPx * 0.01;
           const slDist =
-            intent.input?.stopLossMode === 'ATR' && config.features.atrDynamicExits
-              ? atrVal * config.exits.atrSlMultiplier
+            intent.input?.stopLossMode === 'ATR' && cfg.features.atrDynamicExits
+              ? atrVal * cfg.exits.atrSlMultiplier
               : refPx * ((intent.input?.stopLossPct ?? 1.5) / 100);
+          const tpAllowed = Boolean(cfg.features.takeProfitLadder);
           const tpPx =
-            binanceType === 'OCO' && refPx > 0
+            binanceType === 'OCO' && refPx > 0 && tpAllowed
               ? refPx * (1 + (isLong ? 1 : -1) * (tpPct / 100))
               : undefined;
           const slPx =
@@ -390,7 +427,7 @@ export default function App() {
                 : refPx + slDist
               : undefined;
 
-          const resp = await fetch('/api/live/order', {
+          const resp = await apiFetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -415,6 +452,7 @@ export default function App() {
             executedQty?: number;
             avgPrice?: number;
             commission?: number;
+            commissionAsset?: string;
             ocoOrderListId?: number;
             algoOrderIds?: string[];
             ocoWarning?: string;
@@ -438,6 +476,7 @@ export default function App() {
                 executedQty: data.executedQty,
                 avgPrice: data.avgPrice,
                 commission: data.commission,
+                commissionAsset: data.commissionAsset,
                 orderId: data.orderId,
                 ocoOrderListId: data.ocoOrderListId,
                 algoOrderIds: data.algoOrderIds,
@@ -462,24 +501,22 @@ export default function App() {
         void drainLiveIntents();
       }
     }
-  }, [syncSnapshots, config.exits.atrSlMultiplier, config.features.atrDynamicExits]);
+  }, [syncSnapshots]);
 
   const applyLiveStatusToRuntime = useCallback(
     (status: LiveCredentialStatus) => {
       setLiveStatus(status);
       if (!hydratedServerVaultRef.current) {
         hydratedServerVaultRef.current = true;
-        setConfig((prev) => {
-          const nextVenue = status.venue ?? prev.trading.venue;
-          const nextLev = status.leverage ?? prev.trading.leverage;
-          const nextMargin = status.marginType ?? prev.trading.marginType;
-          if (
-            nextVenue === prev.trading.venue &&
-            nextLev === prev.trading.leverage &&
-            nextMargin === prev.trading.marginType
-          ) {
-            return prev;
-          }
+        const prev = configRef.current;
+        const nextVenue = status.venue ?? prev.trading.venue;
+        const nextLev = status.leverage ?? prev.trading.leverage;
+        const nextMargin = status.marginType ?? prev.trading.marginType;
+        if (
+          nextVenue !== prev.trading.venue ||
+          nextLev !== prev.trading.leverage ||
+          nextMargin !== prev.trading.marginType
+        ) {
           const updated: BotConfig = {
             ...prev,
             trading: {
@@ -489,10 +526,10 @@ export default function App() {
               marginType: nextMargin,
             },
           };
+          setConfig(updated);
           paperRuntimeRef.current?.updateConfig(updated);
           liveRuntimeRef.current?.updateConfig(updated);
-          return updated;
-        });
+        }
       }
       if (liveRuntimeRef.current) {
         liveRuntimeRef.current.setEnvironment(status.environment);
@@ -508,10 +545,184 @@ export default function App() {
     [syncSnapshots]
   );
 
+  const [connectionProfile, setConnectionProfile] = useState<ConnectionProfile>(() =>
+    loadConnectionProfile()
+  );
+  const [connectionHealth, setConnectionHealth] = useState<ServerConnectionHealth | null>(null);
+  const [remoteVpsSnapshot, setRemoteVpsSnapshot] = useState<RemoteVpsEngineSnapshot | null>(null);
+  const [localTokenDraft, setLocalTokenDraft] = useState('');
+  const connectionHealthRef = useRef<ServerConnectionHealth | null>(null);
+  connectionHealthRef.current = connectionHealth;
+  const sharedProfileCheckedRef = useRef(false);
+
+  const serverTargetLabel =
+    connectionProfile.kind === 'remote'
+      ? `☁️ Remote VPS (${connectionProfile.name})`
+      : '🖥️ This Computer';
+
+  const handleChangeConnectionProfile = useCallback((next: ConnectionProfile) => {
+    hydratedServerVaultRef.current = false;
+    setRemoteVpsSnapshot(null);
+    setActiveConnectionProfile(next);
+    setConnectionProfile(next);
+  }, []);
+
+  const refreshConnectionHealth = useCallback(async () => {
+    const started = Date.now();
+    try {
+      const resp = await apiFetch('/api/connection/info');
+      const latencyMs = Math.max(1, Date.now() - started);
+      if (resp.status === 401 || resp.status === 429) {
+        const errData = (await resp.json().catch(() => ({}))) as { error?: string };
+        setConnectionHealth({
+          checkedAtMs: Date.now(),
+          reachable: true,
+          latencyMs,
+          authOk: false,
+          authRequired: true,
+          engineAuthority: 'browser',
+          engineReachable: false,
+          engineRunning: null,
+          environment: 'Testnet',
+          venue: 'Spot',
+          zeroTrustUser: null,
+          apiVersion: '2.0.0',
+          error: errData.error || 'Access Token rejected (401)',
+        });
+        return;
+      }
+      if (!resp.ok) {
+        setConnectionHealth({
+          checkedAtMs: Date.now(),
+          reachable: false,
+          latencyMs: null,
+          authOk: false,
+          authRequired: false,
+          engineAuthority: 'browser',
+          engineReachable: false,
+          engineRunning: null,
+          environment: 'Testnet',
+          venue: 'Spot',
+          zeroTrustUser: null,
+          apiVersion: '2.0.0',
+          error: `HTTP ${resp.status}`,
+        });
+        return;
+      }
+      const data = (await resp.json()) as {
+        authRequired?: boolean;
+        engineAuthority?: 'browser' | 'daemon';
+        engineReachable?: boolean;
+        engineRunning?: boolean | null;
+        environment?: 'Testnet' | 'Production';
+        venue?: 'Spot' | 'Futures';
+        zeroTrustUser?: string | null;
+        apiVersion?: string;
+      };
+      setConnectionHealth({
+        checkedAtMs: Date.now(),
+        reachable: true,
+        latencyMs,
+        authOk: true,
+        authRequired: Boolean(data.authRequired),
+        engineAuthority: data.engineAuthority === 'daemon' ? 'daemon' : 'browser',
+        engineReachable: Boolean(data.engineReachable),
+        engineRunning: typeof data.engineRunning === 'boolean' ? data.engineRunning : null,
+        environment: data.environment === 'Production' ? 'Production' : 'Testnet',
+        venue: data.venue === 'Futures' ? 'Futures' : 'Spot',
+        zeroTrustUser: data.zeroTrustUser ?? null,
+        apiVersion: String(data.apiVersion ?? '2.0.0'),
+      });
+    } catch (err) {
+      setConnectionHealth({
+        checkedAtMs: Date.now(),
+        reachable: false,
+        latencyMs: null,
+        authOk: false,
+        authRequired: false,
+        engineAuthority: 'browser',
+        engineReachable: false,
+        engineRunning: null,
+        environment: 'Testnet',
+        venue: 'Spot',
+        zeroTrustUser: null,
+        apiVersion: '2.0.0',
+        error: err instanceof Error ? err.message : 'Unable to reach server',
+      });
+    }
+  }, []);
+
+  // Hydrate shared .apexrust/remote-profile.json once at boot if CLI/installer configured a Remote VPS profile
+  useEffect(() => {
+    if (sharedProfileCheckedRef.current) return;
+    sharedProfileCheckedRef.current = true;
+    try {
+      if (window.localStorage.getItem('apexrust_connection_profile_v1')) return;
+    } catch {
+      // Ignore storage access errors
+    }
+    if (connectionProfile.kind === 'remote') return;
+    apiFetch('/api/remote-profile')
+      .then((r) => (r.ok ? r.json() : null))
+      .then(
+        (
+          data: {
+            ok?: boolean;
+            profile?: { activeMode?: string; name?: string; baseUrl?: string; token?: string };
+          } | null
+        ) => {
+          if (
+            data?.ok &&
+            data.profile?.activeMode === 'remote' &&
+            typeof data.profile.baseUrl === 'string' &&
+            data.profile.baseUrl.trim()
+          ) {
+            handleChangeConnectionProfile({
+              kind: 'remote',
+              name: (data.profile.name || 'Remote VPS').trim(),
+              baseUrl: data.profile.baseUrl.trim(),
+              token: data.profile.token ?? '',
+              rememberToken: Boolean(data.profile.token),
+            });
+          }
+        }
+      )
+      .catch(() => undefined);
+  }, [connectionProfile.kind, handleChangeConnectionProfile]);
+
+  useEffect(() => {
+    void refreshConnectionHealth();
+    const timer = window.setInterval(() => {
+      void refreshConnectionHealth();
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  }, [refreshConnectionHealth, connectionProfile]);
+
+  // Acquire/renew single-browser Live Lease when browser is the execution authority
+  useEffect(() => {
+    if (
+      accountMode !== 'Live' ||
+      !liveStatus.configured ||
+      connectionHealth?.engineAuthority === 'daemon'
+    ) {
+      return;
+    }
+    const renewLease = () => {
+      void apiFetch('/api/live/lease', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      }).catch(() => undefined);
+    };
+    renewLease();
+    const timer = window.setInterval(renewLease, 10_000);
+    return () => window.clearInterval(timer);
+  }, [accountMode, liveStatus.configured, connectionHealth?.engineAuthority, connectionProfile]);
+
   // Hydrate server-side Live Credentials Vault status (secrets never leave server)
   useEffect(() => {
     let active = true;
-    fetch('/api/live/config')
+    apiFetch('/api/live/config')
       .then((r) => (r.ok ? r.json() : null))
       .then((data: LiveCredentialStatus | null) => {
         if (active && data) {
@@ -524,7 +735,52 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [applyLiveStatusToRuntime]);
+  }, [applyLiveStatusToRuntime, connectionProfile, connectionHealth?.authOk]);
+
+  const isRemoteVpsDaemon =
+    connectionProfile.kind === 'remote' ||
+    (connectionHealth?.engineAuthority === 'daemon' &&
+      Boolean(connectionHealth?.engineReachable));
+
+  const refreshRemoteVpsSnapshot = useCallback(async () => {
+    if (accountMode !== 'Live' || !isRemoteVpsDaemon) return;
+    try {
+      const resp = await apiFetch('/api/engine/snapshot');
+      if (!resp.ok) return;
+      const data = (await resp.json()) as { ok?: boolean; snapshot?: unknown };
+      if (data.ok && data.snapshot) {
+        setRemoteVpsSnapshot(mapRustEngineSnapshot(data.snapshot));
+      }
+    } catch {
+      // Transient VPS snapshot fetch error handled by health pill
+    }
+  }, [accountMode, isRemoteVpsDaemon]);
+
+  useEffect(() => {
+    if (accountMode !== 'Live' || !isRemoteVpsDaemon) {
+      setRemoteVpsSnapshot(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const resp = await apiFetch('/api/engine/snapshot');
+        if (!resp.ok || cancelled) return;
+        const data = (await resp.json()) as { ok?: boolean; snapshot?: unknown };
+        if (data.ok && data.snapshot && !cancelled) {
+          setRemoteVpsSnapshot(mapRustEngineSnapshot(data.snapshot));
+        }
+      } catch {
+        // Ignore transient offline error; retry on next poll
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [accountMode, isRemoteVpsDaemon, connectionProfile]);
 
   // Isolated Paper Simulation auto-tick loop
   useEffect(() => {
@@ -575,7 +831,7 @@ export default function App() {
       for (const symbol of config.trading.pairs) {
         if (cancelled) return;
         try {
-          const resp = await fetch(
+          const resp = await apiFetch(
             `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(config.trading.timeframe)}&venue=${encodeURIComponent(config.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}&limit=3`
           );
           if (!resp.ok) continue;
@@ -743,23 +999,29 @@ export default function App() {
     let cancelled = false;
     const fetchTicker = async () => {
       try {
-        const resp = await fetch(
+        const resp = await apiFetch(
           `/api/market/ticker?symbol=${encodeURIComponent(selectedSymbol)}&venue=${encodeURIComponent(config.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}`
         );
         if (!resp.ok || cancelled) return;
         const data = (await resp.json()) as {
           ok?: boolean;
           symbol?: string;
-          bid?: number;
-          ask?: number;
-          price?: number;
+          bid?: number | string;
+          ask?: number | string;
+          price?: number | string;
+          bidPrice?: number | string;
+          askPrice?: number | string;
+          lastPrice?: number | string;
         };
-        if (data.ok && data.price && data.price > 0 && !cancelled) {
+        const lastPx = Number(data.lastPrice ?? data.price ?? 0);
+        const bidPx = Number(data.bidPrice ?? data.bid ?? 0);
+        const askPx = Number(data.askPrice ?? data.ask ?? 0);
+        if (data.ok && lastPx > 0 && !cancelled) {
           setLiveTicker({
             symbol: data.symbol ?? selectedSymbol,
-            bid: data.bid && data.bid > 0 ? data.bid : data.price,
-            ask: data.ask && data.ask > 0 ? data.ask : data.price,
-            last: data.price,
+            bid: bidPx > 0 ? bidPx : lastPx,
+            ask: askPx > 0 ? askPx : lastPx,
+            last: lastPx,
           });
         }
       } catch {
@@ -793,23 +1055,36 @@ export default function App() {
       const rt = liveRuntimeRef.current;
       if (!rt || cancelled) return;
       try {
-        const resp = await fetch(
-          `/api/live/open-orders?venue=${encodeURIComponent(config.trading.venue)}`
+        const venues = Array.from(
+          new Set(rt.snapshot.pendingOrders.map((o) => o.venue ?? configRef.current.trading.venue))
         );
-        if (!resp.ok || cancelled) return;
-        const data = (await resp.json()) as {
-          ok?: boolean;
-          orders?: Array<{ orderId?: number | string; symbol?: string }>;
-        };
-        if (!data.ok || !Array.isArray(data.orders) || cancelled) return;
-        const openIds = new Set(data.orders.map((o) => String(o.orderId ?? '')));
+        const openIdsByVenue = new Map<ExchangeVenue, Set<string>>();
+        for (const venue of venues) {
+          const resp = await apiFetch(
+            `/api/live/open-orders?venue=${encodeURIComponent(venue)}`
+          );
+          if (!resp.ok || cancelled) continue;
+          const data = (await resp.json()) as {
+            ok?: boolean;
+            orders?: Array<{ orderId?: number | string; symbol?: string }>;
+          };
+          if (data.ok && Array.isArray(data.orders)) {
+            openIdsByVenue.set(
+              venue,
+              new Set(data.orders.map((o) => String(o.orderId ?? '')))
+            );
+          }
+        }
+        if (cancelled) return;
         let changed = false;
         const currentPending = [...rt.snapshot.pendingOrders];
         for (const pending of currentPending) {
-          if (pending.exchangeOrderId && !openIds.has(pending.exchangeOrderId)) {
+          const pendVenue = pending.venue ?? configRef.current.trading.venue;
+          const openIds = openIdsByVenue.get(pendVenue);
+          if (openIds && pending.exchangeOrderId && !openIds.has(pending.exchangeOrderId)) {
             try {
-              const statusResp = await fetch(
-                `/api/live/order-status?symbol=${encodeURIComponent(pending.symbol)}&orderId=${encodeURIComponent(pending.exchangeOrderId)}&venue=${encodeURIComponent(config.trading.venue)}`
+              const statusResp = await apiFetch(
+                `/api/live/order-status?symbol=${encodeURIComponent(pending.symbol)}&orderId=${encodeURIComponent(pending.exchangeOrderId)}&venue=${encodeURIComponent(pendVenue)}`
               );
               if (!statusResp.ok) continue;
               const statusData = (await statusResp.json()) as {
@@ -830,7 +1105,8 @@ export default function App() {
               } else if (
                 statusData.status === 'CANCELED' ||
                 statusData.status === 'REJECTED' ||
-                statusData.status === 'EXPIRED'
+                statusData.status === 'EXPIRED' ||
+                statusData.status === 'EXPIRED_IN_MATCH'
               ) {
                 rt.cancelPendingOrder(pending.id);
                 changed = true;
@@ -883,6 +1159,7 @@ export default function App() {
   useEffect(() => {
     const seen = syncedExecIdsRef.current;
     if (!seen) return;
+    const inflight = inflightExecIdsRef.current;
 
     const toOrderLog = (rec: BinanceExecutionRecord): OrderExecutionLog => ({
       id: `client-${rec.accountMode.toLowerCase()}-${rec.id}`,
@@ -922,17 +1199,20 @@ export default function App() {
     });
 
     const newLogs: OrderExecutionLog[] = [];
+    const keysToMark: string[] = [];
     for (const rec of paperSnapshot.executionHistory) {
       const key = `Paper:${rec.id}`;
-      if (!seen.has(key)) {
-        seen.add(key);
+      if (!seen.has(key) && !inflight.has(key)) {
+        inflight.add(key);
+        keysToMark.push(key);
         newLogs.push(toOrderLog(rec));
       }
     }
     for (const rec of liveSnapshot.executionHistory) {
       const key = `Live:${rec.id}`;
-      if (!seen.has(key)) {
-        seen.add(key);
+      if (!seen.has(key) && !inflight.has(key)) {
+        inflight.add(key);
+        keysToMark.push(key);
         newLogs.push(toOrderLog(rec));
       }
     }
@@ -949,18 +1229,26 @@ export default function App() {
 
     if (newLogs.length === 0) return;
 
-    void fetch('/api/orders/history', {
+    void apiFetch('/api/orders/history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ logs: newLogs }),
     })
       .then((res) => {
         if (res.ok) {
+          for (const key of keysToMark) {
+            seen.add(key);
+          }
           setOrderLogRefreshKey((k) => k + 1);
         }
       })
       .catch(() => {
         // Ignore transient offline sync failure
+      })
+      .finally(() => {
+        for (const key of keysToMark) {
+          inflight.delete(key);
+        }
       });
   }, [
     paperSnapshot.executionHistory,
@@ -987,7 +1275,7 @@ export default function App() {
         window.clearTimeout(gitBackupTimerRef.current);
       }
       gitBackupTimerRef.current = window.setTimeout(() => {
-        void fetch('/api/git/backup', {
+        void apiFetch('/api/git/backup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1023,7 +1311,7 @@ export default function App() {
     paperRuntimeRef.current?.setVenue(venue);
     liveRuntimeRef.current?.setVenue(venue);
     handleUpdateConfig(nextConfig);
-    void fetch('/api/live/config', {
+    void apiFetch('/api/live/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ venue }),
@@ -1036,6 +1324,7 @@ export default function App() {
   };
 
   const handleUpdateFuturesSettings = (leverage: number, marginType: MarginType) => {
+    if (!config.features.futuresMarket) return;
     const safeLeverage = Math.min(20, Math.max(1, leverage));
     const nextConfig: BotConfig = {
       ...config,
@@ -1046,7 +1335,7 @@ export default function App() {
       },
     };
     handleUpdateConfig(nextConfig);
-    void fetch('/api/live/config', {
+    void apiFetch('/api/live/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ leverage: safeLeverage, marginType }),
@@ -1059,6 +1348,8 @@ export default function App() {
   };
 
   const handleToggleAutomation = () => {
+    // Master toggle lives in Feature Toggles; prevent re-enabling here when toggled OFF.
+    if (!config.features.automatedTrading) return;
     const nextEnabled = !config.automation.enabled;
     const next: BotConfig = {
       ...config,
@@ -1075,6 +1366,13 @@ export default function App() {
   };
 
   const handleRunAutoScan = () => {
+    if (!config.features.automatedTrading || !config.features.signalGenerator) return;
+    if (
+      (config.trading.venue === 'Spot' && !config.features.spotMarket) ||
+      (config.trading.venue === 'Futures' && !config.features.futuresMarket)
+    ) {
+      return;
+    }
     const rt = activeRuntimeRef.current;
     if (!rt) return;
     rt.runAutoScanNow(Date.now());
@@ -1105,7 +1403,34 @@ export default function App() {
     syncSnapshots();
   };
 
+  const isControllingVpsBot =
+    accountMode === 'Live' &&
+    isRemoteVpsDaemon &&
+    Boolean(connectionHealth?.engineReachable);
+
+  const vpsBotRunning = connectionHealth?.engineRunning ?? true;
+
+  const displaySnapshot = useMemo(
+    () =>
+      accountMode === 'Live' && isRemoteVpsDaemon
+        ? mergeRemoteVpsSnapshot(snapshot, remoteVpsSnapshot, config.trading.leverage)
+        : snapshot,
+    [accountMode, isRemoteVpsDaemon, snapshot, remoteVpsSnapshot, config.trading.leverage]
+  );
+
   const handleToggleRunning = () => {
+    if (isControllingVpsBot) {
+      const nextAction = vpsBotRunning ? 'pause' : 'resume';
+      const requestId = `hdr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      void apiFetch('/api/engine/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: nextAction, request_id: requestId }),
+      })
+        .then(() => refreshConnectionHealth())
+        .catch(() => undefined);
+      return;
+    }
     const rt = activeRuntimeRef.current;
     if (!rt) return;
     if (accountMode === 'Live' && !snapshot.running && (!liveStatus.configured || !liveStatus.armedForLiveOrders)) {
@@ -1132,6 +1457,13 @@ export default function App() {
       // Live runtime never executes synthetic simulated ticks; keep BinanceLive feed
       return;
     }
+    if (
+      source === 'BinanceLive' &&
+      !config.features.wsPrimaryFeed &&
+      !config.features.restFallback
+    ) {
+      return;
+    }
     rt.snapshot.transport.feedSource = source;
     if (source === 'Simulated') {
       rt.setTransportMode('WsPrimary', 'Switched to deterministic local simulation');
@@ -1147,10 +1479,14 @@ export default function App() {
   const handleEnvironmentToggle = () => {
     const nextEnv =
       snapshot.transport.environment === 'Testnet' ? 'Production' : 'Testnet';
-    paperRuntimeRef.current?.setEnvironment(nextEnv);
+    if (accountMode === 'Paper') {
+      paperRuntimeRef.current?.setEnvironment(nextEnv);
+      syncSnapshots();
+      return;
+    }
     liveRuntimeRef.current?.setEnvironment(nextEnv);
     syncSnapshots();
-    void fetch('/api/live/config', {
+    void apiFetch('/api/live/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ environment: nextEnv }),
@@ -1182,19 +1518,7 @@ export default function App() {
     }
 
     if (accountMode === 'Live') {
-      if (!liveStatus.configured) {
-        return {
-          ok: false,
-          reason: 'Live credentials not configured. Open Bot -> Live Credentials first.',
-        };
-      }
-      if (!liveStatus.armedForLiveOrders) {
-        return {
-          ok: false,
-          reason: 'Live execution is disarmed. Arm Live Order Execution in Live Credentials first.',
-        };
-      }
-      if (venue === 'Spot' && input.side === 'Short') {
+      if (venue === 'Spot' && input.side === 'Short' && !input.reduceOnly) {
         return {
           ok: false,
           reason: 'Live Short opening requires USD-M Futures. Switch venue to Futures first.',
@@ -1223,18 +1547,13 @@ export default function App() {
           : refPx * (Math.max(0.2, input.stopLossPct) / 100);
       const riskSlPx = refPx > 0 ? (isLong ? refPx - slDist : refPx + slDist) : 0;
 
-      const authCheck = rt.authorizeManualEntry(input.symbol, refPx, riskSlPx, Date.now());
-      if (!authCheck.ok) {
-        return authCheck;
-      }
-
       const selectedTarget =
         venue === 'Futures' && input.targets.length > 1
           ? input.targets[input.targets.length - 1]
           : input.targets[0];
       const primaryTpPct = selectedTarget?.pctOffset ?? 2.5;
       const tpPx =
-        binanceType === 'OCO' && refPx > 0
+        binanceType === 'OCO' && refPx > 0 && config.features.takeProfitLadder
           ? refPx * (1 + (isLong ? 1 : -1) * (primaryTpPct / 100))
           : undefined;
       const slPx =
@@ -1242,8 +1561,76 @@ export default function App() {
           ? riskSlPx
           : undefined;
 
+      // When 24/7 Remote VPS Daemon is active, route manual orders (entries, OCOs, and reduceOnly closes) directly to it.
+      if (isRemoteVpsDaemon) {
+        try {
+          const requestId = `ticket-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const vpsMethod =
+            binanceType === 'OCO'
+              ? 'OCO'
+              : binanceType === 'LIMIT_MAKER'
+                ? 'LIMIT_MAKER'
+                : binanceType === 'LIMIT'
+                  ? 'LIMIT'
+                  : 'MARKET';
+          const vpsResp = await apiFetch('/api/engine/control', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'manual_order',
+              symbol: input.symbol,
+              side: isLong ? 'long' : 'short',
+              notional_usdt: input.usdtAmount,
+              order_method: vpsMethod,
+              limit_price: input.limitPrice,
+              take_profit_price: tpPx,
+              stop_loss_price: slPx,
+              reduce_only: Boolean(input.reduceOnly),
+              request_id: requestId,
+            }),
+          });
+          const vpsData = (await vpsResp.json()) as { accepted?: boolean; error?: string };
+          if (!vpsResp.ok || vpsData.accepted === false) {
+            return {
+              ok: false,
+              reason: vpsData.error ?? '24/7 VPS Bot rejected manual order',
+            };
+          }
+          await Promise.all([refreshConnectionHealth(), refreshRemoteVpsSnapshot()]);
+          return {
+            ok: true,
+            warning: 'Order dispatched to 24/7 Remote VPS Bot (ATR Break-Even & Trailing Stop managed 24/7 on VPS).',
+          };
+        } catch (err) {
+          return {
+            ok: false,
+            reason: err instanceof Error ? err.message : 'Unable to reach 24/7 VPS Bot',
+          };
+        }
+      }
+
+      if (!liveStatus.configured) {
+        return {
+          ok: false,
+          reason: 'Live credentials not configured. Open Bot -> Live Credentials first.',
+        };
+      }
+      if (!liveStatus.armedForLiveOrders) {
+        return {
+          ok: false,
+          reason: 'Live execution is disarmed. Arm Live Order Execution in Live Credentials first.',
+        };
+      }
+
+      if (!input.reduceOnly) {
+        const authCheck = rt.authorizeManualEntry(input.symbol, refPx, riskSlPx, Date.now());
+        if (!authCheck.ok) {
+          return authCheck;
+        }
+      }
+
       try {
-        const resp = await fetch('/api/live/order', {
+        const resp = await apiFetch('/api/live/order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1271,6 +1658,7 @@ export default function App() {
           executedQty?: number;
           avgPrice?: number;
           commission?: number;
+          commissionAsset?: string;
           ocoOrderListId?: number;
           algoOrderIds?: string[];
           ocoWarning?: string;
@@ -1295,6 +1683,7 @@ export default function App() {
               executedQty: data.executedQty,
               avgPrice: data.avgPrice,
               commission: data.commission,
+              commissionAsset: data.commissionAsset,
               orderId: data.orderId,
               ocoOrderListId: data.ocoOrderListId,
               algoOrderIds: data.algoOrderIds,
@@ -1319,10 +1708,39 @@ export default function App() {
     return res;
   };
 
+  const dispatchVpsControl = async (payload: Record<string, unknown>) => {
+    const requestId = `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const resp = await apiFetch('/api/engine/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, request_id: requestId }),
+      });
+      if (!resp.ok) {
+        const data = (await resp.json().catch(() => ({}))) as { error?: string };
+        liveRuntimeRef.current?.reportLiveAutoRejected(
+          data.error ?? `24/7 VPS control error (HTTP ${resp.status})`
+        );
+        syncSnapshots();
+      }
+      await Promise.all([refreshConnectionHealth(), refreshRemoteVpsSnapshot()]);
+    } catch (err) {
+      liveRuntimeRef.current?.reportLiveAutoRejected(
+        `Unable to reach 24/7 VPS Bot: ${err instanceof Error ? err.message : 'Network error'}`
+      );
+      syncSnapshots();
+    }
+  };
+
   const handleClosePosition = async (symbol: string) => {
     const rt = activeRuntimeRef.current;
     if (!rt) return;
     const venue = config.trading.venue;
+
+    if (accountMode === 'Live' && isRemoteVpsDaemon) {
+      await dispatchVpsControl({ action: 'close_position', symbol });
+      return;
+    }
 
     if (accountMode === 'Live') {
       const pair = rt.snapshot.pairs.find((p) => p.symbol === symbol);
@@ -1338,7 +1756,7 @@ export default function App() {
           (pos.exchangeAlgoIds && pos.exchangeAlgoIds.length > 0)
         ) {
           try {
-            await fetch('/api/live/cancel-open-brackets', {
+            await apiFetch('/api/live/cancel-open-brackets', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -1354,7 +1772,7 @@ export default function App() {
         }
         const closeSide = pos.side === 'Long' ? 'SELL' : 'BUY';
         try {
-          const resp = await fetch('/api/live/order', {
+          const resp = await apiFetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1418,6 +1836,11 @@ export default function App() {
     if (!rt) return;
     const venue = config.trading.venue;
 
+    if (accountMode === 'Live' && isRemoteVpsDaemon) {
+      await dispatchVpsControl({ action: 'flatten_all' });
+      return;
+    }
+
     if (accountMode === 'Live') {
       if (!liveStatus.configured || !liveStatus.armedForLiveOrders) {
         rt.reportLiveAutoRejected('Live Flatten All blocked: credentials not configured or disarmed.');
@@ -1434,7 +1857,7 @@ export default function App() {
           (pos.exchangeAlgoIds && pos.exchangeAlgoIds.length > 0)
         ) {
           try {
-            await fetch('/api/live/cancel-open-brackets', {
+            await apiFetch('/api/live/cancel-open-brackets', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -1449,7 +1872,7 @@ export default function App() {
           }
         }
         try {
-          const resp = await fetch('/api/live/order', {
+          const resp = await apiFetch('/api/live/order', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1506,6 +1929,10 @@ export default function App() {
     const rt = activeRuntimeRef.current;
     if (!rt) return;
     const ord = rt.snapshot.pendingOrders.find((o) => o.id === orderId);
+    if (accountMode === 'Live' && isRemoteVpsDaemon && ord) {
+      await dispatchVpsControl({ action: 'close_position', symbol: ord.symbol });
+      return;
+    }
     if (
       accountMode === 'Live' &&
       ord?.exchangeOrderId &&
@@ -1513,12 +1940,12 @@ export default function App() {
       liveStatus.armedForLiveOrders
     ) {
       try {
-        await fetch('/api/live/order', {
+        await apiFetch('/api/live/order', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             symbol: ord.symbol,
-            venue: config.trading.venue,
+            venue: ord.venue ?? config.trading.venue,
             orderId: ord.exchangeOrderId,
           }),
         });
@@ -1531,16 +1958,30 @@ export default function App() {
   };
 
   const handleTripCB = () => {
+    if (!config.features.circuitBreaker) return;
+    if (accountMode === 'Live' && isRemoteVpsDaemon) {
+      void dispatchVpsControl({
+        action: 'trip_cb',
+        reason: 'Manual operator circuit breaker activation',
+      });
+      return;
+    }
     activeRuntimeRef.current?.tripCircuitBreaker('Manual operator circuit breaker activation');
     syncSnapshots();
   };
 
   const handleResetCB = () => {
+    if (!config.features.circuitBreaker) return;
+    if (accountMode === 'Live' && isRemoteVpsDaemon) {
+      void dispatchVpsControl({ action: 'reset_cb' });
+      return;
+    }
     activeRuntimeRef.current?.resetCircuitBreaker();
     syncSnapshots();
   };
 
   const handleSimulateLoss = (symbol: string, lossUsdt: number) => {
+    if (!config.features.circuitBreaker) return;
     activeRuntimeRef.current?.simulateLossStress(symbol, lossUsdt);
     syncSnapshots();
   };
@@ -1569,7 +2010,7 @@ export default function App() {
     symbol: string
   ): Promise<{ ok: boolean; added: number; latencyMs?: number; message: string }> => {
     try {
-      const resp = await fetch(
+      const resp = await apiFetch(
         `/api/live/trades?symbol=${encodeURIComponent(symbol)}&venue=${encodeURIComponent(config.trading.venue)}&limit=25`
       );
       const data = (await resp.json()) as {
@@ -1622,7 +2063,7 @@ export default function App() {
     requirePreflightTestOrder: boolean;
   }): Promise<{ ok: boolean; message: string }> => {
     try {
-      const resp = await fetch('/api/live/config', {
+      const resp = await apiFetch('/api/live/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -1672,7 +2113,7 @@ export default function App() {
 
   const handleVerifyConnection = async (): Promise<{ ok: boolean; message: string }> => {
     try {
-      const resp = await fetch('/api/live/verify', { method: 'POST' });
+      const resp = await apiFetch('/api/live/verify', { method: 'POST' });
       const data = (await resp.json()) as {
         ok?: boolean;
         error?: string;
@@ -1700,7 +2141,7 @@ export default function App() {
 
   const handleRunPreflightOrder = async (): Promise<{ ok: boolean; message: string }> => {
     try {
-      const resp = await fetch('/api/live/order', {
+      const resp = await apiFetch('/api/live/order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1731,7 +2172,7 @@ export default function App() {
     confirmProduction: boolean
   ): Promise<{ ok: boolean; message: string }> => {
     try {
-      const resp = await fetch('/api/live/arm', {
+      const resp = await apiFetch('/api/live/arm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ armed: arm, confirmProduction }),
@@ -1761,7 +2202,7 @@ export default function App() {
 
   const handleRevokeCredentials = async (): Promise<void> => {
     try {
-      const resp = await fetch('/api/live/config', { method: 'DELETE' });
+      const resp = await apiFetch('/api/live/config', { method: 'DELETE' });
       const data = (await resp.json()) as { status?: LiveCredentialStatus };
       if (data.status) applyLiveStatusToRuntime(data.status);
     } catch {
@@ -1833,6 +2274,40 @@ export default function App() {
             <span className="text-slate-400">· {snapshot.transport.environment}</span>
             <ChevronDown className="h-3.5 w-3.5 text-slate-400" aria-hidden="true" />
           </button>
+
+          {/* Always-Visible Execution Target Pill (This Computer vs Remote VPS) */}
+          <button
+            type="button"
+            onClick={() => {
+              setSection('bot');
+              setBotSubTab('vps');
+            }}
+            aria-label="Configure execution server location (This Computer or Remote VPS)"
+            className={`hidden items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition sm:flex whitespace-nowrap ${
+              connectionProfile.kind === 'remote'
+                ? connectionHealth?.reachable === false
+                  ? 'border-rose-500/40 bg-rose-950/30 text-rose-200 hover:border-rose-400'
+                  : 'border-cyan-400/40 bg-cyan-950/30 text-cyan-200 hover:border-cyan-300'
+                : 'border-white/[0.08] bg-[#141820] text-slate-200 hover:border-[#7DF2AD]/40'
+            }`}
+          >
+            {connectionProfile.kind === 'remote' ? (
+              <>
+                <Cloud className="h-3.5 w-3.5 text-cyan-300" aria-hidden="true" />
+                <span>☁️ Remote VPS · {connectionProfile.name}</span>
+                {connectionHealth?.latencyMs != null && connectionHealth.reachable && (
+                  <span className="font-mono text-[11px] text-cyan-300/80">
+                    ({connectionHealth.latencyMs} ms)
+                  </span>
+                )}
+              </>
+            ) : (
+              <>
+                <Laptop className="h-3.5 w-3.5 text-[#7DF2AD]" aria-hidden="true" />
+                <span>🖥️ This Computer</span>
+              </>
+            )}
+          </button>
         </div>
 
         <div className="flex items-center gap-2.5 shrink-0">
@@ -1862,38 +2337,117 @@ export default function App() {
           <span className="hidden items-center gap-1.5 font-mono text-xs text-slate-400 xl:inline-flex whitespace-nowrap">
             <span
               className={`h-1.5 w-1.5 rounded-full ${
-                snapshot.transport.mode === 'WsPrimary' ? 'bg-[#7DF2AD]' : 'bg-amber-400'
+                displaySnapshot.transport.mode === 'WsPrimary' ? 'bg-[#7DF2AD]' : 'bg-amber-400'
               }`}
               aria-hidden="true"
             />
-            {snapshot.transport.mode} · {config.trading.pairs.length} Pairs
+            {displaySnapshot.transport.mode} · {config.trading.pairs.length} Pairs
           </span>
 
           <button
             type="button"
             onClick={handleToggleRunning}
             className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition whitespace-nowrap shrink-0 ${
-              snapshot.running
+              (isControllingVpsBot ? vpsBotRunning : displaySnapshot.running)
                 ? 'border border-white/[0.08] bg-[#141820] text-slate-100 hover:bg-[#1C222D]'
                 : accountMode === 'Live'
                   ? 'bg-amber-400 text-[#0B0F17] hover:bg-amber-300'
                   : 'bg-[#7DF2AD] text-[#0B0F17] hover:bg-[#95F7BD]'
             }`}
           >
-            {snapshot.running ? (
+            {(isControllingVpsBot ? vpsBotRunning : displaySnapshot.running) ? (
               <>
                 <Pause className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Pause Engine</span>
+                <span>
+                  {isControllingVpsBot
+                    ? 'Pause VPS Bot'
+                    : accountMode === 'Paper'
+                      ? 'Pause Paper Sim'
+                      : 'Pause Local Bot'}
+                </span>
               </>
             ) : (
               <>
                 <Play className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Resume Engine</span>
+                <span>
+                  {isControllingVpsBot
+                    ? 'Resume VPS Bot'
+                    : accountMode === 'Paper'
+                      ? 'Resume Paper Sim'
+                      : 'Resume Local Bot'}
+                </span>
               </>
             )}
           </button>
         </div>
       </header>
+
+      {/* Same-Origin Access Token Unlock Bar (when accessing a token-protected server directly in browser) */}
+      {connectionProfile.kind === 'local' &&
+        connectionHealth?.reachable &&
+        connectionHealth.authRequired &&
+        !connectionHealth.authOk && (
+          <form
+            role="region"
+            aria-label="Server Access Token Unlock"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const clean = localTokenDraft.trim();
+              if (!clean) return;
+              setLocalAccessToken(clean);
+              setLocalTokenDraft('');
+              hydratedServerVaultRef.current = false;
+              setOrderLogRefreshKey((k) => k + 1);
+              void refreshConnectionHealth();
+            }}
+            className="flex flex-wrap items-center justify-between gap-3 border-b border-amber-500/30 bg-amber-950/35 px-4 py-2 text-xs text-amber-100"
+          >
+            <span>
+              🔐 Access Token required by this server (`APEXRUST_PROXY_TOKEN`). Enter token to unlock API routes for this browser session:
+            </span>
+            <div className="flex items-center gap-2">
+              <input
+                type="password"
+                value={localTokenDraft}
+                onChange={(e) => setLocalTokenDraft(e.target.value)}
+                placeholder="Paste APEXRUST_PROXY_TOKEN…"
+                className="w-60 rounded-md border border-amber-400/35 bg-[#0D1015] px-2.5 py-1 font-mono text-xs text-slate-100 placeholder:text-slate-500 focus:border-amber-300 focus:outline-none"
+              />
+              <button
+                type="submit"
+                className="rounded-md bg-amber-400 px-3 py-1 text-xs font-bold text-[#0B0F17] hover:bg-amber-300"
+              >
+                Unlock
+              </button>
+            </div>
+          </form>
+        )}
+
+      {/* Remote VPS Auth / Connection Alert Bar */}
+      {connectionProfile.kind === 'remote' &&
+        connectionHealth &&
+        (!connectionHealth.reachable || !connectionHealth.authOk) && (
+          <div
+            role="alert"
+            className="flex flex-wrap items-center justify-between gap-3 border-b border-rose-500/30 bg-rose-950/35 px-4 py-2 text-xs text-rose-100"
+          >
+            <span>
+              {!connectionHealth.authOk && connectionHealth.reachable
+                ? `🔑 Remote VPS (${connectionProfile.name}) rejected the Access Token (HTTP 401). Please update or reconnect in VPS & Server Connection.`
+                : `☁️ Remote VPS (${connectionProfile.name}) is temporarily unreachable over Cloudflare One. Your 24/7 VPS Bot keeps running and managing positions on the server.`}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setSection('bot');
+                setBotSubTab('vps');
+              }}
+              className="rounded-md bg-rose-400 px-3 py-1 text-xs font-bold text-[#0B0F17] hover:bg-rose-300"
+            >
+              Reconnect to VPS
+            </button>
+          </div>
+        )}
 
       {/* Mobile Navigation Drawer */}
       {mobileMenuOpen && (
@@ -1951,6 +2505,23 @@ export default function App() {
                 <KeyRound className="h-4 w-4 shrink-0" aria-hidden="true" />
                 <span>Live Credentials</span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setSection('bot');
+                  setBotSubTab('vps');
+                  setMobileMenuOpen(false);
+                }}
+                className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm font-medium text-cyan-300 hover:bg-white/[0.05]"
+              >
+                {connectionProfile.kind === 'remote' ? (
+                  <Cloud className="h-4 w-4 shrink-0" aria-hidden="true" />
+                ) : (
+                  <Laptop className="h-4 w-4 shrink-0" aria-hidden="true" />
+                )}
+                <span>{serverTargetLabel}</span>
+              </button>
             </nav>
           </aside>
         </div>
@@ -1994,7 +2565,7 @@ export default function App() {
         <main className="min-w-0 flex-1 p-3.5 sm:p-5">
           {section === 'trade' && (
             <TradingDeskView
-              snapshot={snapshot}
+              snapshot={displaySnapshot}
               config={config}
               liveStatus={liveStatus}
               liveTicker={liveTicker}
@@ -2016,13 +2587,19 @@ export default function App() {
               onUpdateFuturesSettings={handleUpdateFuturesSettings}
               onResetCircuitBreaker={handleResetCB}
               onOpenLiveCredentials={handleOpenLiveCredentials}
+              serverTargetLabel={serverTargetLabel}
+              isRemoteVpsDaemon={isRemoteVpsDaemon}
+              onOpenVpsConnection={() => {
+                setSection('bot');
+                setBotSubTab('vps');
+              }}
               onSyncLiveTrades={handleSyncLiveTrades}
             />
           )}
 
           {section === 'markets' && (
             <MarketsView
-              snapshot={snapshot}
+              snapshot={displaySnapshot}
               config={config}
               selectedSymbol={selectedSymbol}
               onSelectPairAndTrade={handleSelectPairAndTrade}
@@ -2038,7 +2615,19 @@ export default function App() {
               activeVenue={config.trading.venue}
               symbols={config.trading.pairs}
               refreshKey={orderLogRefreshKey}
+              serverTargetLabel={serverTargetLabel}
               onSelectPairAndTrade={handleSelectPairAndTrade}
+              onAdoptOrphanPair={(sym) => {
+                const clean = sym.trim().toUpperCase();
+                if (!clean || config.trading.pairs.includes(clean)) return;
+                handleUpdateConfig({
+                  ...config,
+                  trading: {
+                    ...config.trading,
+                    pairs: [...config.trading.pairs, clean],
+                  },
+                });
+              }}
             />
           )}
 
@@ -2114,6 +2703,19 @@ export default function App() {
                   >
                     Git Backup
                   </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={botSubTab === 'vps'}
+                    onClick={() => setBotSubTab('vps')}
+                    className={`rounded-md px-4 py-1.5 text-xs font-semibold transition whitespace-nowrap ${
+                      botSubTab === 'vps'
+                        ? 'bg-cyan-400 text-[#0B0F17]'
+                        : 'text-cyan-300 hover:text-cyan-100'
+                    }`}
+                  >
+                    VPS & Server Connection
+                  </button>
                 </div>
 
                 <span className="font-mono text-xs text-slate-400">
@@ -2128,14 +2730,14 @@ export default function App() {
                   · Risk:{' '}
                   <span
                     className={
-                      snapshot.risk.state === 'Active'
+                      displaySnapshot.risk.state === 'Active'
                         ? 'text-[#7DF2AD]'
-                        : snapshot.risk.state === 'Cooldown'
+                        : displaySnapshot.risk.state === 'Cooldown'
                           ? 'text-amber-400'
                           : 'text-rose-400'
                     }
                   >
-                    {snapshot.risk.state}
+                    {displaySnapshot.risk.state}
                   </span>
                 </span>
               </div>
@@ -2143,7 +2745,7 @@ export default function App() {
               {botSubTab === 'strategy' && (
                 <StrategyConfigView
                   config={config}
-                  snapshot={snapshot}
+                  snapshot={displaySnapshot}
                   onUpdateConfig={handleUpdateConfig}
                   onToggleAutomation={handleToggleAutomation}
                   onRunAutoScan={handleRunAutoScan}
@@ -2161,7 +2763,7 @@ export default function App() {
 
               {botSubTab === 'risk' && (
                 <RiskCircuitBreakerView
-                  snapshot={snapshot}
+                  snapshot={displaySnapshot}
                   config={config}
                   onUpdateConfig={handleUpdateConfig}
                   onSimulateLoss={handleSimulateLoss}
@@ -2174,6 +2776,8 @@ export default function App() {
                 <LiveCredentialsView
                   liveStatus={liveStatus}
                   accountMode={accountMode}
+                  serverTargetLabel={serverTargetLabel}
+                  isRemoteVps={connectionProfile.kind === 'remote'}
                   onSaveCredentials={handleSaveCredentials}
                   onVerifyConnection={handleVerifyConnection}
                   onRunPreflightOrder={handleRunPreflightOrder}
@@ -2184,14 +2788,28 @@ export default function App() {
               )}
 
               {botSubTab === 'git' && (
-                <GitBackupView config={config} snapshot={snapshot} />
+                <GitBackupView
+                  config={config}
+                  snapshot={displaySnapshot}
+                  serverTargetLabel={serverTargetLabel}
+                />
+              )}
+
+              {botSubTab === 'vps' && (
+                <RemoteEngineView
+                  profile={connectionProfile}
+                  connectionHealth={connectionHealth}
+                  localFeatures={config.features}
+                  onChangeProfile={handleChangeConnectionProfile}
+                  onRefreshConnectionHealth={refreshConnectionHealth}
+                />
               )}
             </div>
           )}
 
           {section === 'signal' && (
             <SignalsView
-              snapshot={snapshot}
+              snapshot={displaySnapshot}
               config={config}
               onSelectPairAndTrade={handleSelectPairAndTrade}
             />

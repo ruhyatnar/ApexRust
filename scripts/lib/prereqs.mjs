@@ -97,15 +97,17 @@ export function checkPrerequisites({ needRust = true } = {}) {
         required: true,
       });
     } else if (IS_WIN) {
+      const cl = runCapture('cl.exe', []);
       const vswhere = runCapture(
         '"%ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe"',
         ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath']
       );
+      const msvcOk = cl.ok || (vswhere.ok && vswhere.stdout.length > 0);
       results.push({
         id: 'buildtools',
         name: 'MSVC C++ Build Tools',
-        ok: vswhere.ok && vswhere.stdout.length > 0,
-        detail: vswhere.ok && vswhere.stdout ? vswhere.stdout : 'not found',
+        ok: msvcOk,
+        detail: cl.ok ? 'cl.exe in PATH' : vswhere.ok && vswhere.stdout ? vswhere.stdout : 'not found',
         fix: fixFor('buildtools'),
         required: true,
       });

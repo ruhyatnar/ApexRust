@@ -1,4 +1,5 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { escapeCsvCell, fmtPx } from '../engine/formatters';
 import {
   BinanceExecutionRecord,
   ExchangeVenue,
@@ -27,11 +28,6 @@ interface TradeHistoryViewProps {
     latencyMs?: number;
     message: string;
   }>;
-}
-
-function fmtPx(px: number): string {
-  const d = px >= 100 ? 2 : px >= 1 ? 4 : 6;
-  return px.toFixed(d);
 }
 
 function buildBinanceRestPayload(rec: BinanceExecutionRecord): Record<string, unknown> {
@@ -218,7 +214,6 @@ function buildBinanceOrderResponsePayload(rec: BinanceExecutionRecord): Record<s
           executedQty: '0.0000',
           cummulativeQuoteQty: '0.00',
           status: 'NEW',
-          timeInForce: 'GTC',
           type: 'LIMIT_MAKER',
           side: tpSide,
         },
@@ -287,6 +282,13 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
   const [payloadSchemaMode, setPayloadSchemaMode] = useState<'REST' | 'ORDER' | 'WS'>('REST');
   const [copiedPayload, setCopiedPayload] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
   const [syncBanner, setSyncBanner] = useState<{
     ok: boolean;
     message: string;
@@ -418,17 +420,9 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
       r.rMultiple !== null ? r.rMultiple.toFixed(2) : '',
       r.exitReason ?? 'ENTRY_FILL',
     ]);
-    const csvEscape = (cell: unknown): string => {
-      const raw = String(cell ?? '');
-      const neutralized = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
-      if (/[",\n\r]/.test(neutralized)) {
-        return `"${neutralized.replace(/"/g, '""')}"`;
-      }
-      return neutralized;
-    };
     const csvContent = [
-      headers.map(csvEscape).join(','),
-      ...rows.map((row) => row.map(csvEscape).join(',')),
+      headers.map(escapeCsvCell).join(','),
+      ...rows.map((row) => row.map((cell) => escapeCsvCell(typeof cell === 'boolean' ? String(cell) : cell)).join(',')),
     ].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -451,7 +445,8 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
     try {
       void navigator.clipboard?.writeText(JSON.stringify(payload, null, 2));
       setCopiedPayload(true);
-      setTimeout(() => setCopiedPayload(false), 1800);
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => setCopiedPayload(false), 1800);
     } catch {
       // Clipboard API unavailable in non-secure context
     }

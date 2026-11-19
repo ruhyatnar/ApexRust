@@ -7,7 +7,7 @@ export const UI_STATE_STORAGE_KEY = 'apexrust_ui_state_v1';
 export interface PersistedWorkspaceUiState {
   accountMode: ExecutionAccountMode;
   section: 'trade' | 'markets' | 'orders' | 'bot' | 'signal' | 'rust';
-  botSubTab: 'strategy' | 'features' | 'risk' | 'credentials' | 'git';
+  botSubTab: 'strategy' | 'features' | 'risk' | 'credentials' | 'git' | 'vps';
   selectedSymbol: string;
   environment?: 'Testnet' | 'Production';
   paperFeedSource?: 'Simulated' | 'BinanceLive';
@@ -209,7 +209,8 @@ export function loadPersistedWorkspaceUiState(
         parsed.botSubTab === 'features' ||
         parsed.botSubTab === 'risk' ||
         parsed.botSubTab === 'credentials' ||
-        parsed.botSubTab === 'git'
+        parsed.botSubTab === 'git' ||
+        parsed.botSubTab === 'vps'
           ? parsed.botSubTab
           : 'strategy',
       selectedSymbol:

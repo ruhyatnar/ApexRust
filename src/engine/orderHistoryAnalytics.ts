@@ -1,6 +1,15 @@
-import type { ExchangeVenue, ExecutionAccountMode, OrderExecutionLog, OrderExecutionStatus } from './types';
+import { escapeCsvCell } from './formatters';
+import type {
+  ExchangeVenue,
+  ExecutionAccountMode,
+  OrderExecutionLog,
+  OrderExecutionStatus,
+  OrphanPairKind,
+  OrphanPairRecord,
+  SyncLookbackPreset,
+} from './types';
 
-export interface OrderHistoryFilters {
+interface OrderHistoryFilters {
   accountMode: 'ALL' | ExecutionAccountMode;
   venue: 'ALL' | ExchangeVenue;
   status: 'ALL' | OrderExecutionStatus;
@@ -10,7 +19,7 @@ export interface OrderHistoryFilters {
   endDate?: string; // YYYY-MM-DD (UTC, inclusive through 23:59:59.999Z)
 }
 
-export interface UtcDateRangeBounds {
+interface UtcDateRangeBounds {
   startMs: number | null;
   endMs: number | null;
   isInverted: boolean;
@@ -52,7 +61,7 @@ export function parseUtcDateRangeBounds(
 }
 
 export function computeUtcDatePresetRange(
-  preset: 'today' | '7d' | '30d',
+  preset: 'today' | '1d' | '3d' | '7d' | '30d',
   nowMs: number = Date.now()
 ): { startDate: string; endDate: string } {
   const endUtc = new Date(nowMs);
@@ -65,7 +74,16 @@ export function computeUtcDatePresetRange(
     0,
     0
   );
-  const offsetDays = preset === 'today' ? 0 : preset === '7d' ? 6 : 29;
+  const offsetDays =
+    preset === 'today'
+      ? 0
+      : preset === '1d'
+        ? 1
+        : preset === '3d'
+          ? 2
+          : preset === '7d'
+            ? 6
+            : 29;
   const startDayStartMs = endDayStartMs - offsetDays * 86_400_000;
   return {
     startDate: new Date(startDayStartMs).toISOString().slice(0, 10),
@@ -73,7 +91,294 @@ export function computeUtcDatePresetRange(
   };
 }
 
-export interface EquityCurvePoint {
+export function lookbackPresetToMs(preset: SyncLookbackPreset): number {
+  switch (preset) {
+    case '1d':
+      return 1 * 86_400_000;
+    case '3d':
+      return 3 * 86_400_000;
+    case '7d':
+      return 7 * 86_400_000;
+    case '30d':
+      return 30 * 86_400_000;
+  }
+}
+
+/**
+ * Generates official Binance-compliant [startTime, endTime] slices:
+ * - Spot (`GET /api/v3/allOrders`, `GET /api/v3/myTrades`): `endTime - startTime` MUST be < 24h (we use 23h59m59.999s = 86_399_999ms).
+ * - USD-M Futures (`GET /fapi/v1/allOrders`, `GET /fapi/v1/userTrades`): `endTime - startTime` MUST be <= 7d (we use 6d = 518_400_000ms so 30d splits into 5 clean slices).
+ */
+export function buildBinanceSyncTimeWindows(
+  venue: ExchangeVenue,
+  lookback: SyncLookbackPreset,
+  nowMs: number = Date.now()
+): Array<{ startTime: number; endTime: number }> {
+  const totalDurationMs = lookbackPresetToMs(lookback);
+  const startBoundMs = Math.max(0, nowMs - totalDurationMs);
+  const maxSliceMs = venue === 'Spot' ? 86_399_999 : 6 * 86_400_000;
+  const windows: Array<{ startTime: number; endTime: number }> = [];
+  let cursor = startBoundMs;
+  while (cursor < nowMs) {
+    const segEnd = Math.min(nowMs, cursor + maxSliceMs);
+    windows.push({ startTime: cursor, endTime: segEnd });
+    if (segEnd >= nowMs) break;
+    cursor = segEnd + 1;
+  }
+  return windows;
+}
+
+interface AggregatedOrderTradeMetrics {
+  orderId: string;
+  commission: number;
+  commissionAsset: string;
+  isMaker: boolean;
+  realizedPnlUsdt: number | null;
+  executedQty: number;
+  quoteQty: number;
+}
+
+export function aggregateTradesByOrderId(
+  rawTrades: Array<Record<string, unknown>>,
+  venue: ExchangeVenue
+): Map<string, AggregatedOrderTradeMetrics> {
+  const map = new Map<string, AggregatedOrderTradeMetrics>();
+  for (const t of rawTrades) {
+    const ordId = String(t.orderId ?? '').trim();
+    if (!ordId) continue;
+    const comm = Number(t.commission ?? 0) || 0;
+    const commAsset = String(t.commissionAsset ?? 'USDT').trim() || 'USDT';
+    const isMaker = Boolean(t.isMaker ?? t.maker ?? false);
+    const qty = Number(t.qty ?? 0) || 0;
+    const price = Number(t.price ?? 0) || 0;
+    const quoteQty = Number(t.quoteQty ?? qty * price) || 0;
+    const rawPnl = t.realizedPnl !== undefined ? Number(t.realizedPnl) : NaN;
+    const hasPnl = venue === 'Futures' && Number.isFinite(rawPnl);
+
+    const existing = map.get(ordId);
+    if (!existing) {
+      map.set(ordId, {
+        orderId: ordId,
+        commission: comm,
+        commissionAsset: commAsset,
+        isMaker,
+        realizedPnlUsdt: hasPnl ? rawPnl : null,
+        executedQty: qty,
+        quoteQty,
+      });
+    } else {
+      existing.commission += comm;
+      existing.isMaker = existing.isMaker || isMaker;
+      existing.executedQty += qty;
+      existing.quoteQty += quoteQty;
+      if (hasPnl) {
+        existing.realizedPnlUsdt = (existing.realizedPnlUsdt ?? 0) + rawPnl;
+      }
+    }
+  }
+  return map;
+}
+
+export function detectOrphanPairs(params: {
+  configuredPairs: string[];
+  venue: ExchangeVenue;
+  environment: 'Testnet' | 'Production';
+  dbLogs: OrderExecutionLog[];
+  exchangeOpenOrders?: Array<Record<string, unknown>>;
+  exchangeAlgoOrders?: Array<Record<string, unknown>>;
+  exchangePositions?: Array<Record<string, unknown>>;
+  exchangeSpotBalances?: Array<{ asset: string; free: number; locked: number }>;
+  knownQuoteAssets?: string[];
+  nowMs?: number;
+}): OrphanPairRecord[] {
+  const nowMs = params.nowMs ?? Date.now();
+  const configuredList = params.configuredPairs.map((s) => s.trim().toUpperCase()).filter(Boolean);
+  const configuredSet = new Set(configuredList);
+  const quotesList = (params.knownQuoteAssets ?? ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'BNB', 'ETH', 'BTC']).map((q) =>
+    q.toUpperCase()
+  );
+  const quotes = new Set(quotesList);
+
+  const openOrdersBySym = new Map<string, Set<string>>();
+  for (const ord of params.exchangeOpenOrders ?? []) {
+    const sym = String(ord.symbol ?? '').trim().toUpperCase();
+    const ordId = String(ord.orderId ?? '').trim();
+    if (!sym) continue;
+    let set = openOrdersBySym.get(sym);
+    if (!set) {
+      set = new Set();
+      openOrdersBySym.set(sym, set);
+    }
+    if (ordId) set.add(ordId);
+  }
+
+  const algoOrdersBySym = new Map<string, number>();
+  const algoIdsBySym = new Map<string, Set<string>>();
+  for (const algo of params.exchangeAlgoOrders ?? []) {
+    const sym = String(algo.symbol ?? '').trim().toUpperCase();
+    if (!sym) continue;
+    algoOrdersBySym.set(sym, (algoOrdersBySym.get(sym) ?? 0) + 1);
+    const algoId = String(algo.algoId ?? '').trim();
+    if (algoId) {
+      let set = algoIdsBySym.get(sym);
+      if (!set) {
+        set = new Set();
+        algoIdsBySym.set(sym, set);
+      }
+      set.add(algoId);
+    }
+  }
+
+  const posBySym = new Map<string, { positionAmt: number; unrealizedPnlUsdt: number }>();
+  for (const pos of params.exchangePositions ?? []) {
+    const sym = String(pos.symbol ?? '').trim().toUpperCase();
+    const amt = Number(pos.positionAmt ?? 0) || 0;
+    const upnl = Number(pos.unRealizedProfit ?? pos.unrealizedProfit ?? 0) || 0;
+    if (!sym || Math.abs(amt) <= 1e-12) continue;
+    const prev = posBySym.get(sym);
+    posBySym.set(sym, {
+      positionAmt: (prev?.positionAmt ?? 0) + amt,
+      unrealizedPnlUsdt: (prev?.unrealizedPnlUsdt ?? 0) + upnl,
+    });
+  }
+
+  const findExistingSymbolForBase = (asset: string): string | null => {
+    const matchesAsset = (sym: string): boolean => {
+      if (!sym.startsWith(asset)) return false;
+      const suffix = sym.slice(asset.length);
+      return quotes.has(suffix);
+    };
+    const fromConfigured = configuredList.find(matchesAsset);
+    if (fromConfigured) return fromConfigured;
+    for (const sym of openOrdersBySym.keys()) {
+      if (matchesAsset(sym)) return sym;
+    }
+    for (const log of params.dbLogs) {
+      const sym = log.symbol.toUpperCase();
+      if (matchesAsset(sym)) return sym;
+    }
+    return null;
+  };
+
+  const spotBySym = new Map<string, { free: number; locked: number }>();
+  if (params.venue === 'Spot') {
+    for (const bal of params.exchangeSpotBalances ?? []) {
+      const asset = String(bal.asset ?? '').trim().toUpperCase();
+      if (!asset || quotes.has(asset)) continue;
+      const total = (Number(bal.free) || 0) + (Number(bal.locked) || 0);
+      if (total < 0.0001) continue;
+      const sym = findExistingSymbolForBase(asset) ?? `${asset}USDT`;
+      spotBySym.set(sym, { free: Number(bal.free) || 0, locked: Number(bal.locked) || 0 });
+    }
+  }
+
+  const dbCountBySym = new Map<string, number>();
+  const dbOpenIdsBySym = new Map<string, string[]>();
+  for (const log of params.dbLogs) {
+    if (log.accountMode !== 'Live' || log.venue !== params.venue || log.environment !== params.environment) {
+      continue;
+    }
+    const sym = log.symbol.toUpperCase();
+    dbCountBySym.set(sym, (dbCountBySym.get(sym) ?? 0) + 1);
+    if (log.status === 'NEW' || log.status === 'PARTIALLY_FILLED') {
+      const liveSet = openOrdersBySym.get(sym);
+      const algoSet = algoIdsBySym.get(sym);
+      const hasOpenMatch = Boolean(liveSet && liveSet.has(log.orderId));
+      const hasAlgoMatch =
+        Boolean(algoSet && (algoSet.has(log.orderId) || (log.algoId ? algoSet.has(String(log.algoId)) : false))) ||
+        Boolean(algoSet && log.algoOrderIds?.some((id) => algoSet.has(String(id))));
+      if (!hasOpenMatch && !hasAlgoMatch) {
+        const list = dbOpenIdsBySym.get(sym) ?? [];
+        if (!list.includes(log.orderId)) list.push(log.orderId);
+        dbOpenIdsBySym.set(sym, list);
+      }
+    }
+  }
+
+  const candidateSymbols = new Set<string>([
+    ...openOrdersBySym.keys(),
+    ...algoOrdersBySym.keys(),
+    ...posBySym.keys(),
+    ...spotBySym.keys(),
+    ...dbCountBySym.keys(),
+  ]);
+
+  const records: OrphanPairRecord[] = [];
+  for (const symbol of candidateSymbols) {
+    const inConfigured = configuredSet.has(symbol);
+    const openOrdersCount = openOrdersBySym.get(symbol)?.size ?? 0;
+    const algoOrdersCount = algoOrdersBySym.get(symbol) ?? 0;
+    const pos = posBySym.get(symbol);
+    const spotBal = spotBySym.get(symbol);
+    const dbCount = dbCountBySym.get(symbol) ?? 0;
+    const staleOpenIds = dbOpenIdsBySym.get(symbol) ?? [];
+
+    const hasExchangeActivity =
+      openOrdersCount > 0 ||
+      algoOrdersCount > 0 ||
+      Boolean(pos && Math.abs(pos.positionAmt) > 0) ||
+      Boolean(spotBal && spotBal.free + spotBal.locked >= 0.0001);
+
+    const kinds: OrphanPairKind[] = [];
+    if (!inConfigured && hasExchangeActivity) {
+      kinds.push('exchange_untracked_pair');
+    }
+    if (staleOpenIds.length > 0) {
+      kinds.push('stale_local_open_order');
+    }
+    if (!inConfigured && dbCount > 0 && !hasExchangeActivity) {
+      kinds.push('db_unconfigured_pair');
+    }
+
+    if (kinds.length === 0) continue;
+
+    const summaryParts: string[] = [];
+    if (!inConfigured) summaryParts.push('Not in active trading.pairs');
+    if (openOrdersCount > 0) summaryParts.push(`${openOrdersCount} open order(s) on Binance`);
+    if (algoOrdersCount > 0) summaryParts.push(`${algoOrdersCount} conditional algo order(s)`);
+    if (pos && Math.abs(pos.positionAmt) > 0) {
+      summaryParts.push(`Futures position: ${pos.positionAmt}`);
+    }
+    if (spotBal && spotBal.free + spotBal.locked >= 0.0001) {
+      summaryParts.push(`Spot holding: ${(spotBal.free + spotBal.locked).toFixed(4)}`);
+    }
+    if (staleOpenIds.length > 0) {
+      summaryParts.push(`${staleOpenIds.length} local NEW/PARTIAL order(s) missing from Binance openOrders`);
+    }
+    if (dbCount > 0 && !hasExchangeActivity && !inConfigured) {
+      summaryParts.push(`${dbCount} archived local DB record(s)`);
+    }
+
+    records.push({
+      symbol,
+      venue: params.venue,
+      environment: params.environment,
+      kinds,
+      inConfiguredPairs: inConfigured,
+      exchangeOpenOrdersCount: openOrdersCount,
+      exchangeAlgoOrdersCount: algoOrdersCount,
+      exchangePositionAmt: pos?.positionAmt ?? 0,
+      exchangeUnrealizedPnlUsdt: pos?.unrealizedPnlUsdt ?? 0,
+      exchangeSpotFreeBalance: spotBal?.free ?? 0,
+      exchangeSpotLockedBalance: spotBal?.locked ?? 0,
+      localDbOrderCount: dbCount,
+      localStaleOpenOrderIds: staleOpenIds,
+      summary: summaryParts.join(' · '),
+      detectedAtMs: nowMs,
+    });
+  }
+
+  return records.sort((a, b) => {
+    const score = (r: OrphanPairRecord) =>
+      (r.kinds.includes('exchange_untracked_pair') ? 100 : 0) +
+      (r.kinds.includes('stale_local_open_order') ? 50 : 0) +
+      r.exchangeOpenOrdersCount +
+      r.exchangeAlgoOrdersCount;
+    return score(b) - score(a) || a.symbol.localeCompare(b.symbol);
+  });
+}
+
+interface EquityCurvePoint {
   id: string;
   orderId: string;
   symbol: string;
@@ -83,7 +388,7 @@ export interface EquityCurvePoint {
   drawdownUsdt: number;
 }
 
-export interface OrderPerformanceMetrics {
+interface OrderPerformanceMetrics {
   totalOrders: number;
   filledOrders: number;
   openOrders: number;
@@ -160,9 +465,13 @@ export function computeOrderPerformanceMetrics(logs: OrderExecutionLog[]): Order
       totalCommissionUsdt += Math.max(0, log.commission);
       if (log.isMaker) makerCount += 1;
       else takerCount += 1;
-    } else if (log.status === 'NEW') {
+    } else if (log.status === 'NEW' || log.status === 'PENDING_CANCEL') {
       openOrders += 1;
-    } else if (log.status === 'CANCELED' || log.status === 'EXPIRED') {
+    } else if (
+      log.status === 'CANCELED' ||
+      log.status === 'EXPIRED' ||
+      log.status === 'EXPIRED_IN_MATCH'
+    ) {
       canceledOrders += 1;
     } else if (log.status === 'REJECTED') {
       rejectedOrders += 1;
@@ -289,20 +598,14 @@ export function computeOrderPerformanceMetrics(logs: OrderExecutionLog[]): Order
   };
 }
 
-function escapeCsvCell(raw: string | number | null | undefined): string {
-  const s = raw === null || raw === undefined ? '' : String(raw);
-  const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
-  if (/[",\n\r]/.test(safe)) {
-    return `"${safe.replace(/"/g, '""')}"`;
-  }
-  return safe;
-}
-
 export function formatOrderLogsCsv(logs: OrderExecutionLog[]): string {
   const headers = [
-    'timestamp_iso',
+    'order_time_iso',
+    'update_time_iso',
     'order_id',
     'client_order_id',
+    'order_list_id',
+    'algo_id',
     'account_mode',
     'source',
     'venue',
@@ -311,13 +614,22 @@ export function formatOrderLogsCsv(logs: OrderExecutionLog[]): string {
     'lifecycle',
     'side',
     'binance_side',
+    'position_side',
     'order_type',
+    'orig_type',
     'time_in_force',
     'status',
-    'price',
+    'avg_price',
+    'order_price',
+    'stop_price',
+    'working_type',
     'executed_qty',
     'orig_qty',
     'quote_qty_usdt',
+    'reduce_only',
+    'close_position',
+    'price_protect',
+    'self_trade_prevention_mode',
     'commission',
     'commission_asset',
     'is_maker',
@@ -329,11 +641,17 @@ export function formatOrderLogsCsv(logs: OrderExecutionLog[]): string {
     'rationale',
     'error_message',
   ];
-  const rows = logs.map((l) =>
-    [
-      new Date(l.timestampMs).toISOString(),
+  const rows = logs.map((l) => {
+    const orderTimeIso = new Date(l.orderTimeMs ?? l.timestampMs).toISOString();
+    const updateTimeIso = new Date(l.updateTimeMs ?? l.timestampMs).toISOString();
+    const avgPx = l.avgPrice !== undefined && l.avgPrice > 0 ? l.avgPrice : l.price;
+    return [
+      orderTimeIso,
+      updateTimeIso,
       l.orderId,
       l.clientOrderId,
+      l.orderListId ?? '',
+      l.algoId ?? '',
       l.accountMode,
       l.source,
       l.venue,
@@ -342,13 +660,22 @@ export function formatOrderLogsCsv(logs: OrderExecutionLog[]): string {
       l.lifecycle,
       l.side,
       l.binanceSide,
+      l.positionSide ?? 'BOTH',
       l.orderType,
+      l.origType ?? l.orderType,
       l.timeInForce,
       l.status,
+      avgPx,
       l.price,
+      l.stopPrice ?? 0,
+      l.workingType ?? '',
       l.executedQty,
       l.origQty,
       l.quoteQty.toFixed(2),
+      l.reduceOnly ? 'TRUE' : 'FALSE',
+      l.closePosition ? 'TRUE' : 'FALSE',
+      l.priceProtect ? 'TRUE' : 'FALSE',
+      l.selfTradePreventionMode ?? 'NONE',
       l.commission.toFixed(6),
       l.commissionAsset,
       l.isMaker ? 'MAKER' : 'TAKER',
@@ -361,12 +688,12 @@ export function formatOrderLogsCsv(logs: OrderExecutionLog[]): string {
       l.errorMessage ?? '',
     ]
       .map(escapeCsvCell)
-      .join(',')
-  );
+      .join(',');
+  });
   return [headers.join(','), ...rows].join('\n');
 }
 
-export interface OrderStatusBadgeMeta {
+interface OrderStatusBadgeMeta {
   label: string;
   tone: 'emerald' | 'amber' | 'slate' | 'rose';
 }
@@ -379,10 +706,13 @@ export function getOrderStatusBadgeMeta(status: OrderExecutionStatus): OrderStat
       return { label: 'PARTIAL', tone: 'amber' };
     case 'NEW':
       return { label: 'NEW', tone: 'amber' };
+    case 'PENDING_CANCEL':
+      return { label: 'PENDING CANCEL', tone: 'amber' };
     case 'CANCELED':
       return { label: 'CANCELED', tone: 'slate' };
     case 'EXPIRED':
-      return { label: 'EXPIRED', tone: 'slate' };
+    case 'EXPIRED_IN_MATCH':
+      return { label: status === 'EXPIRED_IN_MATCH' ? 'EXP IN MATCH' : 'EXPIRED', tone: 'slate' };
     case 'REJECTED':
       return { label: 'REJECTED', tone: 'rose' };
   }

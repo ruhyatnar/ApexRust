@@ -115,7 +115,7 @@ atr_tp1_multiplier = 2.25
 atr_tp2_multiplier = 3.75
 tp1_close_ratio = 0.50
 break_even_trigger_r = 1.0
-break_even_fee_buffer_bps = 12.0
+break_even_fee_buffer_bps = 25.0
 trailing_activation_r = 1.2
 atr_trailing_multiplier = 1.4
 
@@ -138,3 +138,5 @@ backup_dir = "backups"
 [web]
 bind_addr = "127.0.0.1:8080"
 allowed_origin = "http://localhost:3000"
+auth_token = ""
+

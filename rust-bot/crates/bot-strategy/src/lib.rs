@@ -2,26 +2,25 @@
 //! position exit lifecycle (Initial SL, TP1 partial, Break-Even, ATR Trailing Stop).
 
 use bot_core::{
-    Candle, DirectionPolicy, EntrySignal, ExitConfig, ExitPlan, ExitReason, FeatureToggles,
-    IndicatorConfig, IndicatorSnapshot, Position, Side, StrategyMode, StrategyProfile,
-    TradingConfig,
+    BotConfig, Candle, DirectionPolicy, EntrySignal, ExitConfig, ExitPlan, ExitReason,
+    FeatureToggles, IndicatorSnapshot, Position, Side, StrategyMode, StrategyProfile,
 };
 use chrono::{DateTime, Utc};
 
 /// Evaluates entry signals with full historical candle context for Donchian breakout confirmation.
-#[allow(clippy::too_many_arguments)]
 pub fn evaluate_entry_signal_full(
     symbol: &str,
     candle: &Candle,
     ind: &IndicatorSnapshot,
-    trading_cfg: &TradingConfig,
-    ind_cfg: &IndicatorConfig,
-    profile: StrategyProfile,
-    direction_policy: DirectionPolicy,
-    features: &FeatureToggles,
+    cfg: &BotConfig,
     recent_candles: &[Candle],
     now: DateTime<Utc>,
 ) -> Option<EntrySignal> {
+    let trading_cfg = &cfg.trading;
+    let ind_cfg = &cfg.indicators;
+    let profile = cfg.automation.strategy_profile;
+    let direction_policy = cfg.automation.direction_policy;
+    let features = &cfg.features;
     if !features.signal_generator {
         return None;
     }
@@ -49,11 +48,9 @@ pub fn evaluate_entry_signal_full(
             ind.avg_volume_20
                 .filter(|&a| a > 0.0)
                 .map(|a| candle.volume / a)
-        });
-        if let Some(vr) = vol_ratio {
-            if vr < ind_cfg.min_volume_expansion_mult.max(1.0) {
-                return None;
-            }
+        })?;
+        if vol_ratio < ind_cfg.min_volume_expansion_mult.max(1.0) {
+            return None;
         }
     }
 
@@ -61,7 +58,7 @@ pub fn evaluate_entry_signal_full(
 
     if matches!(profile, StrategyProfile::VwapReversion) {
         let anchor = if features.vwap_bias_filter {
-            ind.vwap.unwrap_or(ema_mid)
+            ind.vwap?
         } else {
             ema_mid
         };
@@ -149,7 +146,7 @@ pub fn evaluate_entry_signal_full(
             lookback.iter().map(|c| c.low).fold(f64::INFINITY, f64::min)
         };
         let avg_vol = if lookback.is_empty() {
-            ind.avg_volume_20.unwrap_or(candle.volume)
+            candle.volume
         } else {
             lookback.iter().map(|c| c.volume).sum::<f64>() / lookback.len() as f64
         };
@@ -259,11 +256,6 @@ pub fn evaluate_entry_signal_full(
     None
 }
 
-/// Build an initial ATR-based `ExitPlan` at trade entry.
-pub fn build_exit_plan(side: Side, entry_price: f64, atr: f64, cfg: &ExitConfig) -> ExitPlan {
-    build_exit_plan_with_features(side, entry_price, atr, cfg, &FeatureToggles::default())
-}
-
 /// Build an `ExitPlan` honoring `FeatureToggles` (`atr_dynamic_exits`, `break_even_stop`, `trailing_stop`, `take_profit_ladder`).
 pub fn build_exit_plan_with_features(
     side: Side,
@@ -281,6 +273,8 @@ pub fn build_exit_plan_with_features(
     } else {
         (entry_price * 0.015, entry_price * 0.025, entry_price * 0.04)
     };
+    let be_enabled = features.atr_dynamic_exits && features.break_even_stop;
+    let trail_enabled = features.atr_dynamic_exits && features.trailing_stop;
 
     match side {
         Side::Long => ExitPlan {
@@ -290,9 +284,9 @@ pub fn build_exit_plan_with_features(
             take_profit_2: entry_price + tp2_dist,
             tp1_hit: false,
             break_even_armed: false,
-            break_even_enabled: features.break_even_stop,
+            break_even_enabled: be_enabled,
             trailing_active: false,
-            trailing_enabled: features.trailing_stop,
+            trailing_enabled: trail_enabled,
             tp_ladder_enabled: features.take_profit_ladder,
             risk_distance_r: sl_dist,
         },
@@ -303,9 +297,9 @@ pub fn build_exit_plan_with_features(
             take_profit_2: entry_price - tp2_dist,
             tp1_hit: false,
             break_even_armed: false,
-            break_even_enabled: features.break_even_stop,
+            break_even_enabled: be_enabled,
             trailing_active: false,
-            trailing_enabled: features.trailing_stop,
+            trailing_enabled: trail_enabled,
             tp_ladder_enabled: features.take_profit_ladder,
             risk_distance_r: sl_dist,
         },
@@ -389,6 +383,12 @@ pub fn manage_position_tick(
                 && mark_price >= pos.exit_plan.take_profit_1
             {
                 pos.exit_plan.tp1_hit = true;
+                if cfg.tp1_close_ratio >= 0.999_999 {
+                    return PositionTickAction::FullClose {
+                        exit_price: pos.exit_plan.take_profit_1,
+                        reason: ExitReason::TakeProfit1,
+                    };
+                }
                 return PositionTickAction::PartialClose {
                     ratio: cfg.tp1_close_ratio,
                     exit_price: pos.exit_plan.take_profit_1,
@@ -449,6 +449,12 @@ pub fn manage_position_tick(
                 && mark_price <= pos.exit_plan.take_profit_1
             {
                 pos.exit_plan.tp1_hit = true;
+                if cfg.tp1_close_ratio >= 0.999_999 {
+                    return PositionTickAction::FullClose {
+                        exit_price: pos.exit_plan.take_profit_1,
+                        reason: ExitReason::TakeProfit1,
+                    };
+                }
                 return PositionTickAction::PartialClose {
                     ratio: cfg.tp1_close_ratio,
                     exit_price: pos.exit_plan.take_profit_1,
@@ -477,7 +483,13 @@ mod tests {
             trailing_activation_r: 1.2,
             atr_trailing_multiplier: 1.4,
         };
-        let plan = build_exit_plan(Side::Long, 100.0, 2.0, &cfg);
+        let plan = build_exit_plan_with_features(
+            Side::Long,
+            100.0,
+            2.0,
+            &cfg,
+            &FeatureToggles::default(),
+        );
         let mut pos = Position {
             id: "test-1".into(),
             symbol: "ETHUSDT".into(),

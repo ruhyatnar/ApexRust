@@ -1008,6 +1008,45 @@ test('Audit regressions: closed-bar deduplication, vwap_reversion ADX bound, mul
   assert.equal(sizedZero.notionalUsdt, 0);
 });
 
+test('FeatureToggles OFF blocks auto-scan, circuit breaker trip/reset, and transport switches', () => {
+  const cfgNoAuto = {
+    ...DEFAULT_BOT_CONFIG,
+    features: { ...DEFAULT_BOT_CONFIG.features, automatedTrading: false },
+  };
+  const rt = new SimulationRuntime(cfgNoAuto, 1_763_280_000_000, { seedDemoData: false });
+  const scansBefore = rt.snapshot.autoStats.scansRun;
+  const scanRes = rt.runAutoScanNow(1_763_280_001_000);
+  assert.equal(scanRes.scannedPairs, 0);
+  assert.equal(rt.snapshot.autoStats.scansRun, scansBefore);
+
+  // Venue toggle OFF also blocks auto-scan
+  rt.updateConfig({
+    ...DEFAULT_BOT_CONFIG,
+    trading: { ...DEFAULT_BOT_CONFIG.trading, venue: 'Spot' },
+    features: { ...DEFAULT_BOT_CONFIG.features, spotMarket: false },
+  });
+  const spotBlockedScan = rt.runAutoScanNow(1_763_280_002_000);
+  assert.equal(spotBlockedScan.scannedPairs, 0);
+
+  // Circuit Breaker toggle OFF ignores manual tripCircuitBreaker & resetCircuitBreaker
+  rt.tripCircuitBreaker('test-active');
+  assert.equal(rt.snapshot.risk.state, 'Halted');
+  rt.updateConfig({
+    ...DEFAULT_BOT_CONFIG,
+    features: { ...DEFAULT_BOT_CONFIG.features, circuitBreaker: false },
+  });
+  rt.resetCircuitBreaker();
+  assert.equal(rt.snapshot.risk.state, 'Halted');
+
+  // Transport toggles OFF block switching to disabled RestFallback or WsPrimary
+  rt.updateConfig({
+    ...DEFAULT_BOT_CONFIG,
+    features: { ...DEFAULT_BOT_CONFIG.features, restFallback: false, wsPrimaryFeed: true },
+  });
+  rt.setTransportMode('RestFallback');
+  assert.equal(rt.snapshot.transport.mode, 'WsPrimary');
+});
+
 
 
 

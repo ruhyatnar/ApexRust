@@ -56,8 +56,14 @@ export const MarketsView: React.FC<MarketsViewProps> = ({
             </button>
             <button
               type="button"
+              disabled={!config.features.wsPrimaryFeed && !config.features.restFallback}
+              title={
+                !config.features.wsPrimaryFeed && !config.features.restFallback
+                  ? 'Enable WebSocket Primary Feed or REST API Fallback in Feature Toggles'
+                  : undefined
+              }
               onClick={() => onToggleFeedSource('BinanceLive')}
-              className={`rounded-md px-3 py-1 text-xs font-medium transition ${
+              className={`rounded-md px-3 py-1 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
                 transport.feedSource === 'BinanceLive'
                   ? 'bg-[#7DF2AD] font-semibold text-[#0B0F17]'
                   : 'text-slate-400 hover:text-slate-200'
@@ -69,12 +75,24 @@ export const MarketsView: React.FC<MarketsViewProps> = ({
 
           <button
             type="button"
+            disabled={
+              transport.mode === 'WsPrimary'
+                ? !config.features.restFallback
+                : !config.features.wsPrimaryFeed
+            }
+            title={
+              (transport.mode === 'WsPrimary'
+                ? !config.features.restFallback
+                : !config.features.wsPrimaryFeed)
+                ? 'Target transport path is disabled in Feature Toggles'
+                : undefined
+            }
             onClick={() =>
               onSimulateTransport(
                 transport.mode === 'WsPrimary' ? 'RestFallback' : 'WsPrimary'
               )
             }
-            className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#141820] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800"
+            className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#141820] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
             {transport.mode === 'WsPrimary' ? 'Test REST Fallback' : 'Recover WS Primary'}
@@ -250,7 +268,16 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+      {!config.features.signalGenerator && (
+        <div
+          role="status"
+          className="rounded-lg border border-amber-500/30 bg-amber-950/25 px-4 py-2.5 text-xs text-amber-200"
+        >
+          Signal Generator Pipeline is currently toggled <strong>OFF</strong> in Bot → Feature Toggles. Entry evaluation and signal actions are disabled.
+        </div>
+      )}
+
+      <div className={`grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3 ${!config.features.signalGenerator ? 'opacity-50' : ''}`}>
         {snapshot.pairs.map((p) => {
           const ind = p.indicators;
           const diag = evaluateSignalDiagnostics(
@@ -367,8 +394,10 @@ export const SignalsView: React.FC<SignalsViewProps> = ({
 
               <button
                 type="button"
+                disabled={!config.features.signalGenerator}
+                title={!config.features.signalGenerator ? 'Signal Generator is disabled in Feature Toggles' : undefined}
                 onClick={() => onSelectPairAndTrade(p.symbol)}
-                className="w-full rounded-lg border border-white/[0.08] bg-[#0D1015] py-2 text-xs font-semibold text-slate-100 transition hover:border-emerald-400/50 hover:text-[#7DF2AD]"
+                className="w-full rounded-lg border border-white/[0.08] bg-[#0D1015] py-2 text-xs font-semibold text-slate-100 transition hover:border-emerald-400/50 hover:text-[#7DF2AD] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Open {p.symbol} in Trade Desk
               </button>

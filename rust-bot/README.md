@@ -35,7 +35,7 @@ rust-bot/
    - Supported order methods: **Market**, **Limit** (`GTC` / `IOC` / `FOK`), **Post-Only Maker** (Spot `LIMIT_MAKER` / Futures `GTX`), and **OCO** (Spot `/api/v3/orderList/oco` + Futures `TAKE_PROFIT_MARKET` & `STOP_MARKET` bracket).
 
 2. **WebSocket-First Architecture with Automatic REST Fallback**
-   - Primary real-time market data (`@kline_<tf>`, `@bookTicker`) via Binance Spot & Futures WebSocket streams.
+   - Primary real-time market data (`@kline_<tf>`) via Binance Spot & Futures WebSocket streams.
    - Automatic stale-stream watchdog (`ws_heartbeat_timeout_ms`) transparently degrades to **`RestFallback`** polling and order placement without dropping position management.
    - Exponential backoff reconnection automatically promotes back to `WsPrimary`.
 

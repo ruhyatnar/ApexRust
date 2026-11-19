@@ -201,10 +201,9 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
   const features = config.features;
   const totalCount = Object.keys(features).length;
   const enabledCount = Object.values(features).filter(Boolean).length;
-  const sessionWindows =
-    config.automation.sessionWindows && config.automation.sessionWindows.length > 0
-      ? config.automation.sessionWindows
-      : DEFAULT_UTC_SESSION_WINDOWS;
+  const sessionWindows = Array.isArray(config.automation.sessionWindows)
+    ? config.automation.sessionWindows
+    : DEFAULT_UTC_SESSION_WINDOWS;
 
   const sessionEval = evaluateUtcSessionWindows(
     nowMs,
@@ -508,8 +507,14 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
 
             <button
               type="button"
+              disabled={!features.sessionWindowFilter}
               onClick={handleAddCustomWindow}
-              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-[#7DF2AD]/40 hover:text-[#7DF2AD]"
+              title={
+                !features.sessionWindowFilter
+                  ? 'Enable UTC Liquidity Session Filter to customize windows'
+                  : undefined
+              }
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-[#7DF2AD]/40 hover:text-[#7DF2AD] disabled:cursor-not-allowed disabled:opacity-40"
             >
               <Plus className="h-3.5 w-3.5" aria-hidden="true" />
               Add UTC Window
@@ -518,7 +523,11 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
         </div>
 
         {/* High-Liquidity Session Presets */}
-        <div className="flex flex-wrap items-center gap-2">
+        <div
+          className={`flex flex-wrap items-center gap-2 ${
+            !features.sessionWindowFilter ? 'opacity-50' : ''
+          }`}
+        >
           <span className="text-[11px] font-medium text-slate-400 mr-1">
             Session Presets:
           </span>
@@ -528,8 +537,9 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
               <button
                 key={preset.id}
                 type="button"
+                disabled={!features.sessionWindowFilter}
                 onClick={() => handleAddPresetWindow(preset)}
-                className={`rounded-md border px-2.5 py-1 font-mono text-[11px] transition ${
+                className={`rounded-md border px-2.5 py-1 font-mono text-[11px] transition disabled:cursor-not-allowed ${
                   active
                     ? 'border-[#7DF2AD]/40 bg-[#7DF2AD]/10 text-[#7DF2AD]'
                     : 'border-white/[0.08] bg-[#0D1015] text-slate-300 hover:border-[#7DF2AD]/30 hover:text-slate-100'
@@ -547,7 +557,7 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
             No UTC session windows configured. While the filter is enabled with zero active windows, all automated entries are paused. Add a preset or custom UTC window above.
           </div>
         ) : (
-          <div className="space-y-2">
+          <div className={`space-y-2 ${!features.sessionWindowFilter ? 'opacity-50' : ''}`}>
             {sessionWindows.map((win) => {
               const startMin = parseUtcTimeToMinutes(win.startUtc);
               const endMin = parseUtcTimeToMinutes(win.endUtc);
@@ -570,8 +580,9 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
                       role="switch"
                       aria-checked={win.enabled}
                       aria-label={`Toggle ${win.label} session window`}
+                      disabled={!features.sessionWindowFilter}
                       onClick={() => handleToggleWindow(win.id, !win.enabled)}
-                      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition ${
+                      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition disabled:cursor-not-allowed ${
                         win.enabled ? 'bg-[#7DF2AD]' : 'bg-slate-700'
                       }`}
                     >
@@ -585,11 +596,12 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
                     <input
                       type="text"
                       aria-label={`Session label for ${win.id}`}
+                      disabled={!features.sessionWindowFilter}
                       value={win.label}
                       onChange={(e) =>
                         handleUpdateWindowField(win.id, 'label', e.target.value)
                       }
-                      className="w-full max-w-[220px] rounded border border-white/[0.08] bg-[#141820] px-2.5 py-1 text-xs font-medium text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                      className="w-full max-w-[220px] rounded border border-white/[0.08] bg-[#141820] px-2.5 py-1 text-xs font-medium text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
                     />
 
                     {isCurrentlyActive && (
@@ -610,11 +622,12 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
                       <input
                         type="time"
                         aria-label={`${win.label} start UTC`}
+                        disabled={!features.sessionWindowFilter}
                         value={win.startUtc}
                         onChange={(e) =>
                           handleUpdateWindowField(win.id, 'startUtc', e.target.value)
                         }
-                        className="rounded border border-white/[0.08] bg-[#141820] px-2 py-1 text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                        className="rounded border border-white/[0.08] bg-[#141820] px-2 py-1 text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
                       />
                     </label>
 
@@ -625,19 +638,21 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
                       <input
                         type="time"
                         aria-label={`${win.label} end UTC`}
+                        disabled={!features.sessionWindowFilter}
                         value={win.endUtc}
                         onChange={(e) =>
                           handleUpdateWindowField(win.id, 'endUtc', e.target.value)
                         }
-                        className="rounded border border-white/[0.08] bg-[#141820] px-2 py-1 text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                        className="rounded border border-white/[0.08] bg-[#141820] px-2 py-1 text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
                       />
                     </label>
 
                     <button
                       type="button"
                       aria-label={`Remove ${win.label} window`}
+                      disabled={!features.sessionWindowFilter}
                       onClick={() => handleRemoveWindow(win.id)}
-                      className="rounded-md p-1.5 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400"
+                      className="rounded-md p-1.5 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-400 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-slate-400"
                     >
                       <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
                     </button>

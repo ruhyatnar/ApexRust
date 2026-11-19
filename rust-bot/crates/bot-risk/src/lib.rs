@@ -280,7 +280,7 @@ pub fn compute_stop_distance_notional(
     if entry_price <= f64::EPSILON {
         return Err(BotError::RiskRejected("Invalid entry price".into()));
     }
-    let stop_dist_dec = ((entry_price - stop_loss_price).abs() / entry_price).max(0.0005);
+    let stop_dist_dec = ((entry_price - stop_loss_price).abs() / entry_price).max(0.002);
     let dollar_risk = account_equity_usdt.max(0.0) * risk_fraction_f;
     Ok(dollar_risk / stop_dist_dec)
 }

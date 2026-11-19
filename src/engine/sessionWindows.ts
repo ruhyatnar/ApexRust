@@ -24,7 +24,7 @@ export const DEFAULT_UTC_SESSION_WINDOWS: UtcTimeWindow[] = [
   },
 ];
 
-export interface SessionWindowPreset {
+interface SessionWindowPreset {
   id: string;
   label: string;
   startUtc: string;
@@ -64,7 +64,7 @@ export const UTC_SESSION_PRESETS: SessionWindowPreset[] = [
   },
 ];
 
-export interface SessionWindowEvaluation {
+interface SessionWindowEvaluation {
   allowed: boolean;
   filterEnabled: boolean;
   currentUtcHHMM: string;
@@ -91,7 +91,7 @@ export function parseUtcTimeToMinutes(hhmm: string): number | null {
 /**
  * Formats integer minutes since midnight (0..1439) as "HH:MM".
  */
-export function formatUtcMinutes(minuteOfDay: number): string {
+function formatUtcMinutes(minuteOfDay: number): string {
   const normalized = ((Math.floor(minuteOfDay) % 1440) + 1440) % 1440;
   const hh = String(Math.floor(normalized / 60)).padStart(2, '0');
   const mm = String(normalized % 60).padStart(2, '0');
@@ -101,7 +101,7 @@ export function formatUtcMinutes(minuteOfDay: number): string {
 /**
  * Returns current UTC "HH:MM" and minute-of-day (0..1439) for an epoch timestamp.
  */
-export function getUtcClockInfo(nowMs: number): { hhmm: string; minuteOfDay: number } {
+function getUtcClockInfo(nowMs: number): { hhmm: string; minuteOfDay: number } {
   const d = new Date(nowMs);
   const minuteOfDay = d.getUTCHours() * 60 + d.getUTCMinutes();
   return {
@@ -140,7 +140,7 @@ export function evaluateUtcSessionWindows(
   filterEnabled: boolean
 ): SessionWindowEvaluation {
   const { hhmm, minuteOfDay } = getUtcClockInfo(nowMs);
-  const list = Array.isArray(windows) && windows.length > 0 ? windows : DEFAULT_UTC_SESSION_WINDOWS;
+  const list = Array.isArray(windows) ? windows : DEFAULT_UTC_SESSION_WINDOWS;
   const enabledWindows = list.filter((w) => w.enabled);
 
   if (!filterEnabled) {

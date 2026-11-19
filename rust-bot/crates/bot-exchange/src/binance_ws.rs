@@ -59,33 +59,50 @@ impl BinanceWsDriver {
     }
 
     pub fn build_combined_stream_url(&self) -> String {
+        let trimmed = self.cfg.ws_stream_url.trim().trim_end_matches('/');
         let base = match (self.cfg.venue, self.cfg.environment) {
             (ExchangeVenue::Futures, ExchangeEnvironment::Production) => {
-                "wss://fstream.binance.com/stream"
+                if !trimmed.is_empty()
+                    && (trimmed.contains("fstream.binance.com")
+                        || (!trimmed.contains("testnet")
+                            && !trimmed.contains("demo")
+                            && !trimmed.contains("binancefuture")
+                            && !trimmed.contains("stream.binance.com")))
+                {
+                    trimmed
+                } else {
+                    "wss://fstream.binance.com/stream"
+                }
             }
             (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
-                "wss://stream.binancefuture.com/stream"
+                if !trimmed.is_empty()
+                    && (trimmed.contains("binancefuture") || trimmed.contains("demo-fstream"))
+                {
+                    trimmed
+                } else {
+                    "wss://stream.binancefuture.com/stream"
+                }
             }
             (ExchangeVenue::Spot, ExchangeEnvironment::Production) => {
-                if self.cfg.ws_stream_url.trim().is_empty()
-                    || self.cfg.ws_stream_url.contains("testnet")
-                    || self.cfg.ws_stream_url.contains("fstream")
-                    || self.cfg.ws_stream_url.contains("binancefuture")
+                if !trimmed.is_empty()
+                    && !trimmed.contains("testnet")
+                    && !trimmed.contains("demo")
+                    && !trimmed.contains("fstream")
+                    && !trimmed.contains("binancefuture")
                 {
-                    "wss://stream.binance.com:9443/stream"
+                    trimmed
                 } else {
-                    self.cfg.ws_stream_url.as_str()
+                    "wss://stream.binance.com:9443/stream"
                 }
             }
             (ExchangeVenue::Spot, ExchangeEnvironment::Testnet) => {
-                if self.cfg.ws_stream_url.trim().is_empty()
-                    || self.cfg.ws_stream_url.contains("stream.binance.com")
-                    || self.cfg.ws_stream_url.contains("fstream")
-                    || self.cfg.ws_stream_url.contains("binancefuture")
+                if !trimmed.is_empty()
+                    && (trimmed.contains("testnet.binance.vision")
+                        || trimmed.contains("demo-stream.binance.com"))
                 {
-                    "wss://stream.testnet.binance.vision/stream"
+                    trimmed
                 } else {
-                    self.cfg.ws_stream_url.as_str()
+                    "wss://stream.testnet.binance.vision/stream"
                 }
             }
         };
@@ -95,7 +112,7 @@ impl BinanceWsDriver {
             .map(|p| format!("{}@kline_{}", p.to_lowercase(), self.timeframe))
             .collect::<Vec<_>>()
             .join("/");
-        format!("{}?streams={}", base, streams)
+        format!("{}?streams={}", base.trim_end_matches('/'), streams)
     }
 
     /// Connect to Binance WebSocket Streams and forward parsed `MarketEvent`s

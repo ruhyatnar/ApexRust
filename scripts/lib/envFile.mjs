@@ -8,11 +8,12 @@ function unquote(raw) {
   if (value.startsWith('"')) {
     const m = /^"((?:[^"\\]|\\.)*)"(?:\s*(?:#.*)?)?$/.exec(value);
     if (m) {
-      return m[1]
-        .replace(/\\r/g, '\r')
-        .replace(/\\n/g, '\n')
-        .replace(/\\"/g, '"')
-        .replace(/\\\\/g, '\\');
+      // Single-pass unescape so `\\n` decodes to `\n` (literal backslash + n), never `<newline>`
+      return m[1].replace(/\\([rn"\\])/g, (_, ch) => {
+        if (ch === 'r') return '\r';
+        if (ch === 'n') return '\n';
+        return ch;
+      });
     }
   }
   if (value.startsWith("'")) {

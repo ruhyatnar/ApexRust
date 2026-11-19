@@ -3,6 +3,7 @@
 // Uses only Node.js built-ins + local scripts/lib/*.mjs so it runs cleanly on fresh clones.
 
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +18,7 @@ import {
   PATHS,
   REPO_DIR,
   augmentPath,
+  detectZeroTrustMeshIps,
   logFile,
 } from './lib/paths.mjs';
 import { checkPrerequisites, isPortFree, nextFreePort, runCapture } from './lib/prereqs.mjs';
@@ -24,9 +26,11 @@ import {
   ensureRuntimeDirs,
   fetchHealth,
   followFiles,
+  formatHostPort,
   isAlive,
   killTree,
   removePid,
+  resolveComponentLaunchConfig,
   runningPid,
   startDetached,
   tailFile,
@@ -69,14 +73,16 @@ function printHelp() {
 
 Commands:
   setup                 Interactive (or flag-driven) wizard to check prereqs, build, and configure
-  start [target]        Start web, bot, or both in the background (.apexrust/logs/)
+  start [target]        Start web, bot, or both in the background (supports --host, --lan, --web-port, --bot-port, --token)
   stop [target]         Stop running component(s) gracefully
-  restart [target]      Restart component(s)
+  restart [target]      Restart component(s) (supports --host, --lan, --web-port, --bot-port, --token)
+  status                Show running PIDs, health checks, URLs, and OS services
   status                Show running PIDs, health checks, URLs, and OS services
   logs [target]         Print or follow logs (-n <lines>, -f / --follow)
   doctor                Verify toolchains, configs, binaries, ports, and services
-  update                git pull --ff-only, rebuild, and restart previously running services
-  service <action>      Manage OS auto-start services: install | uninstall
+  update                git pull --ff-only, rebuild, and restart running services (--components, --no-restart)
+  service <action>      Manage OS auto-start services: install | uninstall [web|bot|both]
+  remote <action>       Manage Remote VPS connection: status | connect | use-local | use-vps
   uninstall             Stop processes and remove OS services / runtime state (--purge deletes build/config)
   run <component>       Internal foreground supervisor used by detached runner and OS services
 
@@ -84,10 +90,15 @@ Targets: web | bot | both (default uses saved state from setup)
 
 Setup / Service Flags:
   -y, --yes, --non-interactive   Accept defaults without prompting (required flags/env override)
+  --role <local|vps|client>      Machine role: local (This Computer), vps (24/7 Server), client (Desktop linked to VPS)
+  --remote-url <url>             Remote VPS URL for --role client or remote connect (e.g. http://100.96.1.10:3000)
+  --remote-name <name>           Friendly nickname for Remote VPS (default: Remote VPS)
+  --remote-token <token>         Optional Access Token for Remote VPS (pass "" to clear)
+  --allowed-origins <list>       Comma-separated Desktop PWA origins allowed by VPS CORS
   --components <web|bot|both>    Which components to build & configure
   --env <testnet|production>     Binance environment (bot.toml always starts with paper_trading=true)
   --venue <spot|futures>         Trading venue
-  --auth <hmac|ed25519>          Credential auth method
+  --auth <hmac|ed25519|paper>    Credential auth method (paper clears live keys)
   --api-key <key>                Binance API key (optional)
   --api-secret <secret>          Binance API secret (for HMAC)
   --key-path <path>              PKCS#8 PEM path (for Ed25519)
@@ -96,11 +107,13 @@ Setup / Service Flags:
   --web-port <port>              Express/UI port (default: 3000)
   --bot-port <port>              Rust daemon port (default: 8080)
   --host <ip> / --lan            Bind host (default: 127.0.0.1; --lan sets 0.0.0.0)
+  --token <token>                Access token for non-private binds on start/restart (min 32 chars)
   --no-build                     Skip npm/cargo build steps during setup
   --no-start                     Do not start services after setup
   --service / --no-service       Install OS auto-start service during setup
   --system                       Linux only: install system-wide /etc/systemd/system unit (asks sudo)
   --linger / --no-linger         Linux only: enable/skip loginctl enable-linger for systemd --user
+  --no-restart                   For update: rebuild without restarting stopped components/services
   --purge                        For uninstall: also delete .env, bot.toml, node_modules, dist, rust-bot/target
   -n, --lines <n>                Log tail line count (default: 80)
   -f, --follow                   Stream logs until Ctrl+C
@@ -111,8 +124,9 @@ function parseCliArgs(argv) {
   const flags = {};
   const positionals = [];
   const valueFlags = new Set([
-    'components', 'env', 'venue', 'auth', 'api-key', 'api-secret', 'key-path',
-    'leverage', 'margin', 'web-port', 'bot-port', 'host', 'lines', 'n', 'log',
+    'components', 'role', 'remote-url', 'remote-name', 'remote-token', 'allowed-origins',
+    'env', 'venue', 'auth', 'api-key', 'api-secret', 'key-path',
+    'leverage', 'margin', 'web-port', 'bot-port', 'host', 'token', 'web-bind', 'lines', 'log',
   ]);
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -173,6 +187,73 @@ function writeState(next) {
   fs.writeFileSync(PATHS.stateFile, `${JSON.stringify(merged, null, 2)}\n`);
 }
 
+function readRemoteProfile() {
+  try {
+    return JSON.parse(fs.readFileSync(PATHS.remoteProfileFile, 'utf8'));
+  } catch {
+    return { activeMode: 'local', name: 'Remote VPS', baseUrl: '' };
+  }
+}
+
+function writeRemoteProfile(next) {
+  fs.mkdirSync(PATHS.stateDir, { recursive: true });
+  const merged = {
+    ...readRemoteProfile(),
+    ...next,
+    updatedAtIso: new Date().toISOString(),
+  };
+  if (merged.token === '' || merged.token === null) {
+    delete merged.token;
+  }
+  fs.writeFileSync(PATHS.remoteProfileFile, `${JSON.stringify(merged, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  return merged;
+}
+
+function normalizeRemoteUrlCli(rawUrl) {
+  const trimmed = String(rawUrl || '').trim();
+  if (!trimmed) {
+    throw new Error(
+      `Please provide a valid http(s):// Remote VPS URL: ${IS_WIN ? 'apexrust.cmd' : './apexrust'} remote connect --remote-url http://100.96.1.10:3000`
+    );
+  }
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`Invalid Remote VPS URL "${trimmed}". Example: http://100.96.1.10:3000`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Remote VPS URL must start with http:// or https:// (got "${trimmed}")`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Do not embed username/password in the Remote VPS URL; use --remote-token instead.');
+  }
+  const cleanPath = parsed.pathname.replace(/\/+$/, '').replace(/\/api(\/engine)?$/, '');
+  if (cleanPath.includes('..')) {
+    throw new Error('Remote VPS URL path cannot contain "..".');
+  }
+  return `${parsed.origin}${cleanPath}`;
+}
+
+function resolveHealthCheckHost(rawHost) {
+  const clean = String(rawHost || '').trim().replace(/^\[|\]$/g, '');
+  if (!clean || clean === '0.0.0.0' || clean === '::') {
+    return '127.0.0.1';
+  }
+  return clean;
+}
+
+function resolveStableNodePath() {
+  try {
+    return fs.realpathSync(process.execPath);
+  } catch {
+    return process.execPath;
+  }
+}
+
 function readCurrentEnv() {
   try {
     return parseEnv(fs.readFileSync(PATHS.env, 'utf8'));
@@ -189,14 +270,41 @@ function readCurrentTomlText() {
   }
 }
 
-function resolvePorts() {
+function resolveBasePorts() {
   const envMap = readCurrentEnv();
   const state = readState();
   const tomlText = readCurrentTomlText();
   const webPort = Number(envMap.PORT || state.webPort || 3000) || 3000;
   const host = envMap.HOST || state.host || '127.0.0.1';
   const botPort = tomlText ? botPortFromToml(tomlText, state.botPort || 8080) : Number(state.botPort || 8080) || 8080;
-  return { webPort, botPort, host };
+  const rawBind = tomlText ? String(readTomlValue(tomlText, 'web', 'bind_addr') || '') : '';
+  const colonIdx = rawBind.lastIndexOf(':');
+  const botHost = colonIdx > 0 ? rawBind.slice(0, colonIdx).replace(/^\[|\]$/g, '').trim() || '127.0.0.1' : '127.0.0.1';
+  return { webPort, botPort, host, botHost };
+}
+
+function setRuntimeBindState(component, bindInfo) {
+  const state = readState();
+  const runtime = { ...(state.runtime || {}) };
+  if (bindInfo) {
+    runtime[component] = bindInfo;
+  } else {
+    delete runtime[component];
+  }
+  writeState({ runtime });
+}
+
+function resolvePorts() {
+  const base = resolveBasePorts();
+  const state = readState();
+  const rtWeb = runningPid('web') ? state.runtime?.web : null;
+  const rtBot = runningPid('bot') ? state.runtime?.bot : null;
+  return {
+    webPort: Number(rtWeb?.port) || base.webPort,
+    botPort: Number(rtBot?.port) || base.botPort,
+    host: rtWeb?.host || base.host,
+    botHost: rtBot?.host || base.botHost,
+  };
 }
 
 function resolveTargetComponents(target) {
@@ -314,21 +422,43 @@ async function cmdSetup(flags) {
   const existingToml = readCurrentTomlText();
   const state = readState();
 
+  const roleFlag = flags.role ? String(flags.role).toLowerCase() : null;
+  if (roleFlag && roleFlag !== 'local' && roleFlag !== 'vps' && roleFlag !== 'client') {
+    throw new Error(`Invalid --role "${flags.role}". Choose local, vps, or client.`);
+  }
+  const role = roleFlag ?? (isInteractive()
+    ? await select(
+        'How will you use this computer?',
+        [
+          { value: 'local', label: '🖥️ This Computer Only (Standalone Local Mode)' },
+          { value: 'vps', label: '☁️ 24/7 Remote VPS Server (Cloudflare One / Zero Trust Host)' },
+          { value: 'client', label: '💻 Desktop Client Connected to a Remote VPS' },
+        ],
+        state.role || 'local'
+      )
+    : (state.role || 'local'));
+
   const rustQuick = checkPrerequisites({ needRust: true });
   const rustReady = rustQuick.find((r) => r.id === 'rust')?.ok && rustQuick.find((r) => r.id === 'buildtools')?.ok;
 
   let components = normalizeComponentsFlag(flags.components);
   if (!components) {
-    const defaultComp = state.components ?? (rustReady ? 'both' : 'web');
-    components = await select(
-      'Which components do you want to set up?',
-      [
-        { value: 'both', label: 'Web UI + Rust Trading Engine (full local stack)' },
-        { value: 'web', label: 'Web UI & Express Proxy only (fastest — no Rust build)' },
-        { value: 'bot', label: 'Rust Trading Engine Daemon only' },
-      ],
-      defaultComp
-    );
+    if (role === 'vps') {
+      components = 'both';
+    } else if (role === 'client') {
+      components = state.components === 'both' ? 'web' : (state.components || 'web');
+    } else {
+      const defaultComp = state.components ?? (rustReady ? 'both' : 'web');
+      components = await select(
+        'Which components do you want to set up?',
+        [
+          { value: 'both', label: 'Web UI + Rust Trading Engine (full local stack)' },
+          { value: 'web', label: 'Web UI & Express Proxy only (fastest — no Rust build)' },
+          { value: 'bot', label: 'Rust Trading Engine Daemon only' },
+        ],
+        defaultComp
+      );
+    }
   }
   const needRust = components !== 'web';
   const needWeb = components !== 'bot';
@@ -381,14 +511,16 @@ async function cmdSetup(flags) {
         existingVenue === 'futures' ? 'futures' : 'spot'
       ));
 
-  let leverage = Number(flags.leverage || readTomlValue(existingToml, 'exchange', 'leverage') || 3) || 3;
+  let leverage = flags.leverage !== undefined
+    ? Number(flags.leverage)
+    : Number(readTomlValue(existingToml, 'exchange', 'leverage') ?? 3) || 3;
   const marginRaw = flags.margin ? String(flags.margin).toUpperCase() : null;
   if (marginRaw && marginRaw !== 'ISOLATED' && marginRaw !== 'CROSSED') {
     throw new Error(`Invalid --margin "${flags.margin}". Choose ISOLATED or CROSSED.`);
   }
   let marginType = marginRaw || String(readTomlValue(existingToml, 'exchange', 'margin_type') || 'ISOLATED').toUpperCase();
   if (venue === 'futures') {
-    if (!flags.leverage && isInteractive()) {
+    if (flags.leverage === undefined && isInteractive()) {
       const levStr = await input('Default Futures leverage (1-20)', String(leverage), (v) => {
         const n = Number(v);
         return Number.isInteger(n) && n >= 1 && n <= 20 ? null : 'Enter an integer from 1 to 20';
@@ -469,20 +601,65 @@ async function cmdSetup(flags) {
           : ed25519KeyPath);
   }
 
-  // Host & ports
+  // Host & ports (with automatic Cloudflare One WARP / Zero Trust mesh IP detection)
+  const detectedMeshIps = detectZeroTrustMeshIps();
   let host = flags.lan ? '0.0.0.0' : flags.host ? String(flags.host) : null;
   if (!host) {
-    const defaultHost = existingEnv.HOST === '0.0.0.0' || state.host === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
+    const defaultHost =
+      role === 'vps' && detectedMeshIps.length > 0
+        ? detectedMeshIps[0].ip
+        : existingEnv.HOST || state.host || '127.0.0.1';
+    const hostChoices = [
+      {
+        value: '127.0.0.1',
+        label:
+          role === 'vps'
+            ? '127.0.0.1 — Localhost / cloudflared Private Tunnel (Recommended)'
+            : '127.0.0.1 — This computer only (Recommended)',
+      },
+      ...detectedMeshIps.map((m) => ({
+        value: m.ip,
+        label: `${m.ip} — ${m.kind} (${m.iface})`,
+      })),
+      {
+        value: '0.0.0.0',
+        label: '0.0.0.0 — All network interfaces (Generates 32-byte Access Token)',
+      },
+    ];
     host = isInteractive()
-      ? await select(
-          'Network bind address:',
-          [
-            { value: '127.0.0.1', label: '127.0.0.1 — This computer only (Recommended)' },
-            { value: '0.0.0.0', label: '0.0.0.0 — Allow LAN / remote browser access' },
-          ],
-          defaultHost
-        )
+      ? await select('Network bind address:', hostChoices, defaultHost)
       : defaultHost;
+  }
+
+  let remoteVpsUrl = flags['remote-url'] ? String(flags['remote-url']).trim() : '';
+  let remoteVpsName = flags['remote-name'] ? String(flags['remote-name']).trim() : '';
+  let remoteVpsToken = flags['remote-token'] !== undefined ? String(flags['remote-token']).trim() : undefined;
+  if (role === 'client') {
+    const prevProfile = readRemoteProfile();
+    if (!remoteVpsUrl) {
+      if (isInteractive()) {
+        remoteVpsUrl = await input(
+          'Remote VPS Address (Cloudflare One IP or URL, e.g. http://100.96.1.10:3000)',
+          prevProfile.baseUrl || 'http://100.96.1.10:3000'
+        );
+      } else {
+        remoteVpsUrl = prevProfile.baseUrl || '';
+      }
+    }
+    if (!remoteVpsUrl) {
+      throw new Error('Remote VPS URL is required for --role client. Pass --remote-url http://100.96.x.y:3000.');
+    }
+    remoteVpsUrl = normalizeRemoteUrlCli(remoteVpsUrl);
+    if (!remoteVpsName) {
+      remoteVpsName = isInteractive()
+        ? await input('Remote VPS Nickname', prevProfile.name || 'Tokyo VPS')
+        : (prevProfile.name || 'Remote VPS');
+    }
+    if (remoteVpsToken === undefined) {
+      remoteVpsToken = isInteractive()
+        ? await input('Optional Remote VPS Access Token (leave blank if trusted on Cloudflare One)', prevProfile.token || '')
+        : (prevProfile.token || '');
+    }
   }
 
   const webRunning = Boolean(runningPid('web'));
@@ -491,15 +668,16 @@ async function cmdSetup(flags) {
   const webPort = flags['web-port'] !== undefined
     ? validatePortNumber(flags['web-port'])
     : needWeb
-      ? await resolvePortChoice('Web Command Center', defaultWebPort, host, [], webRunning)
+      ? await resolvePortChoice('Web Command Center', defaultWebPort, resolveHealthCheckHost(host), [], webRunning)
       : defaultWebPort;
 
   const existingBotPort = botPortFromToml(existingToml, state.botPort || 8080);
   const defaultBotPort = Number(flags['bot-port'] || existingBotPort || 8080) || 8080;
+  const botBindHost = needWeb ? '127.0.0.1' : host;
   const botPort = flags['bot-port'] !== undefined
     ? validatePortNumber(flags['bot-port'], needWeb ? [webPort] : [])
     : needRust
-      ? await resolvePortChoice('Rust Bot API', defaultBotPort, host, needWeb ? [webPort] : [], botRunning)
+      ? await resolvePortChoice('Rust Bot API', defaultBotPort, resolveHealthCheckHost(botBindHost), needWeb ? [webPort] : [], botRunning)
       : defaultBotPort;
 
   // Build steps
@@ -541,6 +719,20 @@ async function cmdSetup(flags) {
     ok(`Backed up existing .env -> ${path.relative(REPO_DIR, PATHS.envBackup)}`);
   }
   const envTemplate = fs.readFileSync(PATHS.envExample, 'utf8');
+  const existingProxyTok = (existingEnv.APEXRUST_PROXY_TOKEN || '').trim();
+  const proxyToken =
+    host === '0.0.0.0'
+      ? (existingProxyTok.length >= 32 ? existingProxyTok : crypto.randomBytes(24).toString('hex'))
+      : existingProxyTok;
+  const existingEngineTok = (existingEnv.APEXRUST_WEB_TOKEN || existingEnv.APEXRUST_ENGINE_TOKEN || '').trim();
+  const engineToken =
+    role === 'vps'
+      ? (existingEngineTok.length >= 32 ? existingEngineTok : crypto.randomBytes(24).toString('hex'))
+      : existingEngineTok;
+  const allowedOrigins =
+    flags['allowed-origins']
+      ? String(flags['allowed-origins'])
+      : existingEnv.APEXRUST_ALLOWED_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000';
   const nextEnvContent = renderEnv(envTemplate, {
     PORT: String(webPort),
     HOST: host,
@@ -550,7 +742,17 @@ async function cmdSetup(flags) {
     BINANCE_API_KEY: apiKey,
     BINANCE_API_SECRET: apiSecret,
     BINANCE_PRIVATE_KEY_PATH: ed25519KeyPath,
-    ...(existingEnv.APEXRUST_PROXY_TOKEN ? { APEXRUST_PROXY_TOKEN: existingEnv.APEXRUST_PROXY_TOKEN } : {}),
+    ...(role === 'vps'
+      ? {
+          APEXRUST_ENGINE_AUTHORITY: 'daemon',
+          APEXRUST_ENGINE_URL: `http://127.0.0.1:${botPort}`,
+          APEXRUST_PERSIST_VAULT: 'true',
+          APEXRUST_ALLOWED_ORIGINS: allowedOrigins,
+          APEXRUST_WEB_TOKEN: engineToken,
+          APEXRUST_ENGINE_TOKEN: engineToken,
+        }
+      : {}),
+    ...(proxyToken ? { APEXRUST_PROXY_TOKEN: proxyToken } : {}),
   });
   fs.writeFileSync(PATHS.env, nextEnvContent, 'utf8');
   chmodOwnerOnly(PATHS.env);
@@ -571,7 +773,7 @@ async function cmdSetup(flags) {
       marginType,
       authMethod,
       ed25519KeyPath,
-      botHost: host,
+      botHost: botBindHost,
       botPort,
       webPort,
     });
@@ -581,6 +783,7 @@ async function cmdSetup(flags) {
   }
 
   writeState({
+    role,
     components,
     webPort,
     botPort,
@@ -590,6 +793,23 @@ async function cmdSetup(flags) {
     installedAt: new Date().toISOString(),
   });
 
+  if (role === 'client' && remoteVpsUrl) {
+    writeRemoteProfile({
+      activeMode: 'remote',
+      name: remoteVpsName || 'Remote VPS',
+      baseUrl: remoteVpsUrl.replace(/\/+$/, ''),
+      token: remoteVpsToken ?? '',
+    });
+    ok(`Linked Desktop Client to ☁️ ${remoteVpsName || 'Remote VPS'} (${remoteVpsUrl})`);
+  } else {
+    writeRemoteProfile({
+      activeMode: 'local',
+    });
+  }
+
+  const activeComponentsToRun =
+    role === 'client' && needWeb ? 'web' : (components === 'both' ? 'both' : components);
+
   // Optional auto-start OS service
   let installSvc = parseBooleanFlag(flags.service, undefined);
   if (installSvc === undefined && isInteractive()) {
@@ -597,7 +817,7 @@ async function cmdSetup(flags) {
   }
   let startedByService = false;
   if (installSvc) {
-    await cmdServiceInstall(components === 'both' ? 'both' : components, flags);
+    await cmdServiceInstall(activeComponentsToRun, flags);
     startedByService = true;
   }
 
@@ -605,7 +825,7 @@ async function cmdSetup(flags) {
   if (!startedByService && flags.start !== false) {
     const startNow = flags.start === true || (!isInteractive() ? true : await confirm('Start ApexRust now?', true));
     if (startNow) {
-      await cmdStart(components, { ...flags, forceRestart: true });
+      await cmdStart(activeComponentsToRun, { ...flags, forceRestart: true });
     }
   }
 
@@ -616,10 +836,19 @@ async function cmdSetup(flags) {
     console.log(`  Web UI:     http://${urlHost}:${webPort}`);
   }
   if (needRust) {
-    const urlHost = host === '0.0.0.0' ? 'localhost' : host;
-    console.log(`  Rust API:   http://${urlHost}:${botPort}/api/health`);
+    console.log(`  Rust API:   http://${botBindHost}:${botPort}/api/health`);
   }
-  console.log(`  Useful commands: ${cliHint} status | logs -f | doctor | stop | uninstall\n`);
+  if (role === 'vps') {
+    const connectHost = host === '0.0.0.0' ? '<vps-cloudflare-one-ip>' : host;
+    console.log(`  VPS Gateway: http://${connectHost}:${webPort} (authority=daemon)`);
+    if (proxyToken) {
+      console.log(`  Access Token saved to .env (APEXRUST_PROXY_TOKEN) — keep it private!`);
+    }
+    console.log('  Remember to add this VPS outbound IP to your Binance API key IP whitelist.');
+  } else if (role === 'client' && remoteVpsUrl) {
+    console.log(`  Connected Remote VPS: ☁️ ${remoteVpsName} (${remoteVpsUrl})`);
+  }
+  console.log(`  Useful commands: ${cliHint} status | remote status | logs -f | doctor | stop | uninstall\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +870,13 @@ async function cmdRun(component, flags) {
   ensureRuntimeDirs();
 
   const childEnv = { ...process.env };
+  const directLaunch = resolveComponentLaunchConfig({
+    component,
+    target: component,
+    flags,
+    basePorts: resolveBasePorts(),
+  });
+  Object.assign(childEnv, directLaunch.envOverrides);
   loadDotEnvInto(childEnv);
 
   let cmd;
@@ -660,7 +896,13 @@ async function cmdRun(component, flags) {
       throw new Error(`Missing ${PATHS.botToml}. Run \`./apexrust setup\` first.`);
     }
     cmd = PATHS.botBinary;
-    args = ['--config', PATHS.botToml];
+    args = ['--daemon', '--config', PATHS.botToml];
+    const webBind =
+      (flags['web-bind'] ? String(flags['web-bind']).trim() : '') ||
+      (childEnv.BOT_WEB_BIND || '').trim();
+    if (webBind) {
+      args.push('--web-bind', webBind);
+    }
   }
 
   let logFd = null;
@@ -731,19 +973,30 @@ async function cmdRun(component, flags) {
 // ---------------------------------------------------------------------------
 // start / stop / restart
 // ---------------------------------------------------------------------------
-async function startComponent(component, forceRestart = false) {
+async function startComponent(component, flags = {}, target = undefined) {
+  const normFlags = typeof flags === 'boolean' ? { forceRestart: flags } : flags;
+  const launch = resolveComponentLaunchConfig({
+    component,
+    target,
+    flags: normFlags,
+    basePorts: resolveBasePorts(),
+  });
+
   const existing = runningPid(component);
   if (existing) {
-    if (forceRestart) {
+    if (launch.shouldRestart) {
       await stopComponent(component);
     } else {
-      ok(`${component} is already running (pid ${existing}).`);
+      const activePorts = resolvePorts();
+      const activeHost = component === 'web' ? activePorts.host : activePorts.botHost;
+      const activePort = component === 'web' ? activePorts.webPort : activePorts.botPort;
+      ok(`${component} is already running (pid ${existing}) -> ${formatHostPort(activeHost, activePort)}.`);
       return;
     }
   }
 
-  const { webPort, botPort } = resolvePorts();
-  const port = component === 'web' ? webPort : botPort;
+  const port = launch.port;
+  const probeHost = resolveHealthCheckHost(launch.bindHost);
 
   if (component === 'web') {
     if (!fs.existsSync(PATHS.tsxCli)) {
@@ -761,29 +1014,44 @@ async function startComponent(component, forceRestart = false) {
     }
   }
 
-  if (!(await isPortFree(port, '127.0.0.1'))) {
-    throw new Error(`Port ${port} for ${component} is already in use by another process.`);
+  if (!(await isPortFree(port, probeHost))) {
+    throw new Error(`Port ${port} on ${probeHost} for ${component} is already in use by another process.`);
   }
 
-  info(`Starting ${component}...`);
-  const pid = startDetached(component, process.env);
-  writePid(component, pid);
+  const spawnEnv = { ...process.env, ...launch.envOverrides };
+  if (component === 'bot' && !launch.envOverrides.BOT_WEB_BIND) {
+    delete spawnEnv.BOT_WEB_BIND;
+  }
 
-  const healthUrl = `http://127.0.0.1:${port}/api/health`;
+  info(`Starting ${component} (bind ${formatHostPort(launch.bindHost, port)})...`);
+  const pid = startDetached(component, spawnEnv);
+  writePid(component, pid);
+  setRuntimeBindState(component, { host: launch.bindHost, port });
+
+  const healthUrl = `http://${probeHost}:${port}/api/health`;
   const health = await waitForHealth(healthUrl, 45000, () => isAlive(pid));
   if (!health.ok) {
     const tail = tailFile(logFile(component), 25);
     await killTree(pid, 3000);
     removePid(component, pid);
+    setRuntimeBindState(component, null);
+    const nonPrivateHint =
+      launch.bindHost === '0.0.0.0' || launch.bindHost === '::'
+        ? `\nHint: Binding "${launch.bindHost}" requires a >= 32-char token (--token <TOKEN> or ${component === 'web' ? 'APEXRUST_PROXY_TOKEN' : 'APEXRUST_WEB_TOKEN'} in .env), or run \`./apexrust setup --role vps --lan\`.`
+        : '';
     throw new Error(
-      `${component} failed health check at ${healthUrl} (${health.error ?? `HTTP ${health.status}`}).\n` +
+      `${component} failed health check at ${healthUrl} (${health.error ?? `HTTP ${health.status}`}).${nonPrivateHint}\n` +
         (tail ? `Recent log output:\n${tail}` : `See ${logFile(component)}`)
     );
   }
-  ok(`${component} started (pid ${pid}) -> ${healthUrl}`);
+  const boundDisplay = formatHostPort(launch.bindHost, port);
+  const endpointMsg =
+    launch.bindHost === probeHost ? healthUrl : `${boundDisplay} (health: ${healthUrl})`;
+  ok(`${component} started (pid ${pid}) -> ${endpointMsg}`);
 }
 
 async function stopComponent(component) {
+  setRuntimeBindState(component, null);
   const pid = runningPid(component);
   if (!pid) {
     removePid(component);
@@ -804,7 +1072,7 @@ async function stopComponent(component) {
 async function cmdStart(target, flags = {}) {
   augmentPath();
   for (const c of resolveTargetComponents(target)) {
-    await startComponent(c, Boolean(flags.forceRestart));
+    await startComponent(c, flags, target);
   }
 }
 
@@ -814,10 +1082,10 @@ async function cmdStop(target) {
   }
 }
 
-async function cmdRestart(target) {
+async function cmdRestart(target, flags = {}) {
   const list = resolveTargetComponents(target);
   for (const c of list) await stopComponent(c);
-  for (const c of list) await startComponent(c);
+  for (const c of list) await startComponent(c, flags, target);
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +1125,7 @@ function getServiceStatus(component) {
 }
 
 async function cmdStatus() {
-  const { webPort, botPort, host } = resolvePorts();
+  const { webPort, botPort, host, botHost } = resolvePorts();
   const tomlText = readCurrentTomlText();
   const envName = tomlText ? readTomlValue(tomlText, 'exchange', 'environment') : undefined;
   const venue = tomlText ? readTomlValue(tomlText, 'exchange', 'venue') : undefined;
@@ -874,14 +1142,19 @@ async function cmdStatus() {
 
   for (const c of COMPONENTS) {
     const port = c === 'web' ? webPort : botPort;
+    const rawHost = c === 'web' ? host : botHost;
+    const probeHost = resolveHealthCheckHost(rawHost);
     const pid = runningPid(c);
-    const health = await fetchHealth(`http://127.0.0.1:${port}/api/health`, 1500);
+    const health = await fetchHealth(`http://${probeHost}:${port}/api/health`, 1500);
     const stateLabel = health.ok
       ? `${C.green}HEALTHY${C.reset}`
       : pid
         ? `${C.yellow}STARTING/UNHEALTHY${C.reset}`
         : `${C.dim}STOPPED${C.reset}`;
-    const url = `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`;
+    const url =
+      rawHost === '0.0.0.0' || rawHost === '::'
+        ? `${formatHostPort(rawHost, port)} (local: http://localhost:${port})`
+        : `http://${formatHostPort(rawHost, port)}`;
     console.log(`  [${c}] ${stateLabel} | pid: ${pid ?? '-'} | url: ${url} | service: ${getServiceStatus(c)}`);
   }
   console.log('');
@@ -979,18 +1252,69 @@ async function cmdDoctor() {
   }
 
   console.log('');
-  info('Ports, Runtime & Services');
-  const { webPort, botPort } = resolvePorts();
-  for (const [c, port] of [['web', webPort], ['bot', botPort]]) {
-    const pid = runningPid(c);
-    const health = await fetchHealth(`http://127.0.0.1:${port}/api/health`, 1500);
-    const free = await isPortFree(port, '127.0.0.1');
-    if (health.ok) {
-      ok(`${c} responding on 127.0.0.1:${port} (pid ${pid ?? 'external'})`);
-    } else if (!free) {
-      warn(`Port ${port} (${c}) is occupied by a process not answering /api/health`);
+  info('Network, Cloudflare One Zero Trust & Remote VPS Checks');
+  const currentEnv = readCurrentEnv();
+  const bindHost = currentEnv.HOST || state.host || '127.0.0.1';
+  const proxyTok = (currentEnv.APEXRUST_PROXY_TOKEN || '').trim();
+  const meshIps = detectZeroTrustMeshIps();
+  if (meshIps.length > 0) {
+    for (const m of meshIps) {
+      ok(`Detected ${m.kind} (${m.iface}): ${m.ip}`);
+    }
+  } else {
+    info('No Cloudflare One / CGNAT (100.64.0.0/10) mesh interface detected locally');
+  }
+  if (bindHost === '0.0.0.0' && proxyTok.length < 32 && currentEnv.APEXRUST_TRUST_ZERO_TRUST_MESH !== 'true') {
+    issues += 1;
+    fail('HOST=0.0.0.0 requires a >= 32-char APEXRUST_PROXY_TOKEN (or set HOST=127.0.0.1 / Cloudflare One WARP IP)');
+  } else {
+    ok(`Bind safety OK (HOST=${bindHost}, authority=${currentEnv.APEXRUST_ENGINE_AUTHORITY || 'browser'})`);
+  }
+
+  try {
+    const t0 = Date.now();
+    const timeResp = await fetch('https://api.binance.com/api/v3/time', {
+      signal: AbortSignal.timeout(2500),
+    });
+    if (timeResp.ok) {
+      const rttMs = Math.max(1, Date.now() - t0);
+      const timeJson = await timeResp.json();
+      const driftMs = Math.abs(Date.now() - Number(timeJson.serverTime || Date.now()));
+      if (driftMs > 1000) {
+        warn(`System clock drift vs Binance API is ${driftMs} ms (> 1000 ms, RTT ${rttMs} ms) — enable NTP/chrony sync`);
+      } else {
+        ok(`Binance REST clock drift: ${driftMs} ms (RTT ${rttMs} ms, within 1000 ms)`);
+      }
+    }
+  } catch {
+    info('Skipping Binance REST clock check (offline or sandboxed network)');
+  }
+
+  const remoteProf = readRemoteProfile();
+  if (remoteProf.activeMode === 'remote' && remoteProf.baseUrl) {
+    info(`Remote VPS Profile active: ☁️ ${remoteProf.name || 'Remote VPS'} -> ${remoteProf.baseUrl}`);
+    const rHealth = await fetchHealth(`${remoteProf.baseUrl}/api/health`, 2000);
+    if (rHealth.ok) {
+      ok(`Remote VPS reachable at ${remoteProf.baseUrl}`);
     } else {
-      info(`${c} stopped (port ${port} is free)`);
+      warn(`Remote VPS unreachable at ${remoteProf.baseUrl} (verify Cloudflare One Client is connected)`);
+    }
+  }
+
+  console.log('');
+  info('Ports, Runtime & Services');
+  const { webPort, botPort, host, botHost } = resolvePorts();
+  for (const [c, port, rawHost] of [['web', webPort, host], ['bot', botPort, botHost]]) {
+    const probeHost = resolveHealthCheckHost(rawHost);
+    const pid = runningPid(c);
+    const health = await fetchHealth(`http://${probeHost}:${port}/api/health`, 1500);
+    const free = await isPortFree(port, probeHost);
+    if (health.ok) {
+      ok(`${c} responding on ${probeHost}:${port} (pid ${pid ?? 'external'})`);
+    } else if (!free) {
+      warn(`Port ${port} (${c}) on ${probeHost} is occupied by a process not answering /api/health`);
+    } else {
+      info(`${c} stopped (port ${port} on ${probeHost} is free)`);
     }
     info(`${c} service: ${getServiceStatus(c)}`);
   }
@@ -1016,6 +1340,7 @@ async function cmdDoctor() {
 async function installLinuxSystemd(components, flags) {
   const pathEnv = process.env.PATH;
   const user = os.userInfo().username;
+  const stableNodePath = resolveStableNodePath();
   if (flags.system) {
     ensureRuntimeDirs();
     for (const c of components) {
@@ -1024,7 +1349,7 @@ async function installLinuxSystemd(components, flags) {
       const content = renderSystemdUnit({
         component: c,
         repoDir: REPO_DIR,
-        nodePath: process.execPath,
+        nodePath: stableNodePath,
         system: true,
         user,
         pathEnv,
@@ -1058,7 +1383,7 @@ async function installLinuxSystemd(components, flags) {
       renderSystemdUnit({
         component: c,
         repoDir: REPO_DIR,
-        nodePath: process.execPath,
+        nodePath: stableNodePath,
         system: false,
         pathEnv,
       }),
@@ -1121,6 +1446,7 @@ function installMacLaunchd(components) {
   fs.mkdirSync(dir, { recursive: true });
   ensureRuntimeDirs();
   const uid = typeof process.getuid === 'function' ? process.getuid() : '';
+  const stableNodePath = resolveStableNodePath();
   for (const c of components) {
     const label = launchdLabel(c);
     const plist = path.join(dir, `${label}.plist`);
@@ -1129,7 +1455,7 @@ function installMacLaunchd(components) {
       renderLaunchdPlist({
         component: c,
         repoDir: REPO_DIR,
-        nodePath: process.execPath,
+        nodePath: stableNodePath,
         logPath: logFile(c),
         pathEnv: process.env.PATH,
       }),
@@ -1184,12 +1510,13 @@ function installWindowsTasks(components) {
   }
 }
 
-function uninstallWindowsTasks(components) {
+async function uninstallWindowsTasks(components) {
   for (const c of components) {
     const name = windowsTaskName(c);
     const exists = runCapture('schtasks', ['/Query', '/TN', name]);
     if (exists.ok) {
       runCapture('schtasks', ['/End', '/TN', name]);
+      if (runningPid(c)) await stopComponent(c);
       runCapture('schtasks', ['/Delete', '/TN', name, '/F']);
       ok(`Removed Scheduled Task ${name}`);
     }
@@ -1212,10 +1539,11 @@ async function cmdServiceInstall(target, flags) {
     throw new Error(`OS auto-start services are not supported on ${process.platform}.`);
   }
 
-  const { webPort, botPort } = resolvePorts();
+  const { webPort, botPort, host, botHost } = resolvePorts();
   for (const c of components) {
     const port = c === 'web' ? webPort : botPort;
-    const healthUrl = `http://127.0.0.1:${port}/api/health`;
+    const probeHost = resolveHealthCheckHost(c === 'web' ? host : botHost);
+    const healthUrl = `http://${probeHost}:${port}/api/health`;
     info(`Waiting for ${c} service health at ${healthUrl}...`);
     const health = await waitForHealth(healthUrl, 45000);
     if (!health.ok) {
@@ -1235,10 +1563,36 @@ async function cmdServiceUninstall(target) {
 
 async function cmdService(args, flags) {
   const action = args[0];
-  const target = args[1];
+  const target = args[1] ?? (typeof flags.components === 'string' ? flags.components : undefined);
   if (action === 'install') return cmdServiceInstall(target, flags);
   if (action === 'uninstall' || action === 'remove') return cmdServiceUninstall(target);
-  throw new Error('Usage: ./apexrust service <install|uninstall> [web|bot|both] [--system] [--linger]');
+  throw new Error('Usage: ./apexrust service <install|uninstall> [web|bot|both] [--components ...] [--system] [--linger]');
+}
+
+function restartInstalledService(component) {
+  if (IS_LINUX) {
+    const unit = systemdUnitName(component);
+    if (fs.existsSync(path.join(os.homedir(), '.config', 'systemd', 'user', unit))) {
+      return runStreaming('systemctl', ['--user', 'restart', unit]).ok;
+    }
+    if (fs.existsSync(path.join('/etc/systemd/system', unit))) {
+      return runStreaming('systemctl', ['restart', unit]).ok;
+    }
+  } else if (IS_MAC) {
+    const label = launchdLabel(component);
+    const plist = path.join(os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+    if (fs.existsSync(plist)) {
+      const uid = typeof process.getuid === 'function' ? process.getuid() : '';
+      return runStreaming('launchctl', ['kickstart', '-k', `gui/${uid}/${label}`]).ok;
+    }
+  } else if (IS_WIN) {
+    const name = windowsTaskName(component);
+    if (runCapture('schtasks', ['/Query', '/TN', name]).ok) {
+      runCapture('schtasks', ['/End', '/TN', name]);
+      return runCapture('schtasks', ['/Run', '/TN', name]).ok;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,7 +1605,11 @@ async function cmdUpdate(flags) {
   const components = resolveTargetComponents(flags.components);
   const needWeb = components.includes('web');
   const needRust = components.includes('bot');
-  const wasRunning = components.filter((c) => Boolean(runningPid(c)));
+  const managedServices = components.filter((c) => {
+    const st = getServiceStatus(c);
+    return st !== 'not installed' && st !== 'unsupported';
+  });
+  const wasRunning = components.filter((c) => Boolean(runningPid(c)) && !managedServices.includes(c));
 
   if (wasRunning.length > 0) {
     info(`Stopping running component(s) before update: ${wasRunning.join(', ')}`);
@@ -1278,10 +1636,95 @@ async function cmdUpdate(flags) {
     if (!cargoRes.ok) throw new Error('Cargo build failed.');
   }
 
-  if (wasRunning.length > 0 && flags.restart !== false) {
+  if (flags.restart !== false) {
+    for (const c of managedServices) {
+      info(`Restarting installed OS service for ${c}...`);
+      if (restartInstalledService(c)) {
+        ok(`Restarted OS service for ${c}`);
+      } else {
+        warn(`Could not auto-restart OS service for ${c}; restart manually via OS service manager.`);
+      }
+    }
     for (const c of wasRunning) await startComponent(c);
   }
   ok('Update complete.');
+}
+
+async function cmdRemote(positionals, flags) {
+  printBanner();
+  const action = (positionals[0] || 'status').toLowerCase();
+  const profile = readRemoteProfile();
+
+  if (action === 'use-local' || action === 'local') {
+    const next = writeRemoteProfile({ activeMode: 'local' });
+    ok(`Switched active target to: 🖥️ This Computer (Local Mode) [${next.updatedAtIso}]`);
+    return;
+  }
+
+  if (action === 'use-vps' || action === 'use-remote' || action === 'remote') {
+    if (!profile.baseUrl) {
+      throw new Error(
+        `No Remote VPS URL saved yet. Run: ${IS_WIN ? 'apexrust.cmd' : './apexrust'} remote connect --remote-url http://100.96.x.y:3000`
+      );
+    }
+    const next = writeRemoteProfile({ activeMode: 'remote' });
+    ok(`Switched active target to: ☁️ Remote VPS (${next.name} -> ${next.baseUrl})`);
+    return;
+  }
+
+  if (action === 'connect') {
+    const rawUrl = String(flags['remote-url'] || positionals[1] || profile.baseUrl || '').trim();
+    const cleanUrl = normalizeRemoteUrlCli(rawUrl);
+    const name = String(flags['remote-name'] || profile.name || 'Remote VPS').trim();
+    const rawTokFlag = flags['remote-token'] ?? flags.token;
+    const token = rawTokFlag !== undefined ? String(rawTokFlag).trim() : (profile.token || '');
+    const saved = writeRemoteProfile({
+      activeMode: 'remote',
+      name,
+      baseUrl: cleanUrl,
+      token,
+    });
+    ok(`Saved Remote VPS profile: ☁️ ${saved.name} (${saved.baseUrl})`);
+  }
+
+  const current = readRemoteProfile();
+  const meshIps = detectZeroTrustMeshIps();
+  console.log(`${C.bold}Active Execution Location:${C.reset} ${
+    current.activeMode === 'remote'
+      ? `${C.cyan}☁️ Remote VPS (${current.name} -> ${current.baseUrl})${C.reset}`
+      : `${C.green}🖥️ This Computer (Local Mode)${C.reset}`
+  }`);
+  if (meshIps.length > 0) {
+    for (const m of meshIps) {
+      ok(`Detected ${m.kind} interface (${m.iface}): ${m.ip}`);
+    }
+  }
+  if (current.baseUrl) {
+    try {
+      const headers = {};
+      if (current.token) {
+        headers.Authorization = `Bearer ${current.token}`;
+        headers['X-ApexRust-Token'] = current.token;
+      }
+      const started = Date.now();
+      const resp = await fetch(`${current.baseUrl}/api/connection/info`, {
+        headers,
+        signal: AbortSignal.timeout(4000),
+      });
+      const latency = Date.now() - started;
+      if (resp.ok) {
+        const infoData = await resp.json();
+        ok(`1. VPS Server Reachable    : ${current.baseUrl} (${latency} ms)`);
+        ok(`2. Access Permission       : Verified (${infoData.zeroTrustUser || 'Cloudflare One / Token OK'})`);
+        ok(`3. 24/7 VPS Trading Daemon : ${infoData.engineReachable ? (infoData.engineRunning ? 'Online & Running' : 'Online (Paused)') : 'Web Proxy Only'}`);
+        ok(`4. Binance Account Mode    : ${infoData.venue} · ${infoData.environment} (authority=${infoData.engineAuthority})`);
+      } else {
+        warn(`Remote VPS returned HTTP ${resp.status} from ${current.baseUrl}/api/connection/info`);
+      }
+    } catch (err) {
+      warn(`Could not reach Remote VPS at ${current.baseUrl}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 async function cmdUninstall(flags) {
@@ -1310,6 +1753,10 @@ async function cmdUninstall(flags) {
       PATHS.botToml,
       PATHS.botTomlBackup,
       path.join(REPO_DIR, '.apexrust-order-logs.json'),
+      path.join(REPO_DIR, '.apexrust-orders.sqlite'),
+      path.join(REPO_DIR, '.apexrust-orders.sqlite-wal'),
+      path.join(REPO_DIR, '.apexrust-orders.sqlite-shm'),
+      path.join(REPO_DIR, '.apexrust-orders.sqlite.json'),
       path.join(REPO_DIR, 'dist'),
       path.join(REPO_DIR, 'node_modules'),
       path.join(PATHS.rustDir, 'target'),
@@ -1353,7 +1800,7 @@ async function main() {
       await cmdStop(positionals[0]);
       break;
     case 'restart':
-      await cmdRestart(positionals[0]);
+      await cmdRestart(positionals[0], flags);
       break;
     case 'status':
       await cmdStatus();
@@ -1369,6 +1816,9 @@ async function main() {
       break;
     case 'service':
       await cmdService(positionals, flags);
+      break;
+    case 'remote':
+      await cmdRemote(positionals, flags);
       break;
     case 'uninstall':
       await cmdUninstall(flags);

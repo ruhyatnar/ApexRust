@@ -5,6 +5,29 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import dotenv from 'dotenv';
 import express from 'express';
+import { OrderHistoryDatabase } from './src/engine/orderDatabase';
+import { validateRemoteBaseUrl } from './src/engine/apiClient';
+import {
+  aggregateTradesByOrderId,
+  buildBinanceSyncTimeWindows,
+  detectOrphanPairs,
+  lookbackPresetToMs,
+} from './src/engine/orderHistoryAnalytics';
+import {
+  AuthFailureLimiter,
+  type EngineAuthorityMode,
+  LiveExecutionLeaseManager,
+  evaluateBindSafety,
+  evaluateEngineAuthorityGuard,
+  isEnginePathAllowed,
+  isOriginAllowed,
+  parseAllowedOrigins,
+} from './src/engine/remoteAccess';
+import type {
+  OrderExecutionLog,
+  OrphanResolutionAction,
+  SyncLookbackPreset,
+} from './src/engine/types';
 
 dotenv.config();
 
@@ -67,17 +90,36 @@ function loadInitialSecret(): string {
 }
 const initialSecret = loadInitialSecret();
 
+const initialLeverageRaw = Number(process.env.BINANCE_LEVERAGE ?? 3);
+const initialLeverage = Number.isFinite(initialLeverageRaw)
+  ? Math.min(20, Math.max(1, Math.round(initialLeverageRaw)))
+  : 3;
+const initialMarginType: MarginType =
+  (process.env.BINANCE_MARGIN_TYPE ?? '').trim().toUpperCase() === 'CROSSED'
+    ? 'CROSSED'
+    : 'ISOLATED';
+const initialRecvWindowRaw = Number(process.env.BINANCE_RECV_WINDOW_MS ?? 5000);
+const initialRecvWindowMs = Number.isFinite(initialRecvWindowRaw)
+  ? Math.min(60_000, Math.max(1000, Math.round(initialRecvWindowRaw)))
+  : 5000;
+const initialMaxNotionalRaw = Number(process.env.APEXRUST_MAX_ORDER_NOTIONAL_USDT ?? 250);
+const initialMaxNotionalUsdt = Number.isFinite(initialMaxNotionalRaw)
+  ? Math.max(10, Number(initialMaxNotionalRaw.toFixed(2)))
+  : 250;
+const initialRequirePreflight =
+  (process.env.APEXRUST_REQUIRE_PREFLIGHT ?? 'true').trim().toLowerCase() !== 'false';
+
 const vault: ServerVaultState = {
   environment: initialEnv,
   venue: initialVenue,
-  leverage: 3,
-  marginType: 'ISOLATED',
+  leverage: initialLeverage,
+  marginType: initialMarginType,
   authMethod: initialAuth,
   apiKey: initialKey,
   apiSecret: initialSecret,
-  recvWindowMs: 5000,
-  maxOrderNotionalUsdt: 250,
-  requirePreflightTestOrder: true,
+  recvWindowMs: initialRecvWindowMs,
+  maxOrderNotionalUsdt: initialMaxNotionalUsdt,
+  requirePreflightTestOrder: initialRequirePreflight,
   armedForLiveOrders: false,
   verificationStatus: 'unverified',
   verificationMessage: null,
@@ -88,40 +130,12 @@ const vault: ServerVaultState = {
   syncedBalances: [],
 };
 
-interface BackendOrderExecutionLog {
-  id: string;
-  orderId: string;
-  clientOrderId: string;
-  orderListId?: number;
-  algoOrderIds?: string[];
-  symbol: string;
-  venue: ExchangeVenue;
-  environment: BinanceEnv;
-  accountMode: 'Paper' | 'Live';
-  source: 'paper_engine' | 'live_proxy' | 'binance_all_orders';
-  lifecycle: 'ENTRY' | 'EXIT' | 'CANCEL' | 'PREFLIGHT';
-  side: 'Long' | 'Short';
-  binanceSide: 'BUY' | 'SELL';
-  orderType: string;
-  timeInForce: string;
-  status: 'FILLED' | 'PARTIALLY_FILLED' | 'NEW' | 'CANCELED' | 'REJECTED' | 'EXPIRED';
-  price: number;
-  executedQty: number;
-  origQty: number;
-  quoteQty: number;
-  commission: number;
-  commissionAsset: string;
-  isMaker: boolean;
-  realizedPnlUsdt: number | null;
-  rMultiple: number | null;
-  exitReason: string | null;
-  latencyMs: number | null;
-  endpoint: string;
-  rationale: string;
-  errorMessage?: string;
-  timestampMs: number;
-}
+type BackendOrderExecutionLog = OrderExecutionLog;
 
+const ORDER_DB_FILE = path.resolve(
+  process.cwd(),
+  process.env.APEXRUST_ORDER_DB_PATH?.trim() || '.apexrust-orders.sqlite'
+);
 const ORDER_LOGS_FILE = path.resolve(process.cwd(), '.apexrust-order-logs.json');
 
 function buildInitialPaperOrderLogs(): BackendOrderExecutionLog[] {
@@ -312,26 +326,6 @@ function buildInitialPaperOrderLogs(): BackendOrderExecutionLog[] {
   ];
 }
 
-function loadOrderLogsFromDisk(): BackendOrderExecutionLog[] {
-  try {
-    if (fs.existsSync(ORDER_LOGS_FILE)) {
-      const raw = fs.readFileSync(ORDER_LOGS_FILE, 'utf8');
-      const parsed = JSON.parse(raw) as unknown;
-      if (Array.isArray(parsed)) {
-        return parsed.filter(
-          (x): x is BackendOrderExecutionLog =>
-            typeof x === 'object' && x !== null && typeof (x as { id?: unknown }).id === 'string'
-        );
-      }
-    }
-  } catch {
-    // Fall through to deterministic Paper seed on corrupt/missing file
-  }
-  const seeded = buildInitialPaperOrderLogs();
-  saveOrderLogsToDisk(seeded);
-  return seeded;
-}
-
 function sanitizeSymbol(raw: unknown, fallback = ''): string {
   const clean = String(raw ?? '')
     .toUpperCase()
@@ -339,56 +333,13 @@ function sanitizeSymbol(raw: unknown, fallback = ''): string {
   return clean || fallback;
 }
 
-function saveOrderLogsToDisk(logs: BackendOrderExecutionLog[]): void {
-  try {
-    const tmpFile = `${ORDER_LOGS_FILE}.tmp`;
-    fs.writeFileSync(tmpFile, JSON.stringify(logs.slice(0, 500), null, 2), 'utf8');
-    fs.renameSync(tmpFile, ORDER_LOGS_FILE);
-  } catch {
-    // Ignore read-only filesystem errors
-  }
-}
-
-let orderExecutionLogs: BackendOrderExecutionLog[] = loadOrderLogsFromDisk();
-
-function upsertOrderLogs(entries: BackendOrderExecutionLog[]): number {
-  let added = 0;
-  const byId = new Map<string, BackendOrderExecutionLog>();
-  const byComposite = new Map<string, string>();
-  for (const existing of orderExecutionLogs) {
-    byId.set(existing.id, existing);
-    byComposite.set(
-      `${existing.accountMode}:${existing.environment}:${existing.venue}:${existing.symbol}:${existing.orderId}:${existing.lifecycle}`,
-      existing.id
-    );
-  }
-  for (const item of entries) {
-    const composite = `${item.accountMode}:${item.environment}:${item.venue}:${item.symbol}:${item.orderId}:${item.lifecycle}`;
-    const existingId = byId.has(item.id) ? item.id : byComposite.get(composite);
-    if (!existingId) {
-      added += 1;
-      byId.set(item.id, item);
-      byComposite.set(composite, item.id);
-    } else {
-      const prev = byId.get(existingId)!;
-      const fromClientLive = item.id.startsWith('client-live-') && prev.source === 'live_proxy';
-      byId.set(existingId, {
-        ...prev,
-        ...item,
-        latencyMs: fromClientLive ? prev.latencyMs : item.latencyMs ?? prev.latencyMs,
-        endpoint: fromClientLive ? prev.endpoint : item.endpoint,
-        algoOrderIds: item.algoOrderIds ?? prev.algoOrderIds,
-        orderListId: item.orderListId ?? prev.orderListId,
-        id: existingId,
-      });
-    }
-  }
-  orderExecutionLogs = Array.from(byId.values())
-    .sort((a, b) => b.timestampMs - a.timestampMs)
-    .slice(0, 500);
-  saveOrderLogsToDisk(orderExecutionLogs);
-  return added;
-}
+const orderHistoryDb = new OrderHistoryDatabase({
+  dbPath: ORDER_DB_FILE,
+  legacyJsonPath: ORDER_LOGS_FILE,
+  maxLiveQuota: 5000,
+  maxPaperQuota: 1000,
+  seedInitialPaperLogs: buildInitialPaperOrderLogs,
+});
 
 function maskApiKey(key: string): string | null {
   const clean = key.trim();
@@ -426,9 +377,36 @@ function getRestBaseUrl(env: BinanceEnv, venue: ExchangeVenue = vault.venue): st
     const override = (process.env.BINANCE_FUTURES_TESTNET_REST ?? '').trim();
     return override || 'https://testnet.binancefuture.com';
   }
-  return env === 'Production'
-    ? 'https://api.binance.com'
-    : 'https://testnet.binance.vision';
+  if (env === 'Production') return 'https://api.binance.com';
+  const spotOverride = (process.env.BINANCE_SPOT_TESTNET_REST ?? '').trim();
+  return spotOverride || 'https://testnet.binance.vision';
+}
+
+const KNOWN_QUOTE_SUFFIXES = [
+  'USDT',
+  'USDC',
+  'FDUSD',
+  'TUSD',
+  'BUSD',
+  'EUR',
+  'TRY',
+  'JPY',
+  'BRL',
+  'AUD',
+  'GBP',
+  'BNB',
+  'ETH',
+  'BTC',
+];
+
+function extractBaseAssetFromSymbol(symbol: string): string {
+  const upper = symbol.trim().toUpperCase();
+  for (const quote of KNOWN_QUOTE_SUFFIXES) {
+    if (upper.length > quote.length && upper.endsWith(quote)) {
+      return upper.slice(0, -quote.length);
+    }
+  }
+  return upper;
 }
 
 function signPayload(queryString: string, authMethod: AuthMethod, secret: string): string {
@@ -440,6 +418,7 @@ function signPayload(queryString: string, authMethod: AuthMethod, secret: string
 }
 
 interface SymbolFilters {
+  baseAsset?: string;
   tickSize: number;
   tickDecimals: number;
   minPrice: number;
@@ -486,16 +465,17 @@ function floorToStep(value: number, stepSize: number, decimals: number): string 
 async function getSymbolFilters(
   symbol: string,
   fallbackPrice: number,
-  venue: ExchangeVenue = vault.venue
+  venue: ExchangeVenue = vault.venue,
+  env: BinanceEnv = vault.environment
 ): Promise<SymbolFilters> {
-  const key = `${vault.environment}:${venue}:${symbol}`;
+  const key = `${env}:${venue}:${symbol}`;
   const cached = symbolFilterCache.get(key);
   if (cached && Date.now() - cached.fetchedAtMs < 600_000) {
     return cached;
   }
 
   try {
-    const baseUrl = getRestBaseUrl(vault.environment, venue);
+    const baseUrl = getRestBaseUrl(env, venue);
     const infoPath =
       venue === 'Futures'
         ? `${baseUrl}/fapi/v1/exchangeInfo`
@@ -507,6 +487,7 @@ async function getSymbolFilters(
       const payload = (await resp.json()) as {
         symbols?: Array<{
           symbol?: string;
+          baseAsset?: string;
           quotePrecision?: number;
           quoteAssetPrecision?: number;
           filters?: Array<{
@@ -523,31 +504,30 @@ async function getSymbolFilters(
           }>;
         }>;
       };
-      const symEntry = payload.symbols?.find((s) => s.symbol === symbol);
-      if (symEntry) {
-        const filters = symEntry.filters ?? [];
+      const defaultTickStr = fallbackPrice >= 100 ? '0.01' : '0.0001';
+      const defaultStepStr = venue === 'Futures' ? '0.001' : '0.00001';
+      const nowMs = Date.now();
+      for (const sEntry of payload.symbols ?? []) {
+        if (!sEntry.symbol) continue;
+        const filters = sEntry.filters ?? [];
         const priceFilter = filters.find((f) => f.filterType === 'PRICE_FILTER');
         const lotFilter = filters.find((f) => f.filterType === 'LOT_SIZE');
         const marketLotFilter = filters.find((f) => f.filterType === 'MARKET_LOT_SIZE') ?? lotFilter;
         const notionalFilter = filters.find(
           (f) => f.filterType === 'NOTIONAL' || f.filterType === 'MIN_NOTIONAL'
         );
-
-        const defaultTickStr = fallbackPrice >= 100 ? '0.01' : '0.0001';
-        const defaultStepStr = venue === 'Futures' ? '0.001' : '0.00001';
         const tickStr = priceFilter?.tickSize ?? defaultTickStr;
         const stepStr = lotFilter?.stepSize ?? defaultStepStr;
         const mktStepStr = marketLotFilter?.stepSize ?? stepStr;
-
         const tickSize = Number(tickStr) || Number(defaultTickStr);
         const stepSize = Number(stepStr) || Number(defaultStepStr);
         const marketStepSize = Number(mktStepStr) || stepSize;
-        const rawQuotePrec = Number(symEntry.quoteAssetPrecision ?? symEntry.quotePrecision ?? 2);
+        const rawQuotePrec = Number(sEntry.quoteAssetPrecision ?? sEntry.quotePrecision ?? 2);
         const quoteDecimals = Number.isFinite(rawQuotePrec)
           ? Math.min(8, Math.max(2, rawQuotePrec))
           : 2;
-
-        const resolved: SymbolFilters = {
+        const resolvedEntry: SymbolFilters = {
+          baseAsset: typeof sEntry.baseAsset === 'string' ? sEntry.baseAsset.toUpperCase() : undefined,
           tickSize,
           tickDecimals: countStepDecimals(tickStr),
           minPrice: Number(priceFilter?.minPrice ?? 0) || 0,
@@ -560,15 +540,15 @@ async function getSymbolFilters(
           marketStepDecimals: countStepDecimals(mktStepStr),
           marketMinQty: Number(marketLotFilter?.minQty ?? lotFilter?.minQty ?? 0) || 0,
           marketMaxQty: Number(marketLotFilter?.maxQty ?? lotFilter?.maxQty ?? 0) || 0,
-          minNotional:
-            Number(notionalFilter?.minNotional ?? notionalFilter?.notional ?? 0) || 5,
+          minNotional: Number(notionalFilter?.minNotional ?? notionalFilter?.notional ?? 0) || 5,
           maxNotional: Number(notionalFilter?.maxNotional ?? 0) || 0,
           quoteDecimals,
-          fetchedAtMs: Date.now(),
+          fetchedAtMs: nowMs,
         };
-        symbolFilterCache.set(key, resolved);
-        return resolved;
+        symbolFilterCache.set(`${env}:${venue}:${sEntry.symbol}`, resolvedEntry);
       }
+      const matched = symbolFilterCache.get(key);
+      if (matched) return matched;
     }
   } catch {
     // Fallback to heuristic precision below if exchangeInfo cannot be reached
@@ -639,8 +619,12 @@ async function fetchPublicTicker(
   return { price: 0, bidPrice: 0, askPrice: 0 };
 }
 
-async function fetchPublicPrice(symbol: string, venue: ExchangeVenue): Promise<number> {
-  const ticker = await fetchPublicTicker(symbol, venue, vault.environment);
+async function fetchPublicPrice(
+  symbol: string,
+  venue: ExchangeVenue,
+  env: BinanceEnv = vault.environment
+): Promise<number> {
+  const ticker = await fetchPublicTicker(symbol, venue, env);
   return ticker.price;
 }
 
@@ -762,14 +746,16 @@ async function signedBinanceRequest(
 
 const futuresDualSideCache = new Map<string, { dualSide: boolean; checkedAtMs: number }>();
 
-async function getFuturesDualSideMode(): Promise<boolean> {
-  const key = `${vault.environment}:${vault.apiKey.slice(0, 8)}`;
+async function getFuturesDualSideMode(
+  authSnap: VaultAuthSnapshot = captureVaultAuthSnapshot()
+): Promise<boolean> {
+  const key = `${authSnap.environment}:${authSnap.apiKey.slice(0, 8)}`;
   const cached = futuresDualSideCache.get(key);
   if (cached && Date.now() - cached.checkedAtMs < 120_000) {
     return cached.dualSide;
   }
   try {
-    const res = await signedBinanceRequest('GET', '/fapi/v1/positionSide/dual', {}, 'Futures');
+    const res = await signedBinanceRequest('GET', '/fapi/v1/positionSide/dual', {}, 'Futures', authSnap);
     if (res.ok) {
       const dualSide = res.data.dualSidePosition === true || res.data.dualSidePosition === 'true';
       futuresDualSideCache.set(key, { dualSide, checkedAtMs: Date.now() });
@@ -880,7 +866,11 @@ function ensureGitIgnoreDefaults(): void {
     'target/',
     'rust-bot/target/',
     'rust-bot/config/bot.toml',
+    'rust-bot/config/bot.toml.bak',
     '.apexrust-order-logs.json',
+    '.apexrust-orders.sqlite',
+    '.apexrust-orders.sqlite-*',
+    '.apexrust-orders.sqlite.json',
   ];
   let current = '';
   if (fs.existsSync(giPath)) {
@@ -936,7 +926,7 @@ const DEFAULT_FEATURE_TOGGLES: Record<string, boolean> = {
   circuit_breaker: true,
   spot_market: true,
   futures_market: true,
-  git_auto_backup: true,
+  git_auto_backup: false,
 };
 
 function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
@@ -955,21 +945,29 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
   const venueLower = String(trading.venue ?? vault.venue).toLowerCase() === 'futures' ? 'futures' : 'spot';
   const isFutures = venueLower === 'futures';
   const isProd = envLower === 'production';
+  const restBaseUrl = getRestBaseUrl(vault.environment, isFutures ? 'Futures' : 'Spot');
+  const isFuturesDemo = !isProd && isFutures && restBaseUrl.includes('demo-fapi.binance.com');
+  const isSpotDemo = !isProd && !isFutures && restBaseUrl.includes('demo-api.binance.com');
   const wsStreamUrl = isFutures
     ? isProd
       ? 'wss://fstream.binance.com/stream'
-      : 'wss://stream.binancefuture.com/stream'
+      : isFuturesDemo
+        ? 'wss://demo-fstream.binance.com/stream'
+        : 'wss://stream.binancefuture.com/stream'
     : isProd
       ? 'wss://stream.binance.com:9443/stream'
-      : 'wss://stream.testnet.binance.vision/stream';
+      : isSpotDemo
+        ? 'wss://demo-stream.binance.com/stream'
+        : 'wss://stream.testnet.binance.vision/stream';
   const wsApiUrl = isFutures
     ? isProd
       ? 'wss://ws-fapi.binance.com/ws-fapi/v1'
       : 'wss://testnet.binancefuture.com/ws-fapi/v1'
     : isProd
       ? 'wss://ws-api.binance.com:443/ws-api/v3'
-      : 'wss://ws-api.testnet.binance.vision/ws-api/v3';
-  const restBaseUrl = getRestBaseUrl(vault.environment, isFutures ? 'Futures' : 'Spot');
+      : isSpotDemo
+        ? 'wss://demo-ws-api.binance.com/ws-api/v3'
+        : 'wss://ws-api.testnet.binance.vision/ws-api/v3';
 
   const marginUpper = String(trading.marginType ?? vault.marginType).toUpperCase() === 'CROSSED' ? 'CROSSED' : 'ISOLATED';
   const modeLower = String(trading.mode ?? 'scalping').toLowerCase() === 'intraday' ? 'intraday' : 'scalping';
@@ -1100,8 +1098,103 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     '[web]',
     'bind_addr = "127.0.0.1:8080"',
     'allowed_origin = "http://localhost:3000"',
+    'auth_token = ""',
     '',
   ].join('\n');
+}
+
+const API_VERSION = '2.0.0';
+const authFailureLimiter = new AuthFailureLimiter(10, 5 * 60 * 1000);
+const liveLeaseManager = new LiveExecutionLeaseManager(20_000);
+
+function getEngineAuthority(): EngineAuthorityMode {
+  return (process.env.APEXRUST_ENGINE_AUTHORITY ?? '').trim().toLowerCase() === 'daemon'
+    ? 'daemon'
+    : 'browser';
+}
+
+function getEngineBaseUrl(): string {
+  return (process.env.APEXRUST_ENGINE_URL ?? 'http://127.0.0.1:8080').trim().replace(/\/+$/, '');
+}
+
+function getEngineAuthToken(): string {
+  return (
+    process.env.APEXRUST_ENGINE_TOKEN ??
+    process.env.APEXRUST_WEB_TOKEN ??
+    ''
+  ).trim();
+}
+
+function formatDotEnvScalar(value: string): string {
+  if (value === '') return '';
+  if (/[\s#"'=\\\r\n]/.test(value)) {
+    return `"${value
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\r/g, '\\r')
+      .replace(/\n/g, '\\n')}"`;
+  }
+  return value;
+}
+
+function persistVaultToDotEnvIfEnabled(): boolean {
+  if ((process.env.APEXRUST_PERSIST_VAULT ?? '').trim().toLowerCase() !== 'true') {
+    return false;
+  }
+  try {
+    const envPath = path.resolve(process.cwd(), '.env');
+    const raw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+    const lines = raw ? raw.split(/\r?\n/) : [];
+    const updates: Record<string, string> = {
+      BINANCE_ENVIRONMENT: vault.environment,
+      BINANCE_VENUE: vault.venue,
+      BINANCE_LEVERAGE: String(vault.leverage),
+      BINANCE_MARGIN_TYPE: vault.marginType,
+      BINANCE_RECV_WINDOW_MS: String(vault.recvWindowMs),
+      APEXRUST_MAX_ORDER_NOTIONAL_USDT: String(vault.maxOrderNotionalUsdt),
+      APEXRUST_REQUIRE_PREFLIGHT: vault.requirePreflightTestOrder ? 'true' : 'false',
+      BINANCE_AUTH_METHOD: vault.authMethod,
+      BINANCE_API_KEY: vault.apiKey,
+      BINANCE_API_SECRET: vault.authMethod === 'HMAC-SHA256' ? vault.apiSecret : '',
+      BINANCE_ED25519_PRIVATE_KEY: vault.authMethod === 'Ed25519' ? vault.apiSecret : '',
+      BINANCE_PRIVATE_KEY_PATH: '',
+    };
+    const seen = new Set<string>();
+    const nextLines = lines.map((line) => {
+      const trimmed = line.trim();
+      const isCommented = trimmed.startsWith('#');
+      for (const [k, v] of Object.entries(updates)) {
+        const re = new RegExp(`^\\s*#?\\s*${k}\\s*=`);
+        if (re.test(line)) {
+          seen.add(k);
+          // Do not uncomment commented template lines when persisting an empty/cleared value
+          if (isCommented && v === '') {
+            return line;
+          }
+          return `${k}=${formatDotEnvScalar(v)}`;
+        }
+      }
+      return line;
+    });
+    for (const [k, v] of Object.entries(updates)) {
+      if (!seen.has(k) && v !== '') {
+        nextLines.push(`${k}=${formatDotEnvScalar(v)}`);
+      }
+    }
+    fs.writeFileSync(envPath, `${nextLines.join('\n').replace(/\n+$/, '')}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
+    try {
+      fs.chmodSync(envPath, 0o600);
+    } catch {
+      // Ignore chmod error on Windows
+    }
+    return true;
+  } catch (err) {
+    console.warn('[server] Failed to persist vault to .env:', err instanceof Error ? err.message : String(err));
+    return false;
+  }
 }
 
 async function getGitStatusSummary() {
@@ -1154,7 +1247,32 @@ async function getGitStatusSummary() {
 
 async function bootstrapServer() {
   const app = express();
+  const trustProxyRaw = (process.env.APEXRUST_TRUST_PROXY ?? '').trim().toLowerCase();
+  if (trustProxyRaw === 'true' || trustProxyRaw === '1') {
+    app.set('trust proxy', true);
+  } else if (
+    trustProxyRaw === 'loopback' ||
+    (process.env.APEXRUST_TRUST_ZERO_TRUST_MESH ?? '').trim().toLowerCase() === 'true'
+  ) {
+    app.set('trust proxy', 'loopback');
+  }
   app.use(express.json({ limit: '256kb' }));
+
+  function resolveClientIp(req: express.Request): string {
+    const remoteAddr = String(req.socket.remoteAddress ?? '').trim();
+    const isLoopbackPeer =
+      remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+    const hasCloudflareProxyHeader =
+      Boolean(req.headers['cf-ray']) || Boolean(req.headers['cf-access-authenticated-user-email']);
+    const cfConnectingIp =
+      typeof req.headers['cf-connecting-ip'] === 'string'
+        ? req.headers['cf-connecting-ip'].trim()
+        : '';
+    if ((isLoopbackPeer || trustProxyRaw === 'true' || trustProxyRaw === '1') && hasCloudflareProxyHeader && cfConnectingIp) {
+      return cfConnectingIp;
+    }
+    return String(req.ip || remoteAddr || 'unknown');
+  }
 
   const asyncRoute =
     (fn: (req: express.Request, res: express.Response, next: express.NextFunction) => Promise<void> | void): express.RequestHandler =>
@@ -1162,22 +1280,97 @@ async function bootstrapServer() {
       Promise.resolve(fn(req, res, next)).catch(next);
     };
 
-  // Reject cross-site mutating requests and enforce optional APEXRUST_PROXY_TOKEN on sensitive routes
-  app.use(['/api/live', '/api/git', '/api/orders'], (req, res, next) => {
-    const fetchSite = req.headers['sec-fetch-site'];
-    if (req.method !== 'GET' && fetchSite === 'cross-site') {
-      res.status(403).json({ error: 'Cross-site request blocked for live trading and git safety.' });
+  // CORS + Chromium Private Network Access (PNA) support for Desktop PWA <-> Cloudflare One Zero Trust VPS
+  app.use('/api', (req, res, next) => {
+    const allowedOrigins = parseAllowedOrigins(process.env.APEXRUST_ALLOWED_ORIGINS);
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+    const hostHeader = typeof req.headers.host === 'string' ? req.headers.host.trim().toLowerCase() : '';
+    const isSelfOrigin =
+      Boolean(origin) &&
+      Boolean(hostHeader) &&
+      (origin.toLowerCase() === `http://${hostHeader}` ||
+        origin.toLowerCase() === `https://${hostHeader}`);
+    if (origin && (isSelfOrigin || isOriginAllowed(origin, allowedOrigins))) {
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigins.includes('*') ? '*' : origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Authorization, Content-Type, X-ApexRust-Token, X-ApexRust-Client-Id'
+      );
+      if (String(req.headers['access-control-request-private-network'] ?? '').trim().toLowerCase() === 'true') {
+        res.setHeader('Access-Control-Allow-Private-Network', 'true');
+      }
+    }
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
       return;
     }
+    next();
+  });
+
+  function isRequestTokenAuthorized(req: express.Request): {
+    ok: boolean;
+    status?: number;
+    error?: string;
+  } {
     const configuredToken = (process.env.APEXRUST_PROXY_TOKEN ?? '').trim();
-    if (configuredToken) {
-      const headerToken = String(req.headers['x-apexrust-token'] ?? '').trim();
-      const authHeader = String(req.headers.authorization ?? '').trim();
-      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-      if (!safeTokenMatch(headerToken, configuredToken) && !safeTokenMatch(bearerToken, configuredToken)) {
-        res.status(401).json({ error: 'Unauthorized: missing or invalid APEXRUST_PROXY_TOKEN.' });
-        return;
-      }
+    if (!configuredToken) {
+      return { ok: true };
+    }
+    const clientIp = resolveClientIp(req);
+    if (authFailureLimiter.isLocked(clientIp)) {
+      return {
+        ok: false,
+        status: 429,
+        error: 'Too many failed token attempts from this IP. Try again in 5 minutes.',
+      };
+    }
+    const headerToken = String(req.headers['x-apexrust-token'] ?? '').trim();
+    const authHeader = String(req.headers.authorization ?? '').trim();
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (
+      !safeTokenMatch(headerToken, configuredToken) &&
+      !safeTokenMatch(bearerToken, configuredToken)
+    ) {
+      authFailureLimiter.recordFailure(clientIp);
+      return {
+        ok: false,
+        status: 401,
+        error: 'Unauthorized: missing or invalid Access Token (APEXRUST_PROXY_TOKEN).',
+      };
+    }
+    authFailureLimiter.recordSuccess(clientIp);
+    return { ok: true };
+  }
+
+  // Reject unapproved cross-origin browser requests (both reads & writes) and enforce optional APEXRUST_PROXY_TOKEN
+  app.use(['/api/live', '/api/git', '/api/orders', '/api/engine', '/api/remote-profile', '/api/market'], (req, res, next) => {
+    const allowedOrigins = parseAllowedOrigins(process.env.APEXRUST_ALLOWED_ORIGINS);
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+    const fetchSite = req.headers['sec-fetch-site'];
+    const hostHeader = typeof req.headers.host === 'string' ? req.headers.host.trim().toLowerCase() : '';
+    const isSelfOrigin =
+      Boolean(origin) &&
+      Boolean(hostHeader) &&
+      (origin.toLowerCase() === `http://${hostHeader}` ||
+        origin.toLowerCase() === `https://${hostHeader}`);
+    if (origin && !isSelfOrigin && !isOriginAllowed(origin, allowedOrigins)) {
+      res.status(403).json({
+        error: 'Cross-origin request blocked. Add your Desktop origin to APEXRUST_ALLOWED_ORIGINS.',
+      });
+      return;
+    }
+    if (req.method !== 'GET' && fetchSite === 'cross-site' && !origin && !isOriginAllowed(origin, allowedOrigins)) {
+      res.status(403).json({
+        error: 'Cross-site request blocked. Add your Desktop origin to APEXRUST_ALLOWED_ORIGINS.',
+      });
+      return;
+    }
+    const authCheck = isRequestTokenAuthorized(req);
+    if (!authCheck.ok) {
+      res.status(authCheck.status ?? 401).json({ error: authCheck.error });
+      return;
     }
     next();
   });
@@ -1186,9 +1379,156 @@ async function bootstrapServer() {
     res.json({
       ok: true,
       service: 'apexrust-control-proxy',
+      apiVersion: API_VERSION,
       environment: vault.environment,
       venue: vault.venue,
+      engineAuthority: getEngineAuthority(),
     });
+  });
+
+  app.get('/api/connection/info', asyncRoute(async (req, res) => {
+    const configuredToken = (process.env.APEXRUST_PROXY_TOKEN ?? '').trim();
+    const authCheck = isRequestTokenAuthorized(req);
+    const zeroTrustEmail =
+      typeof req.headers['cf-access-authenticated-user-email'] === 'string'
+        ? req.headers['cf-access-authenticated-user-email'].trim()
+        : null;
+
+    if (!authCheck.ok) {
+      res.status(authCheck.status ?? 401).json({
+        ok: false,
+        service: 'apexrust-control-proxy',
+        apiVersion: API_VERSION,
+        authRequired: configuredToken.length > 0,
+        error: authCheck.error,
+      });
+      return;
+    }
+
+    let engineReachable = false;
+    let engineRunning: boolean | null = null;
+    let engineTransportMode: string | null = null;
+    try {
+      const headers: Record<string, string> = {};
+      const engTok = getEngineAuthToken();
+      if (engTok) headers.Authorization = `Bearer ${engTok}`;
+      const engResp = await fetch(`${getEngineBaseUrl()}/api/health`, {
+        headers,
+        signal: AbortSignal.timeout(2000),
+      });
+      if (engResp.ok) {
+        engineReachable = true;
+        const data = (await engResp.json()) as {
+          running?: boolean;
+          transport_mode?: string;
+        };
+        if (typeof data.running === 'boolean') engineRunning = data.running;
+        if (typeof data.transport_mode === 'string') engineTransportMode = data.transport_mode;
+      }
+    } catch {
+      engineReachable = false;
+    }
+
+    res.json({
+      ok: true,
+      service: 'apexrust-control-proxy',
+      apiVersion: API_VERSION,
+      authRequired: configuredToken.length > 0,
+      engineAuthority: getEngineAuthority(),
+      engineReachable,
+      engineRunning,
+      engineTransportMode,
+      environment: vault.environment,
+      venue: vault.venue,
+      configuredCredentials: Boolean(vault.apiKey && vault.apiSecret),
+      armedForLiveOrders: vault.armedForLiveOrders,
+      persistVaultEnabled: (process.env.APEXRUST_PERSIST_VAULT ?? '').trim().toLowerCase() === 'true',
+      zeroTrustUser: zeroTrustEmail,
+      serverTimeMs: Date.now(),
+    });
+  }));
+
+  // Shared local profile file (.apexrust/remote-profile.json) so Desktop PWA, bot-desktop, and apexrust CLI stay in sync
+  const remoteProfilePath = path.resolve(process.cwd(), '.apexrust', 'remote-profile.json');
+  app.get('/api/remote-profile', (_req, res) => {
+    try {
+      if (fs.existsSync(remoteProfilePath)) {
+        const raw = JSON.parse(fs.readFileSync(remoteProfilePath, 'utf8')) as Record<string, unknown>;
+        res.json({ ok: true, profile: raw });
+        return;
+      }
+    } catch {
+      // Ignore corrupt profile file
+    }
+    res.json({
+      ok: true,
+      profile: {
+        activeMode: 'local',
+        name: 'Remote VPS',
+        baseUrl: '',
+      },
+    });
+  });
+
+  app.post('/api/remote-profile', (req, res) => {
+    const body = (req.body ?? {}) as {
+      activeMode?: 'local' | 'remote';
+      name?: string;
+      baseUrl?: string;
+      token?: string;
+    };
+    let existing: { activeMode?: string; name?: string; baseUrl?: string; token?: string } = {};
+    try {
+      if (fs.existsSync(remoteProfilePath)) {
+        existing = JSON.parse(fs.readFileSync(remoteProfilePath, 'utf8')) as typeof existing;
+      }
+    } catch {
+      existing = {};
+    }
+
+    let nextBaseUrl = typeof existing.baseUrl === 'string' ? existing.baseUrl : '';
+    if (typeof body.baseUrl === 'string') {
+      const trimmedUrl = body.baseUrl.trim();
+      if (trimmedUrl.length > 0) {
+        const checked = validateRemoteBaseUrl(trimmedUrl);
+        if (!checked.ok) {
+          res.status(400).json({ ok: false, error: checked.error });
+          return;
+        }
+        nextBaseUrl = checked.normalizedUrl;
+      } else {
+        nextBaseUrl = '';
+      }
+    }
+
+    const nextToken =
+      typeof body.token === 'string'
+        ? body.token.trim()
+        : typeof existing.token === 'string'
+          ? existing.token.trim()
+          : '';
+    const nextProfile = {
+      activeMode: body.activeMode === 'remote' ? 'remote' : 'local',
+      name:
+        typeof body.name === 'string' && body.name.trim()
+          ? body.name.trim().slice(0, 64)
+          : typeof existing.name === 'string' && existing.name.trim()
+            ? existing.name.trim().slice(0, 64)
+            : 'Remote VPS',
+      baseUrl: nextBaseUrl,
+      ...(nextToken ? { token: nextToken } : {}),
+      updatedAtIso: new Date().toISOString(),
+    };
+    try {
+      fs.mkdirSync(path.dirname(remoteProfilePath), { recursive: true });
+      fs.writeFileSync(remoteProfilePath, `${JSON.stringify(nextProfile, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+    } catch {
+      // Ignore read-only filesystem
+    }
+    res.json({ ok: true, profile: nextProfile });
   });
 
   // Public Binance Market Data Proxies (avoids browser CORS issues on Futures & Testnet endpoints)
@@ -1308,7 +1648,7 @@ async function bootstrapServer() {
     const resultingSecret =
       nextSecret.length > 0
         ? nextSecret
-        : nextAuth !== vault.authMethod && nextAuth === 'Ed25519'
+        : nextAuth !== vault.authMethod
           ? ''
           : vault.apiSecret;
 
@@ -1367,7 +1707,22 @@ async function bootstrapServer() {
       vault.verificationMessage = 'Live safety caps were relaxed — re-arm explicitly before sending live orders.';
     }
 
-    res.json({ ok: true, status: getSafeStatus() });
+    const persistedToEnv = persistVaultToDotEnvIfEnabled();
+    const changedFields = [
+      envChanged ? 'environment' : null,
+      body.venue !== undefined ? 'venue' : null,
+      keyChanged ? 'apiKey' : null,
+      secretChanged ? 'apiSecret' : null,
+      body.maxOrderNotionalUsdt !== undefined ? 'maxOrderNotionalUsdt' : null,
+    ].filter(Boolean);
+    if (changedFields.length > 0) {
+      const zeroTrustUser = req.headers['cf-access-authenticated-user-email'] ?? 'direct';
+      console.log(
+        `[audit]POST /api/live/config ip=${req.ip} origin=${req.headers.origin ?? 'same-origin'} zt=${String(zeroTrustUser)} fields=${changedFields.join(',')} persistedEnv=${persistedToEnv}`
+      );
+    }
+
+    res.json({ ok: true, persistedToEnv, status: getSafeStatus() });
   });
 
   app.post('/api/live/verify', asyncRoute(async (_req, res) => {
@@ -1485,7 +1840,25 @@ async function bootstrapServer() {
     }
 
     vault.armedForLiveOrders = true;
+    console.log(
+      `[audit]POST /api/live/arm ARMED=true env=${vault.environment} venue=${vault.venue} ip=${req.ip}`
+    );
     res.json({ ok: true, status: getSafeStatus() });
+  });
+
+  app.post('/api/live/lease', (req, res) => {
+    const body = (req.body ?? {}) as { clientId?: string; forceTakeover?: boolean };
+    const headerClientId =
+      typeof req.headers['x-apexrust-client-id'] === 'string'
+        ? req.headers['x-apexrust-client-id'].trim()
+        : '';
+    const clientId = (body.clientId ?? headerClientId).trim();
+    const outcome = liveLeaseManager.acquireOrRenew(clientId, Date.now(), Boolean(body.forceTakeover));
+    res.json({
+      ok: outcome.acquired,
+      engineAuthority: getEngineAuthority(),
+      ...outcome,
+    });
   });
 
   app.post('/api/live/order', asyncRoute(async (req, res) => {
@@ -1506,6 +1879,37 @@ async function bootstrapServer() {
       timeInForce?: 'GTC' | 'IOC' | 'FOK';
       preflightOnly?: boolean;
     };
+
+    // Single-Engine Authority guard: prevent browser auto-trader from placing duplicate live entries when VPS daemon is active
+    const authorityCheck = evaluateEngineAuthorityGuard(getEngineAuthority(), {
+      reduceOnly: body.reduceOnly,
+      preflightOnly: body.preflightOnly,
+    });
+    if (!authorityCheck.allowed) {
+      res.status(authorityCheck.status).json({
+        ok: false,
+        code: authorityCheck.code,
+        error: authorityCheck.error,
+      });
+      return;
+    }
+
+    // Single-browser lease check when browser is the engine authority
+    if (!body.reduceOnly && !body.preflightOnly && getEngineAuthority() === 'browser') {
+      const clientId =
+        typeof req.headers['x-apexrust-client-id'] === 'string'
+          ? req.headers['x-apexrust-client-id'].trim()
+          : undefined;
+      const leaseCheck = liveLeaseManager.verifyEntryLease(clientId);
+      if (!leaseCheck.allowed) {
+        res.status(409).json({
+          ok: false,
+          code: 'LIVE_LEASE_HELD_BY_OTHER_CLIENT',
+          error: `Another Desktop/Browser session (${leaseCheck.holderClientId}) currently holds the active Live Trading lease.`,
+        });
+        return;
+      }
+    }
 
     if (!vault.apiKey || !vault.apiSecret) {
       res.status(400).json({ error: 'Live API credentials are not configured.' });
@@ -1542,9 +1946,9 @@ async function bootstrapServer() {
     const requestedNotional = Number(body.quoteOrderQty ?? 0);
     const desiredLeverage = Math.min(20, Math.max(1, Math.round(Number(body.leverage ?? vault.leverage))));
 
-    if (venue === 'Spot' && side === 'SELL' && orderType === 'OCO') {
+    if (venue === 'Spot' && side === 'SELL' && !body.reduceOnly) {
       res.status(400).json({
-        error: 'Spot OCO short-entry is unsupported on Binance Spot. Use USD-M Futures for Short brackets.',
+        error: 'Spot short-entry (non-reduceOnly SELL) is unsupported on Binance Spot. Use USD-M Futures for Short entries.',
       });
       return;
     }
@@ -1563,9 +1967,9 @@ async function bootstrapServer() {
 
     let refPrice = baseEntryType === 'MARKET' ? 0 : requestedPrice > 0 ? requestedPrice : 0;
     if (refPrice <= 0) {
-      refPrice = await fetchPublicPrice(symbol, venue);
+      refPrice = await fetchPublicPrice(symbol, venue, authSnap.environment);
     }
-    const filters = await getSymbolFilters(symbol, refPrice > 0 ? refPrice : 100, venue);
+    const filters = await getSymbolFilters(symbol, refPrice > 0 ? refPrice : 100, venue, authSnap.environment);
 
     if (baseEntryType === 'MARKET') {
       const mStep = filters.marketStepSize || filters.stepSize;
@@ -1733,7 +2137,7 @@ async function bootstrapServer() {
     try {
       let futuresPositionSide: 'BOTH' | 'LONG' | 'SHORT' = 'BOTH';
       if (venue === 'Futures') {
-        const dualSide = await getFuturesDualSideMode();
+        const dualSide = await getFuturesDualSideMode(authSnap);
         if (dualSide) {
           futuresPositionSide =
             body.positionSide === 'LONG' || body.positionSide === 'SHORT'
@@ -1792,7 +2196,7 @@ async function bootstrapServer() {
             typeof testRes.data.msg === 'string'
               ? `Binance Preflight ${testRes.data.code ?? testRes.status}: ${testRes.data.msg}`
               : `Preflight failed with HTTP ${testRes.status}`;
-          upsertOrderLogs([
+          orderHistoryDb.upsertLogs([
             {
               id: `live-preflight-err-${symbol}-${Date.now()}`,
               orderId: `pre-${Date.now()}`,
@@ -1829,7 +2233,7 @@ async function bootstrapServer() {
           return;
         }
         if (preflightOnly) {
-          upsertOrderLogs([
+          orderHistoryDb.upsertLogs([
             {
               id: `live-preflight-ok-${symbol}-${Date.now()}`,
               orderId: `pre-${Date.now()}`,
@@ -1887,14 +2291,14 @@ async function bootstrapServer() {
           typeof liveRes.data.msg === 'string'
             ? `Binance Order ${liveRes.data.code ?? liveRes.status}: ${liveRes.data.msg}`
             : `Order failed with HTTP ${liveRes.status}`;
-        upsertOrderLogs([
+        orderHistoryDb.upsertLogs([
           {
             id: `live-rej-${symbol}-${Date.now()}`,
             orderId: `rej-${Date.now()}`,
             clientOrderId: `live_${symbol.toLowerCase()}`,
             symbol,
             venue,
-            environment: vault.environment,
+            environment: authSnap.environment,
             accountMode: 'Live',
             source: 'live_proxy',
             lifecycle: body.reduceOnly ? 'EXIT' : 'ENTRY',
@@ -1924,7 +2328,7 @@ async function bootstrapServer() {
         return;
       }
 
-      const baseAsset = symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol;
+      const baseAsset = filters.baseAsset || extractBaseAssetFromSymbol(symbol);
       const fillMetrics = parseFillMetrics(liveRes.data, refPrice, venue === 'Spot' ? baseAsset : '');
       const executedQty = fillMetrics.executedQty;
       const avgPrice = fillMetrics.avgPrice;
@@ -1954,32 +2358,49 @@ async function bootstrapServer() {
         const workingType = body.workingType === 'CONTRACT_PRICE' ? 'CONTRACT_PRICE' : 'MARK_PRICE';
 
         if (venue === 'Spot' && Number(exitQtyFmt) > 0) {
-          const ocoParams: Record<string, string | number> = {
-            symbol,
-            side: 'SELL',
-            quantity: exitQtyFmt,
-            aboveType: 'LIMIT_MAKER',
-            abovePrice: tpFmt,
-            belowType: 'STOP_LOSS_LIMIT',
-            belowStopPrice: slFmt,
-            belowPrice: floorToStep(
-              Number(body.stopLossPrice) * 0.998,
-              filters.tickSize,
-              filters.tickDecimals
-            ),
-            belowTimeInForce: 'GTC',
-            newOrderRespType: 'FULL',
-          };
-          const ocoRes = await signedBinanceRequest('POST', '/api/v3/orderList/oco', ocoParams, 'Spot', authSnap);
-          ocoAttached = ocoRes.ok;
-          if (ocoRes.ok) {
-            if (ocoRes.data.orderListId != null) {
-              ocoOrderListId = Number(ocoRes.data.orderListId);
-            }
-            ocoNote = `Attached Spot /api/v3/orderList/oco (#${ocoOrderListId ?? 'ok'} · SELL) TP @ ${tpFmt} / SL @ ${slFmt}`;
-          } else {
-            ocoWarning = `Spot OCO leg failed (${ocoRes.data.code ?? ocoRes.status}): ${String(ocoRes.data.msg ?? 'Position has no exchange OCO bracket')}`;
+          const belowLimitFmt = floorToStep(
+            Number(body.stopLossPrice) * 0.998,
+            filters.tickSize,
+            filters.tickDecimals
+          );
+          const tpNum = Number(tpFmt);
+          const slNum = Number(slFmt);
+          const belowNum = Number(belowLimitFmt);
+          const exitQtyNum = Number(exitQtyFmt);
+          const minPriceViolated =
+            filters.minPrice > 0 && (tpNum < filters.minPrice || slNum < filters.minPrice || belowNum < filters.minPrice);
+          const maxPriceViolated =
+            filters.maxPrice > 0 && (tpNum > filters.maxPrice || slNum > filters.maxPrice || belowNum > filters.maxPrice);
+          const minNotionalViolated =
+            filters.minNotional > 0 &&
+            (tpNum * exitQtyNum < filters.minNotional || belowNum * exitQtyNum < filters.minNotional);
+          if (minPriceViolated || maxPriceViolated || minNotionalViolated) {
+            ocoWarning = `Spot OCO leg skipped: TP (${tpFmt}) / SL (${slFmt}/${belowLimitFmt}) or exit notional fails Binance filters (minPrice=${filters.minPrice}, maxPrice=${filters.maxPrice}, minNotional=${filters.minNotional}).`;
             ocoNote = ocoWarning;
+          } else {
+            const ocoParams: Record<string, string | number> = {
+              symbol,
+              side: 'SELL',
+              quantity: exitQtyFmt,
+              aboveType: 'LIMIT_MAKER',
+              abovePrice: tpFmt,
+              belowType: 'STOP_LOSS_LIMIT',
+              belowStopPrice: slFmt,
+              belowPrice: belowLimitFmt,
+              belowTimeInForce: 'GTC',
+              newOrderRespType: 'FULL',
+            };
+            const ocoRes = await signedBinanceRequest('POST', '/api/v3/orderList/oco', ocoParams, 'Spot', authSnap);
+            ocoAttached = ocoRes.ok;
+            if (ocoRes.ok) {
+              if (ocoRes.data.orderListId != null) {
+                ocoOrderListId = Number(ocoRes.data.orderListId);
+              }
+              ocoNote = `Attached Spot /api/v3/orderList/oco (#${ocoOrderListId ?? 'ok'} · SELL) TP @ ${tpFmt} / SL @ ${slFmt}`;
+            } else {
+              ocoWarning = `Spot OCO leg failed (${ocoRes.data.code ?? ocoRes.status}): ${String(ocoRes.data.msg ?? 'Position has no exchange OCO bracket')}`;
+              ocoNote = ocoWarning;
+            }
           }
         } else if (venue === 'Futures') {
           const [tpRes, slRes] = await Promise.all([
@@ -2027,9 +2448,9 @@ async function bootstrapServer() {
             if (ids.length > 0) algoOrderIds = ids;
             ocoNote = `Attached Futures /fapi/v1/algoOrder TP @ ${tpFmt} + SL @ ${slFmt} (${workingType})`;
           } else {
-            // Roll back any half-attached algo leg so no stray unpaired closePosition trigger lingers
+            // Roll back any half-attached algo leg (DELETE /fapi/v1/algoOrder takes algoId only; symbol causes -1106)
             for (const id of ids) {
-              await signedBinanceRequest('DELETE', '/fapi/v1/algoOrder', { symbol, algoId: id }, 'Futures', authSnap).catch(() => {});
+              await signedBinanceRequest('DELETE', '/fapi/v1/algoOrder', { algoId: id }, 'Futures', authSnap).catch(() => {});
             }
             const tpErr = tpRes.ok ? 'OK' : `${tpRes.data.code ?? tpRes.status}: ${String(tpRes.data.msg ?? 'Err')}`;
             const slErr = slRes.ok ? 'OK' : `${slRes.data.code ?? slRes.status}: ${String(slRes.data.msg ?? 'Err')}`;
@@ -2052,7 +2473,7 @@ async function bootstrapServer() {
           ? resolvedStatusRaw
           : 'FILLED';
 
-      upsertOrderLogs([
+      orderHistoryDb.upsertLogs([
         {
           id: `live-order-${symbol}-${resolvedOrderId}`,
           orderId: resolvedOrderId,
@@ -2064,7 +2485,7 @@ async function bootstrapServer() {
           algoOrderIds,
           symbol,
           venue,
-          environment: vault.environment,
+          environment: authSnap.environment,
           accountMode: 'Live',
           source: 'live_proxy',
           lifecycle: body.reduceOnly || (venue === 'Spot' && side === 'SELL') ? 'EXIT' : 'ENTRY',
@@ -2107,7 +2528,7 @@ async function bootstrapServer() {
       res.json({
         ok: true,
         preflight: false,
-        environment: vault.environment,
+        environment: authSnap.environment,
         venue,
         latencyMs: liveRes.latencyMs,
         orderId: liveRes.data.orderId != null ? String(liveRes.data.orderId) : undefined,
@@ -2155,9 +2576,9 @@ async function bootstrapServer() {
       const orders = Array.isArray(ordersRes.data) ? ordersRes.data : [];
       let algoOrders: unknown[] = [];
       if (venue === 'Futures') {
-        const algoRes = await signedBinanceRequest('GET', '/fapi/v1/algoOpenOrders', params, 'Futures');
-        if (algoRes.ok && Array.isArray(algoRes.data)) {
-          algoOrders = algoRes.data;
+        const algoRes = await signedBinanceRequest('GET', '/fapi/v1/openAlgoOrders', params, 'Futures');
+        if (algoRes.ok) {
+          algoOrders = extractBinanceAlgoOrders(algoRes.data);
         }
       }
       res.json({ ok: true, venue, environment: vault.environment, orders, algoOrders });
@@ -2178,13 +2599,22 @@ async function bootstrapServer() {
     const venue: ExchangeVenue = req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : vault.venue;
     const symbol = sanitizeSymbol(req.query.symbol);
     const orderId = typeof req.query.orderId === 'string' ? req.query.orderId.trim() : '';
+    const isAlgoQuery = String(req.query.orderType ?? '').toUpperCase() === 'ALGO';
     if (!symbol || !orderId) {
       res.status(400).json({ ok: false, error: 'symbol and orderId are required.' });
       return;
     }
     try {
       const endpoint = venue === 'Futures' ? '/fapi/v1/order' : '/api/v3/order';
-      const queryRes = await signedBinanceRequest('GET', endpoint, { symbol, orderId }, venue);
+      let queryRes = isAlgoQuery && venue === 'Futures'
+        ? await signedBinanceRequest('GET', '/fapi/v1/algoOrder', { algoId: orderId }, 'Futures')
+        : await signedBinanceRequest('GET', endpoint, { symbol, orderId }, venue);
+      if (!queryRes.ok && venue === 'Futures' && !isAlgoQuery && Number(queryRes.data?.code) === -2013) {
+        const algoFallback = await signedBinanceRequest('GET', '/fapi/v1/algoOrder', { algoId: orderId }, 'Futures');
+        if (algoFallback.ok) {
+          queryRes = algoFallback;
+        }
+      }
       if (!queryRes.ok) {
         res.status(400).json({
           ok: false,
@@ -2194,14 +2624,14 @@ async function bootstrapServer() {
       }
       const executedQty = Number(queryRes.data.executedQty ?? 0) || 0;
       const cumQuote = Number(queryRes.data.cummulativeQuoteQty ?? queryRes.data.cumQuote ?? 0) || 0;
-      const rawPrice = Number(queryRes.data.avgPrice ?? queryRes.data.price ?? 0) || 0;
+      const rawPrice = Number(queryRes.data.avgPrice ?? queryRes.data.price ?? queryRes.data.triggerPrice ?? 0) || 0;
       const avgPrice = executedQty > 0 && cumQuote > 0 ? cumQuote / executedQty : rawPrice;
       res.json({
         ok: true,
         venue,
         symbol,
-        orderId: String(queryRes.data.orderId ?? orderId),
-        status: String(queryRes.data.status ?? 'UNKNOWN').toUpperCase(),
+        orderId: String(queryRes.data.orderId ?? queryRes.data.algoId ?? orderId),
+        status: String(queryRes.data.algoStatus ?? queryRes.data.status ?? 'UNKNOWN').toUpperCase(),
         executedQty,
         avgPrice,
         order: queryRes.data,
@@ -2274,15 +2704,16 @@ async function bootstrapServer() {
             const delRes = await signedBinanceRequest(
               'DELETE',
               '/fapi/v1/algoOrder',
-              { symbol, algoId: String(algoId) },
+              { algoId: String(algoId) },
               'Futures'
             );
             if (delRes.ok) cancelled += 1;
             else errors.push(`algo #${algoId}: ${String(delRes.data.msg ?? delRes.status)}`);
           }
         } else {
-          const openAlgoRes = await signedBinanceRequest('GET', '/fapi/v1/algoOpenOrders', { symbol }, 'Futures');
-          const openCount = openAlgoRes.ok && Array.isArray(openAlgoRes.data) ? openAlgoRes.data.length : 1;
+          const openAlgoRes = await signedBinanceRequest('GET', '/fapi/v1/openAlgoOrders', { symbol }, 'Futures');
+          const extractedAlgo = openAlgoRes.ok ? extractBinanceAlgoOrders(openAlgoRes.data) : [];
+          const openCount = extractedAlgo.length > 0 ? extractedAlgo.length : 1;
           const delAll = await signedBinanceRequest(
             'DELETE',
             '/fapi/v1/algoOpenOrders',
@@ -2344,7 +2775,7 @@ async function bootstrapServer() {
         cancelParams = { symbol, orderListId: orderListId || orderId };
       } else if ((body.orderType === 'ALGO' || algoId) && venue === 'Futures') {
         cancelPath = '/fapi/v1/algoOrder';
-        cancelParams = { symbol, algoId: algoId || orderId };
+        cancelParams = { algoId: algoId || orderId };
       }
 
       const cancelRes = await signedBinanceRequest('DELETE', cancelPath, cancelParams, venue);
@@ -2368,7 +2799,7 @@ async function bootstrapServer() {
             ? 'SELL'
             : 'BUY'
           : fallbackSide;
-      upsertOrderLogs([
+      orderHistoryDb.upsertLogs([
         {
           id: `live-cancel-${symbol}-${orderId || orderListId || algoId}-${Date.now()}`,
           orderId: orderId || orderListId || algoId,
@@ -2563,7 +2994,7 @@ async function bootstrapServer() {
     }
   }));
 
-  app.delete('/api/live/config', (_req, res) => {
+  app.delete('/api/live/config', (req, res) => {
     vault.apiKey = '';
     vault.apiSecret = '';
     vault.armedForLiveOrders = false;
@@ -2574,10 +3005,530 @@ async function bootstrapServer() {
     vault.permissions = [];
     vault.latencyMs = null;
     vault.syncedBalances = [];
-    res.json({ ok: true, status: getSafeStatus() });
+    const persistedToEnv = persistVaultToDotEnvIfEnabled();
+    console.log(`[audit]DELETE /api/live/config ip=${req.ip} clearedVault=true persistedEnv=${persistedToEnv}`);
+    res.json({ ok: true, persistedToEnv, status: getSafeStatus() });
   });
 
-  // ---------- Order Execution History & Binance allOrders Sync APIs ----------
+  // ---------- Order Execution History, Binance Lookback Sync & Orphan Pair APIs ----------
+
+  function normalizeLookbackPreset(raw: unknown): SyncLookbackPreset {
+    const val = String(raw ?? '7d').trim().toLowerCase();
+    if (val === '1d') return '1d';
+    if (val === '3d') return '3d';
+    if (val === '30d' || val === '1m' || val === '1month') return '30d';
+    return '7d';
+  }
+
+  async function syncSymbolHistoryFromBinance(
+    targetSymbol: string,
+    targetVenue: ExchangeVenue,
+    lookback: SyncLookbackPreset
+  ): Promise<{ syncedCount: number; latencyMs?: number; endpoint: string; error?: string }> {
+    const authSnap = captureVaultAuthSnapshot();
+    const sym = sanitizeSymbol(targetSymbol);
+    const endpoint = targetVenue === 'Futures' ? '/fapi/v1/allOrders' : '/api/v3/allOrders';
+    const tradesEndpoint = targetVenue === 'Futures' ? '/fapi/v1/userTrades' : '/api/v3/myTrades';
+    const nowMs = Date.now();
+    const windowStartMs = Math.max(0, nowMs - lookbackPresetToMs(lookback));
+    let lastLatencyMs: number | undefined;
+    const collectedRawOrders = new Map<string, Record<string, unknown>>();
+    const collectedAlgoOrders = new Map<string, Record<string, unknown>>();
+
+    if (targetVenue === 'Spot') {
+      // Official Binance Spot rule: sending startTime + endTime > 24h fails with -1127.
+      // First query up to 1000 recent orders without endTime in 1 call (weight 20).
+      const recentRes = await signedBinanceRequest(
+        'GET',
+        endpoint,
+        { symbol: sym, limit: '1000' },
+        'Spot',
+        authSnap
+      );
+      lastLatencyMs = recentRes.latencyMs;
+      if (!recentRes.ok) {
+        return {
+          syncedCount: 0,
+          latencyMs: lastLatencyMs,
+          endpoint,
+          error: `Binance ${recentRes.data.code ?? recentRes.status}: ${String(recentRes.data.msg ?? 'Query failed')}`,
+        };
+      }
+      const list = Array.isArray(recentRes.data)
+        ? (recentRes.data as Array<Record<string, unknown>>)
+        : [];
+      let oldestMs = Number.POSITIVE_INFINITY;
+      for (const raw of list) {
+        const ts = Number(raw.updateTime ?? raw.time ?? 0);
+        if (ts > 0 && ts < oldestMs) oldestMs = ts;
+        if (ts >= windowStartMs) {
+          collectedRawOrders.set(String(raw.orderId ?? ''), raw);
+        }
+      }
+      // Only if all 1000 returned orders are still newer than windowStartMs, paginate <24h slices within [windowStartMs, oldestMs - 1]
+      if (list.length >= 1000 && Number.isFinite(oldestMs) && oldestMs > windowStartMs) {
+        const slices = buildBinanceSyncTimeWindows('Spot', lookback, oldestMs - 1)
+          .filter((win) => win.endTime > windowStartMs)
+          .map((win) => ({
+            startTime: Math.max(windowStartMs, win.startTime),
+            endTime: win.endTime,
+          }));
+        for (const win of slices) {
+          const sliceRes = await signedBinanceRequest(
+            'GET',
+            endpoint,
+            { symbol: sym, startTime: win.startTime, endTime: win.endTime, limit: '1000' },
+            'Spot',
+            authSnap
+          );
+          lastLatencyMs = sliceRes.latencyMs;
+          if (!sliceRes.ok || !Array.isArray(sliceRes.data)) break;
+          for (const raw of sliceRes.data as Array<Record<string, unknown>>) {
+            collectedRawOrders.set(String(raw.orderId ?? ''), raw);
+          }
+        }
+      }
+    } else {
+      // Official Binance USD-M Futures rule: startTime..endTime cannot exceed 7 days,
+      // and omitting timestamps returns only the last 7 days. Slice into <= 7d windows.
+      const windows = buildBinanceSyncTimeWindows('Futures', lookback, nowMs);
+      let anyOk = false;
+      let firstErr: string | undefined;
+      for (const win of windows) {
+        let cursorStart = win.startTime;
+        for (let page = 0; page < 10 && cursorStart <= win.endTime; page += 1) {
+          const sliceRes = await signedBinanceRequest(
+            'GET',
+            endpoint,
+            { symbol: sym, startTime: cursorStart, endTime: win.endTime, limit: '1000' },
+            'Futures',
+            authSnap
+          );
+          lastLatencyMs = sliceRes.latencyMs;
+          if (!sliceRes.ok) {
+            if (!firstErr) {
+              firstErr = `Binance ${sliceRes.data.code ?? sliceRes.status}: ${String(sliceRes.data.msg ?? 'Query failed')}`;
+            }
+            break;
+          }
+          anyOk = true;
+          const list = Array.isArray(sliceRes.data)
+            ? (sliceRes.data as Array<Record<string, unknown>>)
+            : [];
+          let maxTs = cursorStart;
+          for (const raw of list) {
+            const oid = String(raw.orderId ?? '');
+            if (oid) collectedRawOrders.set(oid, raw);
+            const ts = Number(raw.time ?? raw.updateTime ?? 0);
+            if (ts > maxTs) maxTs = ts;
+          }
+          if (list.length < 1000 || maxTs < cursorStart) break;
+          cursorStart = maxTs + 1;
+        }
+
+        // Also query Futures Algo historical orders (TAKE_PROFIT_MARKET / STOP_MARKET / TRAILING_STOP_MARKET)
+        const algoSliceRes = await signedBinanceRequest(
+          'GET',
+          '/fapi/v1/allAlgoOrders',
+          { symbol: sym, startTime: win.startTime, endTime: win.endTime, limit: '1000' },
+          'Futures',
+          authSnap
+        );
+        if (algoSliceRes.ok) {
+          for (const rawAlgo of extractBinanceAlgoOrders(algoSliceRes.data)) {
+            const aid = String(rawAlgo.algoId ?? rawAlgo.clientAlgoId ?? '');
+            if (aid) collectedAlgoOrders.set(aid, rawAlgo);
+          }
+        }
+      }
+      if (!anyOk && firstErr) {
+        return { syncedCount: 0, latencyMs: lastLatencyMs, endpoint, error: firstErr };
+      }
+    }
+
+    const rawOrders = Array.from(collectedRawOrders.values());
+    const hasFilled = rawOrders.some((r) => Number(r.executedQty ?? 0) > 0);
+    const tradeMetricsMap = new Map<
+      string,
+      { commission: number; commissionAsset: string; isMaker: boolean; realizedPnlUsdt: number | null }
+    >();
+
+    if (hasFilled) {
+      if (targetVenue === 'Spot') {
+        const trRes = await signedBinanceRequest(
+          'GET',
+          tradesEndpoint,
+          { symbol: sym, limit: '1000' },
+          'Spot',
+          authSnap
+        );
+        if (trRes.ok && Array.isArray(trRes.data)) {
+          const agg = aggregateTradesByOrderId(
+            trRes.data as Array<Record<string, unknown>>,
+            'Spot'
+          );
+          for (const [k, v] of agg.entries()) tradeMetricsMap.set(k, v);
+        }
+        // Fallback: if any filled Spot orders were older than the latest 1,000 trades, query by orderId (with limit=1000)
+        const missingFilledIds = rawOrders
+          .filter((r) => Number(r.executedQty ?? 0) > 0)
+          .map((r) => String(r.orderId ?? ''))
+          .filter((oid) => oid && !tradeMetricsMap.has(oid))
+          .slice(0, 50);
+        for (const oid of missingFilledIds) {
+          const byOrdRes = await signedBinanceRequest(
+            'GET',
+            tradesEndpoint,
+            { symbol: sym, orderId: oid, limit: '1000' },
+            'Spot',
+            authSnap
+          );
+          if (byOrdRes.ok && Array.isArray(byOrdRes.data)) {
+            const agg = aggregateTradesByOrderId(
+              byOrdRes.data as Array<Record<string, unknown>>,
+              'Spot'
+            );
+            for (const [k, v] of agg.entries()) tradeMetricsMap.set(k, v);
+          }
+        }
+      } else {
+        const filledTimes = rawOrders
+          .filter((r) => Number(r.executedQty ?? 0) > 0)
+          .map((r) => Number(r.updateTime ?? r.time ?? nowMs));
+        const windows = buildBinanceSyncTimeWindows('Futures', lookback, nowMs).filter((win) =>
+          filledTimes.some((ts) => ts >= win.startTime - 60_000 && ts <= win.endTime + 60_000)
+        );
+        const allTrades: Array<Record<string, unknown>> = [];
+        for (const win of windows) {
+          let cursorStart = win.startTime;
+          for (let page = 0; page < 10 && cursorStart <= win.endTime; page += 1) {
+            const trRes = await signedBinanceRequest(
+              'GET',
+              tradesEndpoint,
+              { symbol: sym, startTime: cursorStart, endTime: win.endTime, limit: '1000' },
+              'Futures',
+              authSnap
+            );
+            if (!trRes.ok || !Array.isArray(trRes.data)) break;
+            const list = trRes.data as Array<Record<string, unknown>>;
+            allTrades.push(...list);
+            const lastTs = list.reduce((mx, row) => Math.max(mx, Number(row.time ?? 0)), cursorStart);
+            if (list.length < 1000 || lastTs < cursorStart) break;
+            cursorStart = lastTs + 1;
+          }
+        }
+        const agg = aggregateTradesByOrderId(allTrades, 'Futures');
+        for (const [k, v] of agg.entries()) tradeMetricsMap.set(k, v);
+      }
+    }
+
+    const mapped: BackendOrderExecutionLog[] = rawOrders.map((raw, idx) => {
+      const ordId = String(raw.orderId ?? Date.now() + idx);
+      const binSide: 'BUY' | 'SELL' =
+        String(raw.side ?? 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+      const executedQty = Number(raw.executedQty ?? 0) || 0;
+      const origQty = Number(raw.origQty ?? executedQty) || 0;
+      const quoteQtyRaw = Number(raw.cummulativeQuoteQty ?? raw.cumQuote ?? 0);
+      const quoteQty = quoteQtyRaw > 0 ? quoteQtyRaw : 0;
+      const limitPrice = Number(raw.price ?? 0) || 0;
+      const rawAvgPrice = Number(raw.avgPrice ?? 0) || 0;
+      const effAvgPrice =
+        rawAvgPrice > 0
+          ? rawAvgPrice
+          : executedQty > 0 && quoteQty > 0
+            ? quoteQty / executedQty
+            : limitPrice;
+      const stopPrice = Number(raw.stopPrice ?? 0) || 0;
+      const activatePrice =
+        raw.activatePrice !== undefined && Number(raw.activatePrice) > 0
+          ? Number(raw.activatePrice)
+          : null;
+      const priceRate =
+        raw.priceRate !== undefined && Number(raw.priceRate) > 0
+          ? Number(raw.priceRate)
+          : null;
+      const statusRaw = String(raw.status ?? 'NEW').toUpperCase();
+      const normStatus: BackendOrderExecutionLog['status'] =
+        statusRaw === 'FILLED' ||
+        statusRaw === 'PARTIALLY_FILLED' ||
+        statusRaw === 'NEW' ||
+        statusRaw === 'CANCELED' ||
+        statusRaw === 'PENDING_CANCEL' ||
+        statusRaw === 'REJECTED' ||
+        statusRaw === 'EXPIRED' ||
+        statusRaw === 'EXPIRED_IN_MATCH'
+          ? statusRaw
+          : 'NEW';
+      const orderTimeMs = Number(raw.time ?? raw.updateTime ?? nowMs);
+      const updateTimeMs = Number(raw.updateTime ?? raw.time ?? nowMs);
+      const workingTimeMs =
+        raw.workingTime !== undefined && Number(raw.workingTime) > 0
+          ? Number(raw.workingTime)
+          : null;
+      const isReduceOnly = Boolean(raw.reduceOnly);
+      const closePosition = Boolean(raw.closePosition);
+      const priceProtect = Boolean(raw.priceProtect);
+      const posSideRaw = String(raw.positionSide ?? 'BOTH').toUpperCase();
+      const positionSide: 'BOTH' | 'LONG' | 'SHORT' =
+        posSideRaw === 'LONG' || posSideRaw === 'SHORT' ? posSideRaw : 'BOTH';
+      const isHedgeExit =
+        (positionSide === 'LONG' && binSide === 'SELL') ||
+        (positionSide === 'SHORT' && binSide === 'BUY');
+      const isSpotExit = targetVenue === 'Spot' && binSide === 'SELL';
+      const isExit = isReduceOnly || closePosition || isSpotExit || isHedgeExit;
+      const tradeEnrich = tradeMetricsMap.get(ordId);
+      const orderType = String(raw.type ?? 'MARKET').toUpperCase();
+      const origType = String(raw.origType ?? orderType).toUpperCase();
+      const timeInForce = String(raw.timeInForce ?? 'GTC').toUpperCase();
+      const workingType =
+        targetVenue === 'Futures'
+          ? String(raw.workingType ?? 'MARK_PRICE').toUpperCase() === 'CONTRACT_PRICE'
+            ? 'CONTRACT_PRICE'
+            : 'MARK_PRICE'
+          : undefined;
+      const stpMode = String(raw.selfTradePreventionMode ?? 'NONE').toUpperCase();
+
+      return {
+        id: `binance-ord-${targetVenue.toLowerCase()}-${sym}-${ordId}`,
+        orderId: ordId,
+        clientOrderId: String(raw.clientOrderId ?? `binance_${ordId}`),
+        orderListId:
+          typeof raw.orderListId === 'number' && raw.orderListId >= 0
+            ? raw.orderListId
+            : undefined,
+        symbol: sym,
+        venue: targetVenue,
+        environment: authSnap.environment,
+        accountMode: 'Live',
+        source: 'binance_all_orders',
+        lifecycle:
+          normStatus === 'CANCELED' || normStatus === 'EXPIRED' || normStatus === 'EXPIRED_IN_MATCH'
+            ? 'CANCEL'
+            : isExit
+              ? 'EXIT'
+              : 'ENTRY',
+        side:
+          isExit
+            ? binSide === 'SELL'
+              ? 'Long'
+              : 'Short'
+            : binSide === 'BUY'
+              ? 'Long'
+              : 'Short',
+        binanceSide: binSide,
+        positionSide,
+        orderType,
+        origType,
+        timeInForce,
+        status: normStatus,
+        price: limitPrice > 0 ? limitPrice : effAvgPrice,
+        avgPrice: effAvgPrice,
+        stopPrice,
+        activatePrice,
+        priceRate,
+        executedQty,
+        origQty,
+        quoteQty: quoteQty > 0 ? quoteQty : effAvgPrice * executedQty,
+        commission: tradeEnrich?.commission ?? 0,
+        commissionAsset: tradeEnrich?.commissionAsset ?? 'USDT',
+        isMaker:
+          tradeEnrich?.isMaker ??
+          (orderType === 'LIMIT_MAKER' || timeInForce === 'GTX'),
+        reduceOnly: isReduceOnly,
+        closePosition,
+        priceProtect,
+        workingType,
+        selfTradePreventionMode: stpMode,
+        realizedPnlUsdt: tradeEnrich?.realizedPnlUsdt ?? null,
+        rMultiple: null,
+        exitReason: null,
+        latencyMs: lastLatencyMs ?? null,
+        endpoint: `GET ${endpoint} (${lookback})`,
+        rationale: `Synced from Binance ${targetVenue} ${endpoint} (${lookback})`,
+        orderTimeMs,
+        updateTimeMs,
+        workingTimeMs,
+        timestampMs: updateTimeMs,
+      };
+    });
+
+    const mappedAlgo: BackendOrderExecutionLog[] = Array.from(collectedAlgoOrders.values())
+      .filter((raw) => {
+        // Avoid duplicating triggered algo orders whose actualOrderId already appears in regular allOrders
+        const actualOid = raw.actualOrderId !== undefined ? String(raw.actualOrderId) : '';
+        return !actualOid || !collectedRawOrders.has(actualOid);
+      })
+      .map((raw, idx) => {
+        const algoIdStr = String(raw.algoId ?? Date.now() + idx);
+        const binSide: 'BUY' | 'SELL' =
+          String(raw.side ?? 'SELL').toUpperCase() === 'BUY' ? 'BUY' : 'SELL';
+        const algoStatusRaw = String(raw.algoStatus ?? raw.status ?? 'NEW').toUpperCase();
+        const normStatus: BackendOrderExecutionLog['status'] =
+          algoStatusRaw === 'FILLED' || algoStatusRaw === 'TRIGGERED'
+            ? 'FILLED'
+            : algoStatusRaw === 'CANCELED' || algoStatusRaw === 'CANCELLED'
+              ? 'CANCELED'
+              : algoStatusRaw === 'REJECTED'
+                ? 'REJECTED'
+                : algoStatusRaw === 'EXPIRED'
+                  ? 'EXPIRED'
+                  : 'NEW';
+        const triggerPrice = Number(raw.triggerPrice ?? raw.stopPrice ?? 0) || 0;
+        const limitPrice = Number(raw.price ?? 0) || 0;
+        const origQty = Number(raw.quantity ?? raw.origQty ?? 0) || 0;
+        const createTime = Number(raw.createTime ?? raw.time ?? raw.updateTime ?? nowMs);
+        const updateTime = Number(raw.updateTime ?? createTime);
+        const posSideRaw = String(raw.positionSide ?? 'BOTH').toUpperCase();
+        const positionSide: 'BOTH' | 'LONG' | 'SHORT' =
+          posSideRaw === 'LONG' || posSideRaw === 'SHORT' ? posSideRaw : 'BOTH';
+        const isExit =
+          Boolean(raw.reduceOnly) ||
+          Boolean(raw.closePosition) ||
+          (positionSide === 'LONG' && binSide === 'SELL') ||
+          (positionSide === 'SHORT' && binSide === 'BUY');
+        return {
+          id: `binance-algo-futures-${sym}-${algoIdStr}`,
+          orderId: algoIdStr,
+          algoId: algoIdStr,
+          clientOrderId: String(raw.clientAlgoId ?? `algo_${algoIdStr}`),
+          symbol: sym,
+          venue: 'Futures',
+          environment: authSnap.environment,
+          accountMode: 'Live',
+          source: 'binance_all_orders',
+          lifecycle:
+            normStatus === 'CANCELED' || normStatus === 'EXPIRED'
+              ? 'CANCEL'
+              : isExit
+                ? 'EXIT'
+                : 'ENTRY',
+          side: isExit
+            ? binSide === 'SELL'
+              ? 'Long'
+              : 'Short'
+            : binSide === 'BUY'
+              ? 'Long'
+              : 'Short',
+          binanceSide: binSide,
+          positionSide,
+          orderType: String(raw.orderType ?? raw.type ?? 'STOP_MARKET').toUpperCase(),
+          origType: String(raw.orderType ?? raw.type ?? 'STOP_MARKET').toUpperCase(),
+          timeInForce: String(raw.timeInForce ?? 'GTC').toUpperCase(),
+          status: normStatus,
+          price: limitPrice > 0 ? limitPrice : triggerPrice,
+          avgPrice: limitPrice > 0 ? limitPrice : triggerPrice,
+          stopPrice: triggerPrice,
+          activatePrice: raw.activatePrice !== undefined ? Number(raw.activatePrice) || null : null,
+          priceRate: raw.priceRate !== undefined ? Number(raw.priceRate) || null : null,
+          executedQty: 0,
+          origQty,
+          quoteQty: origQty * (limitPrice > 0 ? limitPrice : triggerPrice),
+          commission: 0,
+          commissionAsset: 'USDT',
+          isMaker: false,
+          reduceOnly: Boolean(raw.reduceOnly),
+          closePosition: Boolean(raw.closePosition),
+          priceProtect: Boolean(raw.priceProtect),
+          workingType:
+            String(raw.workingType ?? 'MARK_PRICE').toUpperCase() === 'CONTRACT_PRICE'
+              ? 'CONTRACT_PRICE'
+              : 'MARK_PRICE',
+          selfTradePreventionMode: String(raw.selfTradePreventionMode ?? 'NONE').toUpperCase(),
+          realizedPnlUsdt: null,
+          rMultiple: null,
+          exitReason: null,
+          latencyMs: lastLatencyMs ?? null,
+          endpoint: `GET /fapi/v1/allAlgoOrders (${lookback})`,
+          rationale: `Synced from Binance Futures /fapi/v1/allAlgoOrders (${lookback})`,
+          orderTimeMs: createTime,
+          updateTimeMs: updateTime,
+          workingTimeMs: null,
+          timestampMs: updateTime,
+        };
+      });
+
+    const combinedMapped = [...mapped, ...mappedAlgo];
+    if (combinedMapped.length > 0) {
+      orderHistoryDb.upsertLogs(combinedMapped);
+    }
+    orderHistoryDb.recordSyncWatermark({
+      symbol: sym,
+      venue: targetVenue,
+      environment: authSnap.environment,
+      lookback,
+      windowStartMs,
+      syncedCount: combinedMapped.length,
+      nowMs,
+    });
+
+    return {
+      syncedCount: combinedMapped.length,
+      latencyMs: lastLatencyMs,
+      endpoint,
+    };
+  }
+
+  function extractBinanceAlgoOrders(data: unknown): Array<Record<string, unknown>> {
+    if (Array.isArray(data)) {
+      return data as Array<Record<string, unknown>>;
+    }
+    if (
+      typeof data === 'object' &&
+      data !== null &&
+      Array.isArray((data as { orders?: unknown[] }).orders)
+    ) {
+      return (data as { orders: Array<Record<string, unknown>> }).orders;
+    }
+    return [];
+  }
+
+  async function scanAccountOrphanPairs(
+    configuredPairs: string[],
+    targetVenue: ExchangeVenue
+  ) {
+    let exchangeOpenOrders: Array<Record<string, unknown>> = [];
+    let exchangeAlgoOrders: Array<Record<string, unknown>> = [];
+    let exchangePositions: Array<Record<string, unknown>> = [];
+    let exchangeSpotBalances: Array<{ asset: string; free: number; locked: number }> = [];
+
+    if (vault.apiKey && vault.apiSecret) {
+      const openEndpoint = targetVenue === 'Futures' ? '/fapi/v1/openOrders' : '/api/v3/openOrders';
+      const openRes = await signedBinanceRequest('GET', openEndpoint, {}, targetVenue);
+      if (openRes.ok && Array.isArray(openRes.data)) {
+        exchangeOpenOrders = openRes.data as Array<Record<string, unknown>>;
+      }
+      if (targetVenue === 'Futures') {
+        const algoRes = await signedBinanceRequest('GET', '/fapi/v1/openAlgoOrders', {}, 'Futures');
+        if (algoRes.ok) {
+          exchangeAlgoOrders = extractBinanceAlgoOrders(algoRes.data);
+        }
+        const posRes = await signedBinanceRequest('GET', '/fapi/v2/positionRisk', {}, 'Futures');
+        if (posRes.ok && Array.isArray(posRes.data)) {
+          exchangePositions = posRes.data as Array<Record<string, unknown>>;
+        }
+      } else {
+        const accRes = await signedBinanceRequest('GET', '/api/v3/account', {}, 'Spot');
+        if (accRes.ok && Array.isArray(accRes.data.balances)) {
+          exchangeSpotBalances = (accRes.data.balances as Array<Record<string, unknown>>).map((b) => ({
+            asset: String(b.asset ?? ''),
+            free: Number(b.free ?? 0) || 0,
+            locked: Number(b.locked ?? 0) || 0,
+          }));
+        }
+      }
+    }
+
+    return detectOrphanPairs({
+      configuredPairs,
+      venue: targetVenue,
+      environment: vault.environment,
+      dbLogs: orderHistoryDb.getAllLogs(),
+      exchangeOpenOrders,
+      exchangeAlgoOrders,
+      exchangePositions,
+      exchangeSpotBalances,
+    });
+  }
 
   app.get('/api/orders/history', asyncRoute(async (req, res) => {
     const symbolParam =
@@ -2603,16 +3554,28 @@ async function bootstrapServer() {
           ? 'Paper'
           : undefined;
     const syncBinance = req.query.syncBinance === '1' || req.query.syncBinance === 'true';
-    const limitParam = Math.min(500, Math.max(1, Number(req.query.limit ?? 200) || 200));
+    const lookback = normalizeLookbackPreset(req.query.lookback);
+    const includeOrphans = req.query.includeOrphans === '1' || req.query.includeOrphans === 'true';
+    const limitParam = Math.min(2000, Math.max(1, Number(req.query.limit ?? 500) || 500));
 
     let syncResult:
-      | { synced: boolean; count?: number; latencyMs?: number; endpoint?: string; error?: string }
+      | {
+          synced: boolean;
+          count?: number;
+          lookback?: SyncLookbackPreset;
+          symbolsSynced?: string[];
+          orphanCount?: number;
+          latencyMs?: number;
+          endpoint?: string;
+          error?: string;
+        }
       | undefined;
 
     if (syncBinance) {
       if (!vault.apiKey || !vault.apiSecret) {
         syncResult = {
           synced: false,
+          lookback,
           error:
             'Live API credentials are not configured in the server vault. Add credentials in Bot -> Live Credentials to pull Binance allOrders.',
         };
@@ -2622,14 +3585,30 @@ async function bootstrapServer() {
           typeof req.query.symbols === 'string' && req.query.symbols.trim().length > 0
             ? req.query.symbols
                 .split(',')
-                .map((s) => s.trim().toUpperCase())
+                .map((s) => sanitizeSymbol(s))
                 .filter(Boolean)
             : null;
-        const targetSymbols = symbolParam
+        const baseSymbols = symbolParam
           ? [symbolParam]
           : symbolsQuery && symbolsQuery.length > 0
             ? symbolsQuery
             : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'AVAXUSDT'];
+        const targetSet = new Set<string>(baseSymbols);
+        let orphanCount = 0;
+
+        if (includeOrphans && !symbolParam) {
+          try {
+            const orphans = await scanAccountOrphanPairs(baseSymbols, targetVenue);
+            orphanCount = orphans.length;
+            for (const o of orphans) {
+              targetSet.add(o.symbol);
+            }
+          } catch {
+            // Continue syncing base symbols
+          }
+        }
+
+        const targetSymbols = Array.from(targetSet);
         const endpoint = targetVenue === 'Futures' ? '/fapi/v1/allOrders' : '/api/v3/allOrders';
         try {
           let totalSynced = 0;
@@ -2637,111 +3616,18 @@ async function bootstrapServer() {
           let firstError: string | undefined;
 
           for (const targetSymbol of targetSymbols) {
-            const allOrdersRes = await signedBinanceRequest(
-              'GET',
-              endpoint,
-              { symbol: targetSymbol, limit: '50' },
-              targetVenue
-            );
-            lastLatencyMs = allOrdersRes.latencyMs;
-            if (!allOrdersRes.ok) {
-              if (!firstError) {
-                firstError = `Binance ${allOrdersRes.data.code ?? allOrdersRes.status}: ${String(allOrdersRes.data.msg ?? 'Query failed')}`;
-              }
-              continue;
-            }
-            const rawList = Array.isArray(allOrdersRes.data)
-              ? (allOrdersRes.data as Array<Record<string, unknown>>)
-              : [];
-            const mapped: BackendOrderExecutionLog[] = rawList.map((raw, idx) => {
-              const ordId = String(raw.orderId ?? Date.now() + idx);
-              const sym = String(raw.symbol ?? targetSymbol);
-              const binSide: 'BUY' | 'SELL' =
-                String(raw.side ?? 'BUY').toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
-              const executedQty = Number(raw.executedQty ?? 0) || 0;
-              const origQty = Number(raw.origQty ?? executedQty) || 0;
-              const quoteQty = Number(
-                raw.cummulativeQuoteQty ?? raw.cumQuote ?? 0
-              );
-              const rawPrice = Number(raw.avgPrice ?? raw.price ?? 0);
-              const effPrice =
-                executedQty > 0 && quoteQty > 0
-                  ? quoteQty / executedQty
-                  : rawPrice > 0
-                    ? rawPrice
-                    : 0;
-              const statusRaw = String(raw.status ?? 'NEW').toUpperCase();
-              const normStatus: BackendOrderExecutionLog['status'] =
-                statusRaw === 'FILLED' ||
-                statusRaw === 'PARTIALLY_FILLED' ||
-                statusRaw === 'NEW' ||
-                statusRaw === 'CANCELED' ||
-                statusRaw === 'REJECTED' ||
-                statusRaw === 'EXPIRED'
-                  ? statusRaw
-                  : 'NEW';
-              const ts = Number(raw.updateTime ?? raw.time ?? Date.now());
-              const isReduceOnly = Boolean(raw.reduceOnly);
-              const posSide = String(raw.positionSide ?? 'BOTH').toUpperCase();
-              const isHedgeExit =
-                (posSide === 'LONG' && binSide === 'SELL') ||
-                (posSide === 'SHORT' && binSide === 'BUY');
-              const isSpotExit = targetVenue === 'Spot' && binSide === 'SELL';
-              const isExit = isReduceOnly || isSpotExit || isHedgeExit;
-              return {
-                id: `binance-ord-${targetVenue.toLowerCase()}-${sym}-${ordId}`,
-                orderId: ordId,
-                clientOrderId: String(raw.clientOrderId ?? `binance_${ordId}`),
-                orderListId:
-                  typeof raw.orderListId === 'number' && raw.orderListId >= 0
-                    ? raw.orderListId
-                    : undefined,
-                symbol: sym,
-                venue: targetVenue,
-                environment: vault.environment,
-                accountMode: 'Live',
-                source: 'binance_all_orders',
-                lifecycle:
-                  normStatus === 'CANCELED'
-                    ? 'CANCEL'
-                    : isExit
-                      ? 'EXIT'
-                      : 'ENTRY',
-                side:
-                  isExit
-                    ? binSide === 'SELL'
-                      ? 'Long'
-                      : 'Short'
-                    : binSide === 'BUY'
-                      ? 'Long'
-                      : 'Short',
-                binanceSide: binSide,
-                orderType: String(raw.type ?? 'MARKET'),
-                timeInForce: String(raw.timeInForce ?? 'GTC'),
-                status: normStatus,
-                price: effPrice,
-                executedQty,
-                origQty,
-                quoteQty: quoteQty > 0 ? quoteQty : effPrice * executedQty,
-                commission: 0,
-                commissionAsset: 'USDT',
-                isMaker: String(raw.type ?? '') === 'LIMIT_MAKER' || String(raw.timeInForce ?? '') === 'GTX',
-                realizedPnlUsdt: null,
-                rMultiple: null,
-                exitReason: null,
-                latencyMs: allOrdersRes.latencyMs,
-                endpoint: `GET ${endpoint}`,
-                rationale: `Synced from Binance ${targetVenue} ${endpoint}`,
-                timestampMs: ts,
-              };
-            });
-            upsertOrderLogs(mapped);
-            totalSynced += mapped.length;
+            const resSync = await syncSymbolHistoryFromBinance(targetSymbol, targetVenue, lookback);
+            if (resSync.latencyMs !== undefined) lastLatencyMs = resSync.latencyMs;
+            if (resSync.error && !firstError) firstError = resSync.error;
+            totalSynced += resSync.syncedCount;
           }
 
           if (totalSynced === 0 && firstError) {
             syncResult = {
               synced: false,
+              lookback,
+              symbolsSynced: targetSymbols,
+              orphanCount,
               latencyMs: lastLatencyMs,
               endpoint,
               error: firstError,
@@ -2750,6 +3636,9 @@ async function bootstrapServer() {
             syncResult = {
               synced: true,
               count: totalSynced,
+              lookback,
+              symbolsSynced: targetSymbols,
+              orphanCount,
               latencyMs: lastLatencyMs,
               endpoint,
             };
@@ -2757,6 +3646,7 @@ async function bootstrapServer() {
         } catch (err) {
           syncResult = {
             synced: false,
+            lookback,
             endpoint,
             error: err instanceof Error ? err.message : 'Failed to query Binance allOrders',
           };
@@ -2764,21 +3654,20 @@ async function bootstrapServer() {
       }
     }
 
-    const filtered = orderExecutionLogs
-      .filter((log) => {
-        if (symbolParam && log.symbol !== symbolParam) return false;
-        if (venueParam && log.venue !== venueParam) return false;
-        if (envParam && log.environment !== envParam) return false;
-        if (statusParam && log.status !== statusParam) return false;
-        if (accountModeParam && log.accountMode !== accountModeParam) return false;
-        return true;
-      })
-      .slice(0, limitParam);
+    const filtered = orderHistoryDb.queryLogs({
+      symbol: symbolParam,
+      venue: venueParam,
+      environment: envParam,
+      status: statusParam,
+      accountMode: accountModeParam,
+      limit: limitParam,
+    });
 
     res.json({
       ok: true,
       total: filtered.length,
       logs: filtered,
+      dbSummary: orderHistoryDb.getSummary(),
       syncResult,
     });
   }));
@@ -2826,20 +3715,303 @@ async function bootstrapServer() {
       return;
     }
 
-    const added = upsertOrderLogs(valid);
-    res.json({ ok: true, added, total: orderExecutionLogs.length });
+    const { added, updated, total } = orderHistoryDb.upsertLogs(valid);
+    res.json({ ok: true, added, updated, total, dbSummary: orderHistoryDb.getSummary() });
+  });
+
+  app.post('/api/orders/history/import', (req, res) => {
+    const body = req.body as { logs?: unknown[] } | undefined;
+    const rawItems = Array.isArray(body?.logs) ? body!.logs : [];
+    const valid = rawItems
+      .filter(
+        (item): item is BackendOrderExecutionLog =>
+          typeof item === 'object' &&
+          item !== null &&
+          typeof (item as { id?: unknown }).id === 'string' &&
+          typeof (item as { symbol?: unknown }).symbol === 'string' &&
+          sanitizeSymbol((item as { symbol?: unknown }).symbol).length > 0
+      )
+      .map((item) => ({
+        ...item,
+        symbol: sanitizeSymbol(item.symbol, 'BTCUSDT'),
+        venue: String(item.venue ?? '').toLowerCase() === 'futures' ? ('Futures' as const) : ('Spot' as const),
+        environment: item.environment === 'Production' ? ('Production' as const) : ('Testnet' as const),
+        accountMode: item.accountMode === 'Live' ? ('Live' as const) : ('Paper' as const),
+        price: Number.isFinite(Number(item.price)) ? Number(item.price) : 0,
+        executedQty: Number.isFinite(Number(item.executedQty)) ? Number(item.executedQty) : 0,
+        origQty: Number.isFinite(Number(item.origQty)) ? Number(item.origQty) : 0,
+        quoteQty: Number.isFinite(Number(item.quoteQty)) ? Number(item.quoteQty) : 0,
+        commission: Number.isFinite(Number(item.commission)) ? Number(item.commission) : 0,
+        timestampMs:
+          typeof item.timestampMs === 'number' && Number.isFinite(item.timestampMs)
+            ? item.timestampMs
+            : Date.now(),
+      }));
+    if (valid.length === 0) {
+      res.status(400).json({ ok: false, error: 'No valid order logs found in import payload.' });
+      return;
+    }
+    const { added, updated, total } = orderHistoryDb.upsertLogs(valid);
+    res.json({ ok: true, added, updated, total, dbSummary: orderHistoryDb.getSummary() });
   });
 
   app.delete('/api/orders/history', (req, res) => {
-    const mode = req.query.accountMode === 'Live' ? 'Live' : req.query.accountMode === 'Paper' ? 'Paper' : 'ALL';
-    if (mode === 'ALL') {
-      orderExecutionLogs = [];
-    } else {
-      orderExecutionLogs = orderExecutionLogs.filter((l) => l.accountMode !== mode);
+    const mode =
+      req.query.accountMode === 'Live'
+        ? 'Live'
+        : req.query.accountMode === 'Paper'
+          ? 'Paper'
+          : 'ALL';
+    const symbol =
+      typeof req.query.symbol === 'string' && req.query.symbol
+        ? sanitizeSymbol(req.query.symbol)
+        : undefined;
+    const olderThanDays =
+      typeof req.query.olderThanDays === 'string' && Number(req.query.olderThanDays) > 0
+        ? Number(req.query.olderThanDays)
+        : undefined;
+    const confirmAll =
+      String(req.query.confirmAll ?? req.body?.confirmAll ?? '')
+        .trim()
+        .toLowerCase() === 'true' || req.body?.confirmAll === true;
+    if (mode === 'ALL' && !symbol && !olderThanDays && !confirmAll) {
+      res.status(400).json({
+        ok: false,
+        error:
+          'Refusing unfiltered DELETE without accountMode (Paper|Live), symbol, olderThanDays, or confirmAll=true',
+      });
+      return;
     }
-    saveOrderLogsToDisk(orderExecutionLogs);
-    res.json({ ok: true, remaining: orderExecutionLogs.length });
+    const { deleted, remaining } = orderHistoryDb.deleteLogs({
+      accountMode: mode,
+      symbol,
+      olderThanDays,
+    });
+    res.json({ ok: true, deleted, remaining, dbSummary: orderHistoryDb.getSummary() });
   });
+
+  app.get('/api/orders/orphans', asyncRoute(async (req, res) => {
+    const targetVenue: ExchangeVenue =
+      req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : vault.venue;
+    const configuredPairs =
+      typeof req.query.configuredPairs === 'string' && req.query.configuredPairs.trim().length > 0
+        ? req.query.configuredPairs
+            .split(',')
+            .map((s) => sanitizeSymbol(s))
+            .filter(Boolean)
+        : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'AVAXUSDT'];
+
+    const orphans = await scanAccountOrphanPairs(configuredPairs, targetVenue);
+    res.json({
+      ok: true,
+      venue: targetVenue,
+      environment: vault.environment,
+      configured: Boolean(vault.apiKey && vault.apiSecret),
+      orphans,
+      dbSummary: orderHistoryDb.getSummary(),
+    });
+  }));
+
+  app.post('/api/orders/orphans/resolve', asyncRoute(async (req, res) => {
+    const body = req.body as
+      | {
+          symbol?: string;
+          venue?: ExchangeVenue;
+          action?: OrphanResolutionAction;
+          lookback?: SyncLookbackPreset;
+        }
+      | undefined;
+    const symbol = sanitizeSymbol(body?.symbol);
+    const targetVenue: ExchangeVenue =
+      body?.venue === 'Futures' ? 'Futures' : body?.venue === 'Spot' ? 'Spot' : vault.venue;
+    const action = body?.action;
+    if (!symbol || !action) {
+      res.status(400).json({ ok: false, error: 'symbol and action are required.' });
+      return;
+    }
+
+    if (action === 'purge_local_records') {
+      const { deleted, remaining } = orderHistoryDb.deleteLogs({
+        accountMode: 'Live',
+        symbol,
+      });
+      res.json({
+        ok: true,
+        action,
+        symbol,
+        message: `Purged ${deleted} local record(s) for ${symbol} (${remaining} remaining).`,
+        dbSummary: orderHistoryDb.getSummary(),
+      });
+      return;
+    }
+
+    if (!vault.apiKey || !vault.apiSecret) {
+      res.status(400).json({
+        ok: false,
+        error: 'Live Binance API credentials are required in the server vault for exchange reconciliation.',
+      });
+      return;
+    }
+
+    if (action === 'sync_history' || action === 'adopt_pair') {
+      const lookback = normalizeLookbackPreset(body?.lookback ?? '7d');
+      const syncRes = await syncSymbolHistoryFromBinance(symbol, targetVenue, lookback);
+      res.json({
+        ok: !syncRes.error,
+        action,
+        symbol,
+        syncedCount: syncRes.syncedCount,
+        message: syncRes.error
+          ? syncRes.error
+          : `Synced ${syncRes.syncedCount} order(s) for ${symbol} (${lookback}).`,
+        dbSummary: orderHistoryDb.getSummary(),
+      });
+      return;
+    }
+
+    if (action === 'reconcile_orders') {
+      const staleLogs = orderHistoryDb
+        .getAllLogs()
+        .filter(
+          (l) =>
+            l.accountMode === 'Live' &&
+            l.venue === targetVenue &&
+            l.environment === vault.environment &&
+            l.symbol === symbol &&
+            (l.status === 'NEW' || l.status === 'PARTIALLY_FILLED')
+        );
+      const endpoint = targetVenue === 'Futures' ? '/fapi/v1/order' : '/api/v3/order';
+      const updatedEntries: BackendOrderExecutionLog[] = [];
+      const reconcileErrors: string[] = [];
+      for (const stale of staleLogs) {
+        const isAlgoRecord = Boolean(stale.algoId) || stale.endpoint.includes('algoOrder');
+        let qRes =
+          targetVenue === 'Futures' && isAlgoRecord
+            ? await signedBinanceRequest('GET', '/fapi/v1/algoOrder', { algoId: stale.algoId || stale.orderId }, 'Futures')
+            : await signedBinanceRequest('GET', endpoint, { symbol, orderId: stale.orderId }, targetVenue);
+        if (!qRes.ok && targetVenue === 'Futures' && !isAlgoRecord && Number(qRes.data?.code) === -2013) {
+          const algoLookup = await signedBinanceRequest('GET', '/fapi/v1/algoOrder', { algoId: stale.orderId }, 'Futures');
+          if (algoLookup.ok) {
+            qRes = algoLookup;
+          }
+        }
+        if (qRes.ok) {
+          const statusRaw = String(qRes.data.algoStatus ?? qRes.data.status ?? stale.status).toUpperCase();
+          const executedQty = Number(qRes.data.executedQty ?? stale.executedQty) || 0;
+          const quoteQty = Number(qRes.data.cummulativeQuoteQty ?? qRes.data.cumQuote ?? stale.quoteQty) || 0;
+          const avgPrice =
+            executedQty > 0 && quoteQty > 0
+              ? quoteQty / executedQty
+              : Number(qRes.data.avgPrice ?? qRes.data.price ?? qRes.data.triggerPrice ?? stale.price) || stale.price;
+          updatedEntries.push({
+            ...stale,
+            status: (statusRaw as BackendOrderExecutionLog['status']) || 'CANCELED',
+            executedQty,
+            quoteQty,
+            avgPrice,
+            updateTimeMs: Number(qRes.data.updateTime ?? Date.now()),
+            timestampMs: Number(qRes.data.updateTime ?? Date.now()),
+            rationale: `${stale.rationale} · Reconciled (${statusRaw})`,
+          });
+        } else if (Number(qRes.data?.code) === -2013) {
+          // Official Binance error -2013 ("Order does not exist.") -> mark CANCELED so it no longer blocks as a ghost open order
+          updatedEntries.push({
+            ...stale,
+            status: 'CANCELED',
+            updateTimeMs: Date.now(),
+            timestampMs: Date.now(),
+            rationale: `${stale.rationale} · Marked CANCELED (-2013 order does not exist on exchange)`,
+          });
+        } else {
+          reconcileErrors.push(
+            `Order #${stale.orderId}: Binance ${qRes.data?.code ?? qRes.status} (${String(qRes.data?.msg ?? 'Query failed')})`
+          );
+        }
+      }
+      if (updatedEntries.length > 0) {
+        orderHistoryDb.upsertLogs(updatedEntries);
+      }
+      const allFailed = updatedEntries.length === 0 && reconcileErrors.length > 0;
+      res.json({
+        ok: !allFailed,
+        action,
+        symbol,
+        reconciledCount: updatedEntries.length,
+        message: allFailed
+          ? reconcileErrors.join('; ')
+          : reconcileErrors.length > 0
+            ? `Reconciled ${updatedEntries.length} order(s) for ${symbol} (${reconcileErrors.join('; ')}).`
+            : `Reconciled ${updatedEntries.length} stale order(s) for ${symbol} via ${endpoint}.`,
+        dbSummary: orderHistoryDb.getSummary(),
+      });
+      return;
+    }
+
+    if (action === 'cancel_exchange_orders') {
+      const cancelEndpoint =
+        targetVenue === 'Futures' ? '/fapi/v1/allOpenOrders' : '/api/v3/openOrders';
+      const cancelRes = await signedBinanceRequest(
+        'DELETE',
+        cancelEndpoint,
+        { symbol },
+        targetVenue
+      );
+      let algoCancelOk = targetVenue !== 'Futures';
+      let algoErrMsg = '';
+      if (targetVenue === 'Futures') {
+        const algoDelRes = await signedBinanceRequest('DELETE', '/fapi/v1/algoOpenOrders', { symbol }, 'Futures');
+        const benignNoAlgo = Number(algoDelRes.data?.code) === -2011;
+        algoCancelOk = algoDelRes.ok || benignNoAlgo;
+        if (!algoCancelOk) {
+          algoErrMsg = `algoOpenOrders: Binance ${algoDelRes.data?.code ?? algoDelRes.status} (${String(algoDelRes.data?.msg ?? 'Cancel failed')})`;
+        }
+      }
+      // Binance returns -2011 ("Unknown order sent") when a symbol has 0 regular open orders
+      const isBenignNoOpenOrders = Number(cancelRes.data?.code) === -2011;
+      const regularOk = cancelRes.ok || isBenignNoOpenOrders;
+      const effectiveOk = regularOk && algoCancelOk;
+      if (effectiveOk) {
+        const staleLogs = orderHistoryDb
+          .getAllLogs()
+          .filter(
+            (l) =>
+              l.accountMode === 'Live' &&
+              l.venue === targetVenue &&
+              l.environment === vault.environment &&
+              l.symbol === symbol &&
+              (l.status === 'NEW' || l.status === 'PARTIALLY_FILLED')
+          )
+          .map((l) => ({
+            ...l,
+            status: 'CANCELED' as const,
+            updateTimeMs: Date.now(),
+            timestampMs: Date.now(),
+          }));
+        if (staleLogs.length > 0) {
+          orderHistoryDb.upsertLogs(staleLogs);
+        }
+      }
+      res.json({
+        ok: effectiveOk,
+        action,
+        symbol,
+        message: effectiveOk
+          ? `Canceled open exchange & algo orders for ${symbol}.`
+          : [
+              !regularOk
+                ? `Binance ${cancelRes.data.code ?? cancelRes.status}: ${String(cancelRes.data.msg ?? 'Cancel failed')}`
+                : null,
+              algoErrMsg || null,
+            ]
+              .filter(Boolean)
+              .join('; '),
+        dbSummary: orderHistoryDb.getSummary(),
+      });
+      return;
+    }
+
+    res.status(400).json({ ok: false, error: `Unsupported orphan resolution action: ${String(action)}` });
+  }));
 
   // ---------- Git Sync Backup APIs ----------
 
@@ -3008,6 +4180,63 @@ async function bootstrapServer() {
     });
   }));
 
+  // ---------- 24/7 VPS Rust Daemon Engine Gateway (/api/engine/* -> bot-web 127.0.0.1:8080) ----------
+
+  app.use('/api/engine', asyncRoute(async (req, res) => {
+    const subPath = req.path || '/';
+    if (!isEnginePathAllowed(req.method, subPath)) {
+      res.status(404).json({
+        ok: false,
+        error: `Disallowed or unknown VPS Engine Gateway route: ${req.method} /api/engine${subPath}`,
+      });
+      return;
+    }
+
+    const rawSubUrl = req.url || subPath || '/';
+    const normalizedSubUrl = rawSubUrl.startsWith('/') ? rawSubUrl : `/${rawSubUrl}`;
+    const upstreamUrl = `${getEngineBaseUrl()}/api${normalizedSubUrl}`;
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+    };
+    const engTok = getEngineAuthToken();
+    if (engTok) {
+      headers.Authorization = `Bearer ${engTok}`;
+      headers['X-ApexRust-Token'] = engTok;
+    }
+    const hasBody = req.method === 'POST' || req.method === 'DELETE';
+    let bodyStr: string | undefined;
+    if (hasBody && req.body && Object.keys(req.body as Record<string, unknown>).length > 0) {
+      headers['Content-Type'] = 'application/json';
+      bodyStr = JSON.stringify(req.body);
+    }
+
+    try {
+      const upstreamResp = await fetch(upstreamUrl, {
+        method: req.method,
+        headers,
+        body: bodyStr,
+        signal: AbortSignal.timeout(5000),
+      });
+      const text = await upstreamResp.text();
+      let parsed: unknown = null;
+      try {
+        parsed = text ? JSON.parse(text) : {};
+      } catch {
+        parsed = { raw: text };
+      }
+      res.status(upstreamResp.status).json(parsed);
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        engineReachable: false,
+        error:
+          err instanceof Error
+            ? `24/7 VPS Rust Trading Daemon is not reachable at ${getEngineBaseUrl()}: ${err.message}`
+            : `24/7 VPS Rust Trading Daemon is not reachable at ${getEngineBaseUrl()}`,
+      });
+    }
+  }));
+
   app.use('/api', (_req, res) => {
     res.status(404).json({ ok: false, error: 'API endpoint not found.' });
   });
@@ -3071,9 +4300,28 @@ async function bootstrapServer() {
   }
 
   const port = Number(process.env.PORT || 3000);
-  const host = (process.env.HOST || '0.0.0.0').trim() || '0.0.0.0';
+  const isCloudRun = Boolean(process.env.K_SERVICE);
+  const defaultHost = isCloudRun ? '0.0.0.0' : '127.0.0.1';
+  const host = (process.env.HOST || defaultHost).trim() || defaultHost;
+  const configuredToken = (process.env.APEXRUST_PROXY_TOKEN ?? '').trim();
+  const trustZeroTrustMesh =
+    (process.env.APEXRUST_TRUST_ZERO_TRUST_MESH ?? '').trim().toLowerCase() === 'true';
+
+  const bindSafety = evaluateBindSafety(host, configuredToken, {
+    isCloudRun,
+    trustZeroTrustMesh,
+  });
+  if (!bindSafety.ok) {
+    console.error(`[server] Security bind check failed: ${bindSafety.reason}`);
+    process.exit(1);
+  }
+
   app.listen(port, host, () => {
-    console.log(`ApexRust server listening on http://${host}:${port}`);
+    console.log(
+      `ApexRust server listening on http://${host}:${port} (authority=${getEngineAuthority()}, tokenAuth=${
+        configuredToken ? 'enabled' : 'mesh-trusted'
+      })`
+    );
   });
 }
 

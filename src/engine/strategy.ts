@@ -14,7 +14,7 @@ import type {
   TradingConfig,
 } from './types';
 
-export interface StrategyEvalOptions {
+interface StrategyEvalOptions {
   strategyProfile?: StrategyProfile;
   directionPolicy?: DirectionPolicy;
   recentCandles?: Candle[];
@@ -134,7 +134,11 @@ export function evaluateEntrySignal(
     !useVwap || !indCfg.requireVwapAlignment || ind.vwap === null || candle.close <= ind.vwap;
 
   if (profile === 'ema_breakout') {
-    const history = (options?.recentCandles ?? []).slice(-11, -1);
+    const rawHistory = options?.recentCandles ?? [];
+    const history =
+      rawHistory.length > 0 && rawHistory[rawHistory.length - 1]?.openTimeMs === candle.openTimeMs
+        ? rawHistory.slice(-11, -1)
+        : rawHistory.slice(-10);
     const priorHigh = history.length > 0 ? Math.max(...history.map((c) => c.high)) : candle.open;
     const priorLow = history.length > 0 ? Math.min(...history.map((c) => c.low)) : candle.open;
     const avgVol =
@@ -244,7 +248,7 @@ export function evaluateEntrySignal(
   return null;
 }
 
-export interface SignalDiagnosticsResult {
+interface SignalDiagnosticsResult {
   bias: string;
   preferredSide: Side;
   checks: Array<{ label: string; ok: boolean }>;
@@ -336,7 +340,10 @@ export function evaluateSignalDiagnostics(
   let checks: Array<{ label: string; ok: boolean }>;
 
   if (profile === 'ema_breakout') {
-    const recent = candles.slice(-11, -1);
+    const recent =
+      candles.length > 0 && candles[candles.length - 1]?.openTimeMs === latestCandle.openTimeMs
+        ? candles.slice(-11, -1)
+        : candles.slice(-10);
     const priorHigh = recent.length > 0 ? Math.max(...recent.map((c) => c.high)) : latestCandle.open;
     const priorLow = recent.length > 0 ? Math.min(...recent.map((c) => c.low)) : latestCandle.open;
     const avgVol =
@@ -503,7 +510,7 @@ export function buildExitPlan(
   };
 }
 
-export type PositionTickAction =
+type PositionTickAction =
   | { type: 'Hold' }
   | { type: 'PartialClose'; ratio: number; exitPrice: number; reason: ExitReason }
   | { type: 'FullClose'; exitPrice: number; reason: ExitReason };
@@ -584,6 +591,9 @@ export function managePositionTick(
 
         if (!pos.exitPlan.tp1Hit && markPrice >= pos.exitPlan.takeProfit1) {
           pos.exitPlan.tp1Hit = true;
+          if (cfg.tp1CloseRatio >= 0.999) {
+            return { type: 'FullClose', exitPrice: pos.exitPlan.takeProfit1, reason: 'TakeProfit1' };
+          }
           return {
             type: 'PartialClose',
             ratio: cfg.tp1CloseRatio,
@@ -657,6 +667,9 @@ export function managePositionTick(
 
       if (!pos.exitPlan.tp1Hit && markPrice <= pos.exitPlan.takeProfit1) {
         pos.exitPlan.tp1Hit = true;
+        if (cfg.tp1CloseRatio >= 0.999) {
+          return { type: 'FullClose', exitPrice: pos.exitPlan.takeProfit1, reason: 'TakeProfit1' };
+        }
         return {
           type: 'PartialClose',
           ratio: cfg.tp1CloseRatio,

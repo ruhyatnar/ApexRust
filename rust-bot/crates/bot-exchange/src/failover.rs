@@ -1,4 +1,7 @@
-use crate::{BinanceFuturesClient, BinanceRestClient, BinanceWsDriver, LiveOrderAck, LiveOrderRequest};
+use crate::{
+    BinanceFuturesClient, BinanceRestClient, BinanceWsDriver, ExchangeOpenPosition,
+    ExchangeOrderStatus, LiveOrderAck, LiveOrderRequest,
+};
 use bot_core::{Candle, ExchangeConfig, ExchangeVenue, MarketEvent, Result, TransportMode};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -97,6 +100,53 @@ impl FailoverGateway {
         }
     }
 
+    pub async fn cancel_open_orders(&self, symbol: &str) -> Result<()> {
+        match self.cfg.venue {
+            ExchangeVenue::Futures => self.futures.cancel_futures_open_orders(symbol).await,
+            ExchangeVenue::Spot => self.rest.cancel_spot_open_orders(symbol).await,
+        }
+    }
+
+    pub async fn fetch_ticker_price(&self, symbol: &str) -> Result<f64> {
+        match self.cfg.venue {
+            ExchangeVenue::Futures => self.futures.fetch_futures_ticker_price(symbol).await,
+            ExchangeVenue::Spot => self.rest.fetch_spot_ticker_price(symbol).await,
+        }
+    }
+
+    pub async fn query_order_status(&self, symbol: &str, order_id: i64) -> Result<ExchangeOrderStatus> {
+        match self.cfg.venue {
+            ExchangeVenue::Futures => self.futures.query_futures_order_status(symbol, order_id).await,
+            ExchangeVenue::Spot => self.rest.query_spot_order_status(symbol, order_id).await,
+        }
+    }
+
+    pub async fn query_futures_algo_order_status(&self, algo_id: i64) -> Result<ExchangeOrderStatus> {
+        self.futures.query_futures_algo_order_status(algo_id).await
+    }
+
+    pub async fn get_spot_open_orders(
+        &self,
+        symbol: Option<&str>,
+    ) -> Result<Vec<ExchangeOrderStatus>> {
+        self.rest.get_spot_open_orders(symbol).await
+    }
+
+    pub async fn get_spot_free_balance(&self, asset: &str) -> Result<f64> {
+        self.rest.get_spot_free_balance(asset).await
+    }
+
+    pub async fn get_futures_positions(
+        &self,
+        symbol: Option<&str>,
+    ) -> Result<Vec<ExchangeOpenPosition>> {
+        self.futures.get_futures_positions(symbol).await
+    }
+
+    pub async fn get_futures_open_algo_orders(&self, symbol: Option<&str>) -> Result<Vec<i64>> {
+        self.futures.get_futures_open_algo_orders(symbol).await
+    }
+
     pub async fn health(&self) -> FailoverHealth {
         let mode = *self.mode.read().await;
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -142,6 +192,8 @@ impl FailoverGateway {
                 });
 
                 loop {
+                    // Reset last WS frame timestamp on each reconnect attempt so watchdog measures fresh handshake timeout
+                    gw_ws.last_ws_epoch_ms.store(0, Ordering::Relaxed);
                     let started = Instant::now();
                     let d = Arc::clone(&driver);
                     let tx_copy = inner_tx.clone();

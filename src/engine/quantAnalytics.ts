@@ -6,7 +6,7 @@ import type {
   Side,
 } from './types';
 
-export interface ExpectancyAnalytics {
+interface ExpectancyAnalytics {
   sampleCount: number;
   isStatisticallySignificant: boolean; // >= 50 trades per §5 & §6
   winCount: number;
@@ -36,7 +36,7 @@ export interface ExpectancyAnalytics {
   streak12DrawdownAt1PctRisk: number;
 }
 
-export interface KellyTierProjection {
+interface KellyTierProjection {
   id: PositionSizingMode;
   label: string;
   riskFractionPct: number; // % of account equity risked per trade
@@ -50,18 +50,18 @@ export interface KellyTierProjection {
   probabilityOfRuinPct: number;
 }
 
-export interface KellyGrowthPoint {
+interface KellyGrowthPoint {
   fractionPct: number;
   logGrowthBps: number;
   zone: 'Optimal' | 'Overbet' | 'Ruin';
 }
 
-export interface KellySizingAnalytics {
+interface KellySizingAnalytics {
   winRateP: number;
   lossRateQ: number;
   payoffRatioB: number;
   rawFullKellyFraction: number; // f* = (b*p - q) / b (can be <= 0)
-  fullKellyPct: number; // clamped [0, 60]%
+  fullKellyPct: number; // clamped [0, 50]%
   halfKellyPct: number; // 0.5 * f*
   quarterKellyPct: number; // 0.25 * f*
   negativeExpectancyWarning: boolean; // true when f* <= 0 (EV <= 0)
@@ -71,7 +71,7 @@ export interface KellySizingAnalytics {
   growthCurve: KellyGrowthPoint[];
 }
 
-export interface PortfolioCorrelationMatrix {
+interface PortfolioCorrelationMatrix {
   symbols: string[];
   matrix: number[][]; // N x N Pearson correlation in [-1, 1]
   avgPairwiseCorrelation: number;
@@ -79,14 +79,14 @@ export interface PortfolioCorrelationMatrix {
   adjustedHalfKellyBySymbol: Record<string, number>; // % equity risk per pair after correlation penalty
 }
 
-export interface MultiTimeframeRoleStatus {
+interface MultiTimeframeRoleStatus {
   timeframe: 'D1 (Macro)' | 'H4 (Structure)' | 'H1 (Momentum)' | 'M5 (Execution)';
   role: string;
   metricSummary: string;
   aligned: boolean;
 }
 
-export interface ValidationStepResult {
+interface ValidationStepResult {
   step: number;
   title: string;
   detail: string;
@@ -94,7 +94,7 @@ export interface ValidationStepResult {
   mandatory: boolean;
 }
 
-export interface PreTradeValidationReport {
+interface PreTradeValidationReport {
   symbol: string;
   side: Side;
   entryPrice: number;
@@ -129,9 +129,11 @@ export function computeExpectancyStats(
   closedTrades: ClosedTrade[],
   baseRiskPerTradePct = 0.75
 ): ExpectancyAnalytics {
-  const sampleCount = closedTrades.length;
-  const wins = closedTrades.filter((t) => t.pnlUsdt > 0);
-  const losses = closedTrades.filter((t) => t.pnlUsdt <= 0);
+  // Exclude partial TP1 scale-outs so Kelly win-rate and payoff match Rust engine & avoid double-counting.
+  const fullTrades = closedTrades.filter((t) => !t.id.endsWith('-tp1'));
+  const sampleCount = fullTrades.length;
+  const wins = fullTrades.filter((t) => t.pnlUsdt > 0);
+  const losses = fullTrades.filter((t) => t.pnlUsdt <= 0);
 
   const winCount = wins.length;
   const lossCount = losses.length;
@@ -214,7 +216,7 @@ export function computeExpectancyStats(
 /**
  * §5 Expected Logarithmic Growth Rate G(f) = p * ln(1 + b*f) + q * ln(1 - f)
  */
-export function computeLogGrowthRate(winRateP: number, payoffB: number, fractionF: number): number {
+function computeLogGrowthRate(winRateP: number, payoffB: number, fractionF: number): number {
   const f = Math.max(0, Math.min(0.99, fractionF));
   if (f <= 0 || payoffB <= 0) return 0;
   const p = Math.min(0.99, Math.max(0.01, winRateP));

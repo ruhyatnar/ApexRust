@@ -128,6 +128,7 @@ export interface Position {
   unrealizedPnlUsdt: number;
   realizedPnlUsdt: number;
   feePaidUsdt?: number;
+  commissionAsset?: string;
   highestFavorablePrice: number;
   exitPlan: ExitPlan;
   openedAtMs: number;
@@ -202,14 +203,21 @@ export type OrderExecutionStatus =
   | 'PARTIALLY_FILLED'
   | 'NEW'
   | 'CANCELED'
+  | 'PENDING_CANCEL'
   | 'REJECTED'
-  | 'EXPIRED';
+  | 'EXPIRED'
+  | 'EXPIRED_IN_MATCH';
+
+export type SyncLookbackPreset = '1d' | '3d' | '7d' | '30d';
+
+export type OrderAutoPollInterval = 'off' | '1m' | '5m' | '15m';
 
 export interface OrderExecutionLog {
   id: string;
   orderId: string;
   clientOrderId: string;
   orderListId?: number;
+  algoId?: string;
   algoOrderIds?: string[];
   symbol: string;
   venue: ExchangeVenue;
@@ -219,16 +227,27 @@ export interface OrderExecutionLog {
   lifecycle: 'ENTRY' | 'EXIT' | 'CANCEL' | 'PREFLIGHT';
   side: Side;
   binanceSide: 'BUY' | 'SELL';
+  positionSide?: 'BOTH' | 'LONG' | 'SHORT';
   orderType: string;
+  origType?: string;
   timeInForce: string;
   status: OrderExecutionStatus;
   price: number;
+  avgPrice?: number;
+  stopPrice?: number;
+  activatePrice?: number | null;
+  priceRate?: number | null;
   executedQty: number;
   origQty: number;
   quoteQty: number;
   commission: number;
   commissionAsset: string;
   isMaker: boolean;
+  reduceOnly?: boolean;
+  closePosition?: boolean;
+  priceProtect?: boolean;
+  workingType?: 'MARK_PRICE' | 'CONTRACT_PRICE';
+  selfTradePreventionMode?: string;
   realizedPnlUsdt: number | null;
   rMultiple: number | null;
   exitReason: string | null;
@@ -236,7 +255,64 @@ export interface OrderExecutionLog {
   endpoint: string;
   rationale: string;
   errorMessage?: string;
+  orderTimeMs?: number;
+  updateTimeMs?: number;
+  workingTimeMs?: number | null;
   timestampMs: number;
+}
+
+export interface SymbolSyncWatermark {
+  key: string; // `${venue}:${environment}:${symbol}`
+  symbol: string;
+  venue: ExchangeVenue;
+  environment: 'Testnet' | 'Production';
+  lastSyncedAtMs: number;
+  oldestSyncedStartMs: number;
+  lastLookback: SyncLookbackPreset;
+  lastSyncedCount: number;
+}
+
+export interface OrderDatabaseSummary {
+  engine: 'sqlite_wal' | 'jsonl_fallback';
+  dbPath: string;
+  totalCount: number;
+  liveCount: number;
+  paperCount: number;
+  maxLiveQuota: number;
+  maxPaperQuota: number;
+  distinctSymbols: string[];
+  watermarks: SymbolSyncWatermark[];
+  lastUpdatedAtMs: number;
+}
+
+export type OrphanPairKind =
+  | 'exchange_untracked_pair'
+  | 'stale_local_open_order'
+  | 'db_unconfigured_pair';
+
+export type OrphanResolutionAction =
+  | 'adopt_pair'
+  | 'sync_history'
+  | 'reconcile_orders'
+  | 'cancel_exchange_orders'
+  | 'purge_local_records';
+
+export interface OrphanPairRecord {
+  symbol: string;
+  venue: ExchangeVenue;
+  environment: 'Testnet' | 'Production';
+  kinds: OrphanPairKind[];
+  inConfiguredPairs: boolean;
+  exchangeOpenOrdersCount: number;
+  exchangeAlgoOrdersCount: number;
+  exchangePositionAmt: number;
+  exchangeUnrealizedPnlUsdt: number;
+  exchangeSpotFreeBalance: number;
+  exchangeSpotLockedBalance: number;
+  localDbOrderCount: number;
+  localStaleOpenOrderIds: string[];
+  summary: string;
+  detectedAtMs: number;
 }
 
 export interface EntrySignal {
@@ -327,7 +403,7 @@ export interface UtcTimeWindow {
   enabled: boolean;
 }
 
-export interface AutomationConfig {
+interface AutomationConfig {
   enabled: boolean;
   strategyProfile: StrategyProfile;
   directionPolicy: DirectionPolicy;
@@ -401,7 +477,7 @@ export type ExecutionAccountMode = 'Paper' | 'Live';
 
 export type BinanceAuthMethod = 'HMAC-SHA256' | 'Ed25519';
 
-export interface LiveBalanceEntry {
+interface LiveBalanceEntry {
   asset: string;
   free: number;
   locked: number;
@@ -428,7 +504,7 @@ export interface LiveCredentialStatus {
   syncedBalances: LiveBalanceEntry[];
 }
 
-export interface TransportHealth {
+interface TransportHealth {
   mode: TransportMode;
   environment: 'Production' | 'Testnet';
   venue: ExchangeVenue;
@@ -444,6 +520,7 @@ export interface TransportHealth {
 export interface PendingOrder {
   id: string;
   symbol: string;
+  venue?: ExchangeVenue;
   side: Side;
   orderType: OrderType;
   orderMethod: ExecutionOrderMethod;
@@ -459,7 +536,7 @@ export interface PendingOrder {
   exchangeOrderId?: string;
 }
 
-export interface AutoTradingStats {
+interface AutoTradingStats {
   scansRun: number;
   signalsDetected: number;
   autoOrdersDispatched: number;

@@ -97,7 +97,7 @@ export const DateRangePicker: React.FC<DateRangePickerProps> = ({
 
   const activePreset = useMemo(() => {
     if (!value.startDate && !value.endDate) return 'all' as const;
-    for (const preset of ['today', '7d', '30d'] as const) {
+    for (const preset of ['today', '1d', '3d', '7d', '30d'] as const) {
       const p = computeUtcDatePresetRange(preset, effectiveNowMs);
       if (p.startDate === value.startDate && p.endDate === value.endDate) {
         return preset;
@@ -184,7 +184,7 @@ export const DateRangePicker: React.FC<DateRangePickerProps> = ({
     onChange({ startDate: value.startDate, endDate: nextEnd });
   };
 
-  const applyPreset = (preset: 'all' | 'today' | '7d' | '30d') => {
+  const applyPreset = (preset: 'all' | 'today' | '1d' | '3d' | '7d' | '30d') => {
     if (preset === 'all') {
       onChange({ startDate: '', endDate: '' });
       return;
@@ -243,13 +243,15 @@ export const DateRangePicker: React.FC<DateRangePickerProps> = ({
           </div>
 
           {/* Quick Time Period Presets */}
-          <div className="mt-2.5 grid grid-cols-4 gap-1.5" role="group" aria-label="Date range presets">
+          <div className="mt-2.5 grid grid-cols-3 gap-1.5" role="group" aria-label="Date range presets">
             {(
               [
                 { id: 'all', label: 'All Dates' },
                 { id: 'today', label: 'Today' },
-                { id: '7d', label: 'Last 7D' },
-                { id: '30d', label: 'Last 30D' },
+                { id: '1d', label: '1D' },
+                { id: '3d', label: '3D' },
+                { id: '7d', label: '7D' },
+                { id: '30d', label: '1M (30D)' },
               ] as const
             ).map((preset) => {
               const isSelected = activePreset === preset.id;

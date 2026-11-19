@@ -18,4 +18,7 @@ rust-bot/Cargo.lock
 *.pem
 *.key
 .apexrust-order-logs.json
+.apexrust-orders.sqlite
+.apexrust-orders.sqlite-*
+.apexrust-orders.sqlite.json
 rust-bot/config/bot.toml

@@ -28,7 +28,40 @@ export const PATHS = {
   runDir: path.join(REPO_DIR, '.apexrust', 'run'),
   logDir: path.join(REPO_DIR, '.apexrust', 'logs'),
   stateFile: path.join(REPO_DIR, '.apexrust', 'state.json'),
+  remoteProfileFile: path.join(REPO_DIR, '.apexrust', 'remote-profile.json'),
 };
+
+/**
+ * Cross-platform detector for Cloudflare One (Zero Trust WARP 100.96.0.0/12) and CGNAT mesh IPs (100.64.0.0/10)
+ * on Linux, macOS, and Windows via `os.networkInterfaces()`.
+ */
+export function detectZeroTrustMeshIps(interfaces = os.networkInterfaces()) {
+  const results = [];
+  for (const [ifaceName, addrs] of Object.entries(interfaces ?? {})) {
+    if (!Array.isArray(addrs)) continue;
+    for (const addr of addrs) {
+      if (!addr || addr.internal) continue;
+      const family = String(addr.family ?? '');
+      if (family !== 'IPv4' && family !== '4') continue;
+      const ip = String(addr.address ?? '').trim();
+      const parts = ip.split('.').map(Number);
+      if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+        continue;
+      }
+      const [a, b] = parts;
+      if (a === 100 && b >= 64 && b <= 127) {
+        const isCloudflareOne =
+          (b >= 96 && b <= 111) || /warp|cloudflare|cf/i.test(ifaceName);
+        results.push({
+          iface: ifaceName,
+          ip,
+          kind: isCloudflareOne ? 'Cloudflare One (Zero Trust WARP)' : 'Zero Trust Mesh (CGNAT)',
+        });
+      }
+    }
+  }
+  return results;
+}
 
 export function pidFile(component) {
   return path.join(PATHS.runDir, `${component}.pid`);

@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from 'react';
+import { fmtUsdMagnitude } from '../engine/formatters';
 import type { BotConfig, EngineSnapshot } from '../engine/types';
 
 interface SummaryCardsRowProps {
@@ -6,12 +7,7 @@ interface SummaryCardsRowProps {
   config: BotConfig;
 }
 
-function fmtUsd(val: number): string {
-  return Math.abs(val).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
+const fmtUsd = fmtUsdMagnitude;
 
 export const SummaryCardsRow: React.FC<SummaryCardsRowProps> = ({ snapshot, config }) => {
   const [tradesFilter, setTradesFilter] = useState<'Closed' | 'Open'>('Closed');

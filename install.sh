@@ -17,19 +17,26 @@ NEED_RUST=1
 PREV=""
 
 for arg in "$@"; do
+  lower_arg="$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')"
   case "$PREV" in
     --components)
-      if [ "$arg" = "web" ]; then NEED_RUST=0; else NEED_RUST=1; fi
+      if [ "$lower_arg" = "web" ]; then NEED_RUST=0; else NEED_RUST=1; fi
+      PREV=""
+      continue
+      ;;
+    --role)
+      if [ "$lower_arg" = "client" ]; then NEED_RUST=0; fi
       PREV=""
       continue
       ;;
   esac
-  case "$arg" in
+  case "$lower_arg" in
     --non-interactive) NON_INTERACTIVE=1; AUTO_YES=1 ;;
     -y|--yes) AUTO_YES=1 ;;
-    --components=web) NEED_RUST=0 ;;
+    --components=web|--role=client) NEED_RUST=0 ;;
     --components=bot|--components=both) NEED_RUST=1 ;;
     --components) PREV="--components" ;;
+    --role) PREV="--role" ;;
   esac
 done
 

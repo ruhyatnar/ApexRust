@@ -22,6 +22,8 @@ import type {
 interface LiveCredentialsViewProps {
   liveStatus: LiveCredentialStatus;
   accountMode: ExecutionAccountMode;
+  serverTargetLabel?: string;
+  isRemoteVps?: boolean;
   onSaveCredentials: (payload: {
     environment: 'Testnet' | 'Production';
     venue: ExchangeVenue;
@@ -44,6 +46,8 @@ interface LiveCredentialsViewProps {
 export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
   liveStatus,
   accountMode,
+  serverTargetLabel = '🖥️ This Computer',
+  isRemoteVps = false,
   onSaveCredentials,
   onVerifyConnection,
   onRunPreflightOrder,
@@ -63,6 +67,7 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
   const [maxOrderNotionalUsdt, setMaxOrderNotionalUsdt] = useState(liveStatus.maxOrderNotionalUsdt);
   const [requirePreflight, setRequirePreflight] = useState(liveStatus.requirePreflightTestOrder);
   const [confirmProdArm, setConfirmProdArm] = useState(false);
+  const [confirmRemoteEnvText, setConfirmRemoteEnvText] = useState('');
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
@@ -95,6 +100,17 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
       });
       return;
     }
+    if (
+      isRemoteVps &&
+      (apiKey.trim() || apiSecret.trim()) &&
+      confirmRemoteEnvText.trim() !== environment
+    ) {
+      setFeedback({
+        type: 'err',
+        text: `Type "${environment}" in the Remote VPS re-confirmation box below before saving API keys.`,
+      });
+      return;
+    }
     setBusyAction('save');
     setFeedback(null);
     const res = await onSaveCredentials({
@@ -113,6 +129,7 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
     if (res.ok) {
       setApiKey('');
       setApiSecret('');
+      setConfirmRemoteEnvText('');
       setFeedback({ type: 'ok', text: res.message });
     } else {
       setFeedback({ type: 'err', text: res.message });
@@ -145,11 +162,19 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
   };
 
   const handleRevoke = async () => {
+    if (isRemoteVps && confirmRemoteEnvText.trim() !== environment) {
+      setFeedback({
+        type: 'err',
+        text: `Type "${environment}" in the Remote VPS re-confirmation box below before revoking API keys.`,
+      });
+      return;
+    }
     setBusyAction('revoke');
     await onRevokeCredentials();
     setApiKey('');
     setApiSecret('');
     setConfirmProdArm(false);
+    setConfirmRemoteEnvText('');
     setBusyAction(null);
     setFeedback({ type: 'ok', text: 'Cleared live credentials from server memory and disarmed Live execution.' });
   };
@@ -167,7 +192,10 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-md border border-cyan-400/30 bg-cyan-950/30 px-2.5 py-1 text-[11px] font-semibold text-cyan-200">
+            🔑 Managing Binance Keys on: {serverTargetLabel}
+          </span>
           <div className="flex rounded-lg border border-white/[0.08] bg-[#0D1015] p-1">
             <button
               type="button"
@@ -449,6 +477,21 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
               }`}
             >
               {feedback.text}
+            </div>
+          )}
+
+          {isRemoteVps && (
+            <div className="space-y-1.5 rounded-lg border border-cyan-500/30 bg-cyan-950/20 p-3 text-xs text-cyan-100">
+              <label className="block font-semibold">
+                Remote VPS Key Edit Confirmation: type <span className="font-mono text-cyan-300">{environment}</span> to confirm updating keys on <strong>{serverTargetLabel}</strong>
+              </label>
+              <input
+                type="text"
+                value={confirmRemoteEnvText}
+                onChange={(e) => setConfirmRemoteEnvText(e.target.value)}
+                placeholder={`Type ${environment} here`}
+                className="w-full max-w-xs rounded-md border border-cyan-400/30 bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-cyan-400 focus:outline-none"
+              />
             </div>
           )}
 

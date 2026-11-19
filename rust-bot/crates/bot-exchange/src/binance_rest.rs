@@ -1,9 +1,11 @@
 use crate::{
-    build_sdk_rest_config, get_or_fetch_symbol_filters, to_binance_step_decimal,
-    validate_live_safety, LiveOrderAck, LiveOrderRequest, SymbolFilters,
+    build_sdk_rest_config, extract_base_asset, get_or_fetch_symbol_filters,
+    to_binance_step_decimal, validate_exchange_filters, validate_live_safety, ExchangeOrderStatus,
+    LiveOrderAck, LiveOrderRequest, SymbolFilters,
 };
 use binance_sdk::spot::rest_api::{
-    DeleteOrderListParams, NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderSideEnum,
+    DeleteOpenOrdersParams, DeleteOrderListParams, GetAccountParams, GetOpenOrdersParams,
+    GetOrderParams, NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderSideEnum,
     NewOrderTimeInForceEnum, NewOrderTypeEnum, OrderListOcoAboveTypeEnum,
     OrderListOcoBelowTimeInForceEnum, OrderListOcoBelowTypeEnum, OrderListOcoParams,
     OrderListOcoSideEnum, OrderTestParams, OrderTestSideEnum, OrderTestTimeInForceEnum,
@@ -31,13 +33,61 @@ pub struct BinanceRestClient {
 }
 
 impl BinanceRestClient {
+    fn resolve_base_url(cfg: &ExchangeConfig) -> &str {
+        let trimmed = cfg.rest_base_url.trim();
+        match (cfg.venue, cfg.environment) {
+            (ExchangeVenue::Futures, ExchangeEnvironment::Production) => {
+                if trimmed.is_empty()
+                    || trimmed.contains("testnet")
+                    || trimmed.contains("demo")
+                    || trimmed.contains("binance.vision")
+                    || trimmed.contains("api.binance.com")
+                {
+                    "https://fapi.binance.com"
+                } else {
+                    trimmed
+                }
+            }
+            (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
+                if trimmed.is_empty()
+                    || trimmed.contains("fapi.binance.com")
+                    || trimmed.contains("api.binance.com")
+                {
+                    "https://testnet.binancefuture.com"
+                } else {
+                    trimmed
+                }
+            }
+            (ExchangeVenue::Spot, ExchangeEnvironment::Production) => {
+                if trimmed.is_empty()
+                    || trimmed.contains("testnet")
+                    || trimmed.contains("demo")
+                    || trimmed.contains("fapi")
+                    || trimmed.contains("binancefuture")
+                {
+                    "https://api.binance.com"
+                } else {
+                    trimmed
+                }
+            }
+            (ExchangeVenue::Spot, ExchangeEnvironment::Testnet) => {
+                if trimmed.is_empty()
+                    || trimmed.contains("api.binance.com")
+                    || trimmed.contains("fapi")
+                    || trimmed.contains("fstream")
+                {
+                    "https://testnet.binance.vision"
+                } else {
+                    trimmed
+                }
+            }
+        }
+    }
+
     pub fn new(cfg: ExchangeConfig) -> Result<Self> {
-        let sdk_client = if let Some(rest_cfg) = build_sdk_rest_config(&cfg)? {
-            let client = match cfg.environment {
-                ExchangeEnvironment::Production => SpotRestApi::production(rest_cfg),
-                ExchangeEnvironment::Testnet => SpotRestApi::testnet(rest_cfg),
-            };
-            Some(client)
+        let sdk_client = if let Some(mut rest_cfg) = build_sdk_rest_config(&cfg)? {
+            rest_cfg.base_path = Some(Self::resolve_base_url(&cfg).to_string());
+            Some(SpotRestApi::from_config(rest_cfg))
         } else {
             None
         };
@@ -57,32 +107,7 @@ impl BinanceRestClient {
     }
 
     fn effective_base_url(&self) -> &str {
-        match (self.cfg.venue, self.cfg.environment) {
-            (ExchangeVenue::Futures, ExchangeEnvironment::Production) => "https://fapi.binance.com",
-            (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
-                "https://testnet.binancefuture.com"
-            }
-            (ExchangeVenue::Spot, ExchangeEnvironment::Production) => {
-                if self.cfg.rest_base_url.trim().is_empty()
-                    || self.cfg.rest_base_url.contains("testnet")
-                    || self.cfg.rest_base_url.contains("fapi")
-                {
-                    "https://api.binance.com"
-                } else {
-                    &self.cfg.rest_base_url
-                }
-            }
-            (ExchangeVenue::Spot, ExchangeEnvironment::Testnet) => {
-                if self.cfg.rest_base_url.trim().is_empty()
-                    || self.cfg.rest_base_url.contains("api.binance.com")
-                    || self.cfg.rest_base_url.contains("fapi")
-                {
-                    "https://testnet.binance.vision"
-                } else {
-                    &self.cfg.rest_base_url
-                }
-            }
-        }
+        Self::resolve_base_url(&self.cfg)
     }
 
     /// Fetch historical klines via public Spot REST endpoint (`/api/v3/klines`).
@@ -142,11 +167,37 @@ impl BinanceRestClient {
     }
 
     /// Single fallback poll yielding a `MarketEvent` tagged `TransportMode::RestFallback`.
+    pub async fn fetch_spot_ticker_price(&self, symbol: &str) -> Result<f64> {
+        let url = format!(
+            "{}/api/v3/ticker/price?symbol={}",
+            self.effective_base_url(),
+            symbol.to_uppercase()
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot ticker request failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| BotError::RestApi(format!("Spot ticker status error: {e}")))?;
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot ticker decode failed: {e}")))?;
+        val.get("price")
+            .and_then(|p| p.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|&p| p.is_finite() && p > 0.0)
+            .ok_or_else(|| BotError::RestApi(format!("Invalid Spot ticker price for {symbol}")))
+    }
+
     pub async fn poll_latest_bar(&self, symbol: &str, interval: &str) -> Result<MarketEvent> {
         let mut bars = self.fetch_klines(symbol, interval, 2).await?;
         let latest = bars
             .pop()
             .ok_or_else(|| BotError::RestApi(format!("Empty klines for {symbol}")))?;
+        let live_price = latest.close;
         let candle = if !latest.is_closed && !bars.is_empty() {
             bars.pop().unwrap_or(latest)
         } else {
@@ -155,39 +206,45 @@ impl BinanceRestClient {
 
         Ok(MarketEvent {
             symbol: symbol.to_uppercase(),
-            price: candle.close,
+            price: live_price,
             candle,
             source: TransportMode::RestFallback,
             received_at: Utc::now(),
         })
     }
 
-    /// Execute a live Spot order (and optional `/api/v3/orderList/oco` exit bracket) via `binance-sdk`.
-    pub async fn execute_spot_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
-        let ref_px = req
-            .limit_price
-            .filter(|&p| p > 0.0)
-            .or_else(|| req.quote_order_qty.map(|q| q / req.quantity.max(1e-9)))
-            .unwrap_or(100.0);
-        validate_live_safety(&self.cfg, ExchangeVenue::Spot, req, ref_px)?;
-        let sdk = self
-            .sdk_client
-            .as_ref()
-            .ok_or_else(|| BotError::RestApi("Spot SDK credentials not configured".into()))?;
-        let recv_window = Decimal::from(
+    fn spot_recv_window(&self) -> Decimal {
+        Decimal::from(
             self.cfg
                 .credentials
                 .as_ref()
                 .map(|c| c.recv_window_ms)
                 .unwrap_or(5000),
-        );
+        )
+    }
+
+    /// Execute a live Spot order (and optional `/api/v3/orderList/oco` exit bracket) via `binance-sdk`.
+    pub async fn execute_spot_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
+        let sym = req.symbol.to_uppercase();
+        let ref_px = if let Some(px) = req.limit_price.filter(|&p| p.is_finite() && p > 0.0) {
+            px
+        } else if let Some(q) = req.quote_order_qty.filter(|&q| q.is_finite() && q > 0.0 && req.quantity > 0.0) {
+            q / req.quantity
+        } else {
+            self.fetch_spot_ticker_price(&sym).await.unwrap_or(0.0)
+        };
+        validate_live_safety(&self.cfg, ExchangeVenue::Spot, req, ref_px)?;
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| BotError::RestApi("Spot SDK credentials not configured".into()))?;
+        let recv_window = self.spot_recv_window();
         let require_preflight = self
             .cfg
             .credentials
             .as_ref()
             .is_some_and(|c| c.require_preflight_test_order);
 
-        let sym = req.symbol.to_uppercase();
         let filters = get_or_fetch_symbol_filters(
             &self.http,
             &self.filter_cache,
@@ -201,6 +258,10 @@ impl BinanceRestClient {
             Side::Long => !req.reduce_only,
             Side::Short => req.reduce_only,
         };
+        let is_market = matches!(
+            req.order_method,
+            OrderExecutionMethod::Market | OrderExecutionMethod::Oco
+        );
 
         let qty_dec = if req.order_method == OrderExecutionMethod::Market
             && side_buy
@@ -208,7 +269,7 @@ impl BinanceRestClient {
         {
             None
         } else {
-            let (step, dec) = if matches!(req.order_method, OrderExecutionMethod::Market | OrderExecutionMethod::Oco) {
+            let (step, dec) = if is_market {
                 (filters.market_step_size, filters.market_step_decimals)
             } else {
                 (filters.step_size, filters.step_decimals)
@@ -216,12 +277,42 @@ impl BinanceRestClient {
             Some(to_binance_step_decimal(req.quantity, step, dec)?)
         };
         let quote_dec = if req.order_method == OrderExecutionMethod::Market && side_buy {
+            let quote_step = 10f64.powi(-(filters.quote_decimals as i32));
             req.quote_order_qty
-                .map(|q| to_binance_step_decimal(q, 0.01, 2))
+                .map(|q| to_binance_step_decimal(q, quote_step, filters.quote_decimals))
                 .transpose()?
         } else {
             None
         };
+
+        let qty_num = qty_dec.and_then(|d| d.to_string().parse::<f64>().ok());
+        let limit_px_num = if matches!(
+            req.order_method,
+            OrderExecutionMethod::Limit | OrderExecutionMethod::LimitMaker
+        ) {
+            let px = req
+                .limit_price
+                .filter(|&p| p.is_finite() && p > 0.0)
+                .ok_or_else(|| BotError::RestApi("LIMIT order missing positive price".into()))?;
+            let px_dec = to_binance_step_decimal(px, filters.tick_size, filters.tick_decimals)?;
+            px_dec.to_string().parse::<f64>().ok()
+        } else {
+            None
+        };
+        let est_notional = req.quote_order_qty.unwrap_or_else(|| {
+            let q = qty_num.unwrap_or(req.quantity);
+            let p = limit_px_num.unwrap_or(ref_px);
+            q * p
+        });
+        validate_exchange_filters(
+            &sym,
+            &filters,
+            limit_px_num,
+            qty_num,
+            est_notional,
+            is_market,
+            req.reduce_only,
+        )?;
 
         let tif = match req.time_in_force.as_str() {
             "IOC" => NewOrderTimeInForceEnum::Ioc,
@@ -331,11 +422,22 @@ impl BinanceRestClient {
             .await
             .map_err(|e| BotError::RestApi(format!("Spot new_order decode failed: {e}")))?;
 
+        let status = resp
+            .status
+            .clone()
+            .unwrap_or_else(|| "UNKNOWN".to_string())
+            .to_uppercase();
         let exec_qty: f64 = resp
             .executed_qty
             .as_deref()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(req.quantity);
+            .unwrap_or(0.0);
+        let filled = status == "FILLED"
+            || (exec_qty > 0.0
+                && !matches!(
+                    status.as_str(),
+                    "NEW" | "CANCELED" | "REJECTED" | "EXPIRED" | "EXPIRED_IN_MATCH"
+                ));
         let cum_quote: f64 = resp
             .cummulative_quote_qty
             .as_deref()
@@ -344,10 +446,15 @@ impl BinanceRestClient {
         let avg_price = if exec_qty > 0.0 && cum_quote > 0.0 {
             cum_quote / exec_qty
         } else {
-            req.limit_price.unwrap_or(0.0)
+            resp.price
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|&p| p > 0.0)
+                .or(req.limit_price)
+                .unwrap_or(ref_px)
         };
 
-        let base_asset = sym.strip_suffix("USDT").unwrap_or(&sym);
+        let base_asset = extract_base_asset(&sym, &filters);
         let base_commission: f64 = resp
             .fills
             .as_ref()
@@ -357,7 +464,7 @@ impl BinanceRestClient {
                     .filter(|f| {
                         f.commission_asset
                             .as_deref()
-                            .is_some_and(|a| a.eq_ignore_ascii_case(base_asset))
+                            .is_some_and(|a| a.eq_ignore_ascii_case(&base_asset))
                     })
                     .filter_map(|f| f.commission.as_deref()?.parse::<f64>().ok())
                     .sum()
@@ -367,42 +474,96 @@ impl BinanceRestClient {
 
         let mut order_list_id = None;
         let mut bracket_warning = None;
-        if req.order_method == OrderExecutionMethod::Oco && net_exec_qty > 0.0 {
+        if req.order_method == OrderExecutionMethod::Oco && side_buy && net_exec_qty > 0.0 {
             if let (Some(tp), Some(sl)) = (req.take_profit_price, req.stop_loss_price) {
-                match (
-                    to_binance_step_decimal(net_exec_qty, filters.step_size, filters.step_decimals),
-                    to_binance_step_decimal(tp, filters.tick_size, filters.tick_decimals),
-                    to_binance_step_decimal(sl, filters.tick_size, filters.tick_decimals),
-                    to_binance_step_decimal(sl * 0.998, filters.tick_size, filters.tick_decimals),
-                ) {
-                    (Ok(oco_qty), Ok(tp_dec), Ok(sl_dec), Ok(sl_lim_dec)) => {
-                        let oco_res = OrderListOcoParams::builder(
-                            sym,
-                            OrderListOcoSideEnum::Sell,
-                            oco_qty,
-                            OrderListOcoAboveTypeEnum::LimitMaker,
-                            OrderListOcoBelowTypeEnum::StopLossLimit,
-                        )
-                        .above_price(tp_dec)
-                        .below_stop_price(sl_dec)
-                        .below_price(sl_lim_dec)
-                        .below_time_in_force(OrderListOcoBelowTimeInForceEnum::Gtc)
-                        .recv_window(recv_window)
-                        .build();
+                if !(tp > avg_price && avg_price > sl && sl > 0.0) {
+                    bracket_warning = Some(format!(
+                        "Spot OCO skipped: requires TP ({tp}) > fill ({avg_price}) > SL ({sl})"
+                    ));
+                } else {
+                    let sl_limit = sl * 0.998;
+                    let oco_qty_dec = to_binance_step_decimal(
+                        net_exec_qty,
+                        filters.step_size,
+                        filters.step_decimals,
+                    );
+                    let tp_dec =
+                        to_binance_step_decimal(tp, filters.tick_size, filters.tick_decimals);
+                    let sl_dec =
+                        to_binance_step_decimal(sl, filters.tick_size, filters.tick_decimals);
+                    let sl_lim_dec = to_binance_step_decimal(
+                        sl_limit,
+                        filters.tick_size,
+                        filters.tick_decimals,
+                    );
+                    match (oco_qty_dec, tp_dec, sl_dec, sl_lim_dec) {
+                        (Ok(oco_qty), Ok(tp_dec), Ok(sl_dec), Ok(sl_lim_dec)) => {
+                            let qf = oco_qty.to_string().parse::<f64>().unwrap_or(net_exec_qty);
+                            let tpf = tp_dec.to_string().parse::<f64>().unwrap_or(tp);
+                            let slf = sl_lim_dec.to_string().parse::<f64>().unwrap_or(sl_limit);
+                            let tp_check = validate_exchange_filters(
+                                &sym,
+                                &filters,
+                                Some(tpf),
+                                Some(qf),
+                                qf * tpf,
+                                false,
+                                false,
+                            );
+                            let sl_check = validate_exchange_filters(
+                                &sym,
+                                &filters,
+                                Some(slf),
+                                Some(qf),
+                                qf * slf,
+                                false,
+                                false,
+                            );
+                            if let Err(e) = tp_check.and(sl_check) {
+                                bracket_warning =
+                                    Some(format!("Spot OCO blocked by exchange filters: {e}"));
+                            } else {
+                                let oco_res = OrderListOcoParams::builder(
+                                    sym.clone(),
+                                    OrderListOcoSideEnum::Sell,
+                                    oco_qty,
+                                    OrderListOcoAboveTypeEnum::LimitMaker,
+                                    OrderListOcoBelowTypeEnum::StopLossLimit,
+                                )
+                                .above_price(tp_dec)
+                                .below_stop_price(sl_dec)
+                                .below_price(sl_lim_dec)
+                                .below_time_in_force(OrderListOcoBelowTimeInForceEnum::Gtc)
+                                .recv_window(recv_window)
+                                .build();
 
-                        match oco_res {
-                            Ok(oco_params) => match sdk.order_list_oco(oco_params).await {
-                                Ok(r) => match r.data().await {
-                                    Ok(oco_data) => order_list_id = oco_data.order_list_id,
-                                    Err(e) => bracket_warning = Some(format!("Spot OCO decode failed: {e}")),
-                                },
-                                Err(e) => bracket_warning = Some(format!("Spot /api/v3/orderList/oco failed: {e}")),
-                            },
-                            Err(e) => bracket_warning = Some(format!("Spot OCO params error: {e}")),
+                                match oco_res {
+                                    Ok(oco_params) => match sdk.order_list_oco(oco_params).await {
+                                        Ok(r) => match r.data().await {
+                                            Ok(oco_data) => order_list_id = oco_data.order_list_id,
+                                            Err(e) => {
+                                                bracket_warning = Some(format!(
+                                                    "Spot OCO decode failed: {e}"
+                                                ));
+                                            }
+                                        },
+                                        Err(e) => {
+                                            bracket_warning = Some(format!(
+                                                "Spot /api/v3/orderList/oco failed: {e}"
+                                            ));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        bracket_warning =
+                                            Some(format!("Spot OCO params error: {e}"));
+                                    }
+                                }
+                            }
                         }
-                    }
-                    _ => {
-                        bracket_warning = Some("Spot OCO rounding error after entry fill".into());
+                        _ => {
+                            bracket_warning =
+                                Some("Spot OCO rounding error after entry fill".into());
+                        }
                     }
                 }
             }
@@ -416,6 +577,8 @@ impl BinanceRestClient {
             order_list_id,
             algo_order_ids: Vec::new(),
             bracket_warning,
+            status,
+            filled,
             executed_qty: exec_qty,
             avg_price,
         })
@@ -425,21 +588,168 @@ impl BinanceRestClient {
         let Some(sdk) = self.sdk_client.as_ref() else {
             return Ok(());
         };
-        let recv_window = Decimal::from(
-            self.cfg
-                .credentials
-                .as_ref()
-                .map(|c| c.recv_window_ms)
-                .unwrap_or(5000),
-        );
         let params = DeleteOrderListParams::builder(symbol.to_uppercase())
             .order_list_id(order_list_id)
-            .recv_window(recv_window)
+            .recv_window(self.spot_recv_window())
             .build()
             .map_err(|e| BotError::RestApi(format!("Cancel OCO params error: {e}")))?;
         sdk.delete_order_list(params)
             .await
             .map_err(|e| BotError::RestApi(format!("Spot delete_order_list failed: {e}")))?;
         Ok(())
+    }
+
+    pub async fn cancel_spot_open_orders(&self, symbol: &str) -> Result<()> {
+        let Some(sdk) = self.sdk_client.as_ref() else {
+            return Ok(());
+        };
+        let params = DeleteOpenOrdersParams::builder(symbol.to_uppercase())
+            .recv_window(self.spot_recv_window())
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Spot cancel open orders params error: {e}")))?;
+        match sdk.delete_open_orders(params).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("-2011") {
+                    Ok(())
+                } else {
+                    Err(BotError::RestApi(format!(
+                        "Spot delete_open_orders failed: {msg}"
+                    )))
+                }
+            }
+        }
+    }
+
+    pub async fn query_spot_order_status(
+        &self,
+        symbol: &str,
+        order_id: i64,
+    ) -> Result<ExchangeOrderStatus> {
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| BotError::RestApi("Spot SDK credentials not configured".into()))?;
+        let params = GetOrderParams::builder(symbol.to_uppercase())
+            .order_id(order_id)
+            .recv_window(self.spot_recv_window())
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Spot get_order params error: {e}")))?;
+        let data = sdk
+            .get_order(params)
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot get_order failed: {e}")))?
+            .data()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot get_order decode failed: {e}")))?;
+        let executed_qty = data
+            .executed_qty
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let cum_quote = data
+            .cummulative_quote_qty
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let avg_price = if executed_qty > 0.0 && cum_quote > 0.0 {
+            cum_quote / executed_qty
+        } else {
+            data.price
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        Ok(ExchangeOrderStatus {
+            order_id: data.order_id.unwrap_or(order_id).to_string(),
+            status: data.status.unwrap_or_else(|| "UNKNOWN".to_string()).to_uppercase(),
+            executed_qty,
+            avg_price,
+        })
+    }
+
+    pub async fn get_spot_open_orders(
+        &self,
+        symbol: Option<&str>,
+    ) -> Result<Vec<ExchangeOrderStatus>> {
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| BotError::RestApi("Spot SDK credentials not configured".into()))?;
+        let mut builder = GetOpenOrdersParams::builder().recv_window(self.spot_recv_window());
+        if let Some(sym) = symbol {
+            builder = builder.symbol(sym.to_uppercase());
+        }
+        let params = builder
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Spot open orders params error: {e}")))?;
+        let rows = sdk
+            .get_open_orders(params)
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot get_open_orders failed: {e}")))?
+            .data()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot get_open_orders decode failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let executed_qty = r
+                    .executed_qty
+                    .as_deref()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let cum_quote = r
+                    .cummulative_quote_qty
+                    .as_deref()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let avg_price = if executed_qty > 0.0 && cum_quote > 0.0 {
+                    cum_quote / executed_qty
+                } else {
+                    r.price
+                        .as_deref()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                };
+                ExchangeOrderStatus {
+                    order_id: r.order_id.unwrap_or_default().to_string(),
+                    status: r.status.unwrap_or_else(|| "NEW".to_string()).to_uppercase(),
+                    executed_qty,
+                    avg_price,
+                }
+            })
+            .collect())
+    }
+
+    pub async fn get_spot_free_balance(&self, asset: &str) -> Result<f64> {
+        let sdk = self
+            .sdk_client
+            .as_ref()
+            .ok_or_else(|| BotError::RestApi("Spot SDK credentials not configured".into()))?;
+        let params = GetAccountParams::builder()
+            .omit_zero_balances(true)
+            .recv_window(self.spot_recv_window())
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Spot account params error: {e}")))?;
+        let data = sdk
+            .get_account(params)
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot get_account failed: {e}")))?
+            .data()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot get_account decode failed: {e}")))?;
+        let free = data
+            .balances
+            .unwrap_or_default()
+            .into_iter()
+            .find(|b| {
+                b.asset
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(asset))
+            })
+            .and_then(|b| b.free.as_deref()?.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        Ok(free)
     }
 }

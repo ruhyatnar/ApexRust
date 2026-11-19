@@ -225,17 +225,35 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
+              disabled={
+                !config.features.automatedTrading ||
+                !config.features.signalGenerator ||
+                (config.trading.venue === 'Spot'
+                  ? !config.features.spotMarket
+                  : !config.features.futuresMarket)
+              }
+              title={
+                !config.features.automatedTrading || !config.features.signalGenerator
+                  ? 'Enable Automated Trading and Signal Generator in Feature Toggles'
+                  : undefined
+              }
               onClick={onRunAutoScan}
-              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0D1015] px-3.5 py-2 text-xs font-semibold text-slate-100 transition hover:border-[#7DF2AD]/50 hover:text-[#7DF2AD] whitespace-nowrap"
+              className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#0D1015] px-3.5 py-2 text-xs font-semibold text-slate-100 transition hover:border-[#7DF2AD]/50 hover:text-[#7DF2AD] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
             >
               <Radar className="h-3.5 w-3.5" aria-hidden="true" />
               Run Auto-Scan Now
             </button>
             <button
               type="button"
+              disabled={!config.features.automatedTrading}
+              title={
+                !config.features.automatedTrading
+                  ? 'Automated Trading Engine is toggled OFF in Bot -> Feature Toggles'
+                  : undefined
+              }
               onClick={onToggleAutomation}
               aria-pressed={auto.enabled}
-              className={`flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-bold transition whitespace-nowrap ${
+              className={`flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-xs font-bold transition disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap ${
                 auto.enabled
                   ? 'border border-white/[0.08] bg-[#0D1015] text-slate-200 hover:border-amber-400/50 hover:text-amber-300'
                   : 'bg-[#7DF2AD] text-[#0B0F17] hover:bg-[#95F7BD]'
@@ -249,12 +267,21 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               ) : (
                 <>
                   <Play className="h-3.5 w-3.5" aria-hidden="true" />
-                  Enable Auto-Trading
+                  Auto-Trading Disabled (OFF)
                 </>
               )}
             </button>
           </div>
         </div>
+
+        {!config.features.automatedTrading && (
+          <div
+            role="status"
+            className="rounded-lg border border-amber-500/30 bg-amber-950/25 px-3.5 py-2 text-xs text-amber-200"
+          >
+            Automated Trading Engine is currently toggled <strong>OFF</strong> in Bot → Feature Toggles. Automated strategy selection and scan controls are locked.
+          </div>
+        )}
 
         {/* Live Telemetry Readout */}
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -285,7 +312,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
         </div>
 
         {/* Strategy Profile Cards */}
-        <div>
+        <div className={!config.features.automatedTrading ? 'opacity-50' : ''}>
           <div className="mb-2.5 flex items-center justify-between">
             <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
               Automated Strategy Selection
@@ -301,8 +328,9 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 <button
                   key={sp.id}
                   type="button"
+                  disabled={!config.features.automatedTrading}
                   onClick={() => updateAutomation('strategyProfile', sp.id)}
-                  className={`flex flex-col items-start rounded-lg border p-3.5 text-left transition ${
+                  className={`flex flex-col items-start rounded-lg border p-3.5 text-left transition disabled:cursor-not-allowed ${
                     selected
                       ? 'border-[#7DF2AD]/60 bg-[#13261E]/70'
                       : 'border-white/[0.06] bg-[#0D1015] hover:border-white/[0.16]'
@@ -326,7 +354,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
         </div>
 
         {/* Order Execution Methods & Policy Parameters */}
-        <div className="grid grid-cols-1 gap-5 border-t border-white/[0.06] pt-4 lg:grid-cols-12">
+        <div className={`grid grid-cols-1 gap-5 border-t border-white/[0.06] pt-4 lg:grid-cols-12 ${!config.features.automatedTrading ? 'opacity-50' : ''}`}>
           <div className="space-y-2.5 lg:col-span-6">
             <span className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
               Default Automated Order Method
@@ -338,8 +366,9 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                   <button
                     key={om.id}
                     type="button"
+                    disabled={!config.features.automatedTrading}
                     onClick={() => updateAutomation('orderMethod', om.id)}
-                    className={`rounded-lg border p-3 text-left transition ${
+                    className={`rounded-lg border p-3 text-left transition disabled:cursor-not-allowed ${
                       selected
                         ? 'border-[#7DF2AD]/60 bg-[#13261E]/70'
                         : 'border-white/[0.06] bg-[#0D1015] hover:border-white/[0.16]'
@@ -369,9 +398,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               </label>
               <select
                 id="auto-direction-policy"
+                disabled={!config.features.automatedTrading}
                 value={auto.directionPolicy}
                 onChange={(e) => updateAutomation('directionPolicy', e.target.value as DirectionPolicy)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
               >
                 <option value="long_only">Spot Long Only</option>
                 <option value="both">Long & Short</option>
@@ -384,9 +414,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               </label>
               <select
                 id="auto-tif"
+                disabled={!config.features.automatedTrading}
                 value={auto.timeInForce}
                 onChange={(e) => updateAutomation('timeInForce', e.target.value as TimeInForce)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
               >
                 <option value="GTC">GTC (Good Till Cancel)</option>
                 <option value="IOC">IOC (Immediate / Cancel)</option>
@@ -403,11 +434,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 type="number"
                 min="10"
                 step="10"
+                disabled={!config.features.automatedTrading}
                 value={auto.autoOrderNotionalUsdt}
                 onChange={(e) =>
                   updateAutomation('autoOrderNotionalUsdt', Math.max(10, Number(e.target.value) || 10))
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -421,11 +453,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 min="1"
                 max="100"
                 step="1"
+                disabled={!config.features.automatedTrading}
                 value={auto.limitOffsetBps}
                 onChange={(e) =>
                   updateAutomation('limitOffsetBps', Math.min(200, Math.max(1, Number(e.target.value) || 5)))
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -439,11 +472,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 min="0"
                 max="30"
                 step="1"
+                disabled={!config.features.automatedTrading}
                 value={auto.signalCooldownBars}
                 onChange={(e) =>
                   updateAutomation('signalCooldownBars', Math.max(0, Number(e.target.value) || 0))
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
               />
             </div>
 
@@ -456,9 +490,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 <input
                   id="auto-exit-close"
                   type="checkbox"
+                  disabled={!config.features.automatedTrading}
                   checked={auto.autoCloseOnExit}
                   onChange={(e) => updateAutomation('autoCloseOnExit', e.target.checked)}
-                  className="h-4 w-4 rounded border-white/[0.15] bg-[#141820] text-[#7DF2AD]"
+                  className="h-4 w-4 rounded border-white/[0.15] bg-[#141820] text-[#7DF2AD] disabled:cursor-not-allowed"
                 />
               </label>
             </div>
@@ -601,8 +636,13 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
         </div>
 
         {/* Technical Indicator Filters */}
-        <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4">
-          <h3 className="text-sm font-semibold text-slate-100">Technical Indicators & Volume</h3>
+        <div className={`rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4 ${!config.features.signalGenerator ? 'opacity-50' : ''}`}>
+          <div className="flex items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-slate-100">Technical Indicators & Volume</h3>
+            {!config.features.signalGenerator && (
+              <span className="font-mono text-[10px] text-amber-300">Signal Generator OFF</span>
+            )}
+          </div>
 
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -615,9 +655,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="1"
                 min="10"
                 max="50"
+                disabled={!config.features.signalGenerator || !config.features.adxStrengthFilter}
                 value={config.indicators.adxMinTrend}
                 onChange={(e) => updateIndicators('adxMinTrend', Number(e.target.value) || 25)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <div>
@@ -630,11 +671,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.1"
                 min="1.0"
                 max="3.5"
+                disabled={!config.features.signalGenerator || !config.features.volumeConfirmationFilter}
                 value={config.indicators.minVolumeExpansionMult ?? 1.5}
                 onChange={(e) =>
                   updateIndicators('minVolumeExpansionMult', Number(e.target.value) || 1.5)
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
           </div>
@@ -649,11 +691,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 type="number"
                 min="20"
                 max="55"
+                disabled={!config.features.signalGenerator || !config.features.rsiMomentumFilter}
                 value={config.indicators.rsiLongPullbackMin}
                 onChange={(e) =>
                   updateIndicators('rsiLongPullbackMin', Number(e.target.value) || 42)
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <div>
@@ -665,11 +708,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 type="number"
                 min="45"
                 max="75"
+                disabled={!config.features.signalGenerator || !config.features.rsiMomentumFilter}
                 value={config.indicators.rsiLongPullbackMax}
                 onChange={(e) =>
                   updateIndicators('rsiLongPullbackMax', Number(e.target.value) || 58)
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
           </div>
@@ -684,11 +728,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 type="number"
                 min="25"
                 max="55"
+                disabled={!config.features.signalGenerator || !config.features.rsiMomentumFilter}
                 value={config.indicators.rsiShortPullbackMin}
                 onChange={(e) =>
                   updateIndicators('rsiShortPullbackMin', Number(e.target.value) || 42)
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <div>
@@ -700,11 +745,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 type="number"
                 min="45"
                 max="80"
+                disabled={!config.features.signalGenerator || !config.features.rsiMomentumFilter}
                 value={config.indicators.rsiShortPullbackMax}
                 onChange={(e) =>
                   updateIndicators('rsiShortPullbackMax', Number(e.target.value) || 58)
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
           </div>
@@ -716,9 +762,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
             <input
               id="cfg-vwap-align"
               type="checkbox"
+              disabled={!config.features.signalGenerator || !config.features.vwapBiasFilter}
               checked={config.indicators.requireVwapAlignment}
               onChange={(e) => updateIndicators('requireVwapAlignment', e.target.checked)}
-              className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-[#7DF2AD]"
+              className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-[#7DF2AD] disabled:cursor-not-allowed disabled:opacity-40"
             />
           </div>
         </div>
@@ -738,9 +785,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.1"
                 min="0.5"
                 max="5"
+                disabled={!config.features.atrDynamicExits}
                 value={config.exits.atrSlMultiplier}
                 onChange={(e) => updateExits('atrSlMultiplier', Number(e.target.value) || 1.5)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <div>
@@ -753,11 +801,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.1"
                 min="0.5"
                 max="5"
+                disabled={!config.features.atrDynamicExits || !config.features.trailingStop}
                 value={config.exits.atrTrailingMultiplier}
                 onChange={(e) =>
                   updateExits('atrTrailingMultiplier', Number(e.target.value) || 1.4)
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
           </div>
@@ -773,9 +822,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.05"
                 min="0.5"
                 max="10"
+                disabled={!config.features.atrDynamicExits || !config.features.takeProfitLadder}
                 value={config.exits.atrTp1Multiplier}
                 onChange={(e) => updateExits('atrTp1Multiplier', Number(e.target.value) || 2.25)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <div>
@@ -788,9 +838,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.05"
                 min="0.8"
                 max="15"
+                disabled={!config.features.atrDynamicExits || !config.features.takeProfitLadder}
                 value={config.exits.atrTp2Multiplier}
                 onChange={(e) => updateExits('atrTp2Multiplier', Number(e.target.value) || 3.75)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
           </div>
@@ -806,11 +857,12 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.05"
                 min="0.1"
                 max="1"
+                disabled={!config.features.takeProfitLadder}
                 value={config.exits.tp1CloseRatio}
                 onChange={(e) =>
                   updateExits('tp1CloseRatio', Math.min(1, Math.max(0.1, Number(e.target.value) || 0.5)))
                 }
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <div>
@@ -823,9 +875,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.1"
                 min="0.3"
                 max="5"
+                disabled={!config.features.trailingStop}
                 value={config.exits.trailingActivationR}
                 onChange={(e) => updateExits('trailingActivationR', Number(e.target.value) || 1.2)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
           </div>
@@ -841,9 +894,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="0.1"
                 min="0.4"
                 max="3"
+                disabled={!config.features.breakEvenStop}
                 value={config.exits.breakEvenTriggerR}
                 onChange={(e) => updateExits('breakEvenTriggerR', Number(e.target.value) || 1.0)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <div>
@@ -856,9 +910,10 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 step="1"
                 min="5"
                 max="100"
+                disabled={!config.features.breakEvenStop}
                 value={config.exits.breakEvenFeeBufferBps}
                 onChange={(e) => updateExits('breakEvenFeeBufferBps', Number(e.target.value) || 25)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
           </div>

@@ -18,10 +18,10 @@ function makeCandle(i: number, open: number, high: number, low: number, close: n
 
 test('EMA converges to constant price after warmup period', () => {
   const ema = new Ema(9);
+  let val: number | null = null;
   for (let i = 0; i < 20; i += 1) {
-    ema.next(250);
+    val = ema.next(250);
   }
-  const val = ema.current();
   assert.ok(val !== null);
   assert.ok(Math.abs(val - 250) < 1e-9);
 });

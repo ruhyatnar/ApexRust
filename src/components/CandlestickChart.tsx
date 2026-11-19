@@ -11,13 +11,19 @@ import {
   StepForward,
   TrendingUp,
 } from 'lucide-react';
-import type { PairRuntimeState, Timeframe, TransportMode } from '../engine/types';
+import type {
+  FeatureToggles,
+  PairRuntimeState,
+  Timeframe,
+  TransportMode,
+} from '../engine/types';
 
 interface CandlestickChartProps {
   pair: PairRuntimeState;
   timeframe: Timeframe;
   adxMinTrend: number;
   transportMode: TransportMode;
+  features?: FeatureToggles;
   onChangeTimeframe: (tf: Timeframe) => void;
   onStepBar: () => void;
   onSimulateTransport: (mode: TransportMode) => void;
@@ -36,6 +42,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   timeframe,
   adxMinTrend,
   transportMode,
+  features,
   onChangeTimeframe,
   onStepBar,
   onSimulateTransport,
@@ -47,6 +54,17 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   const [showIndicatorsMenu, setShowIndicatorsMenu] = useState(false);
   const [hideChart, setHideChart] = useState(false);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  const wsPrimaryEnabled = features?.wsPrimaryFeed ?? true;
+  const restFallbackEnabled = features?.restFallback ?? true;
+  const emaEnabled = features?.emaTrendFilter ?? true;
+  const vwapEnabled = features?.vwapBiasFilter ?? true;
+  const atrExitsEnabled = features?.atrDynamicExits ?? true;
+  const effectiveShowEma = showEma && emaEnabled;
+  const effectiveShowVwap = showVwap && vwapEnabled;
+  const effectiveShowBrackets = showBrackets && atrExitsEnabled;
+  const transportSwitchDisabled =
+    transportMode === 'WsPrimary' ? !restFallbackEnabled : !wsPrimaryEnabled;
 
   const visibleCount = 72;
   const candles = pair.candles.slice(-visibleCount);
@@ -78,17 +96,17 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       if (c.high > maxP) maxP = c.high;
       if (c.volume > maxVol) maxVol = c.volume;
       const ind = indicators[i];
-      if (showEma && ind?.emaFast) {
+      if (effectiveShowEma && ind?.emaFast) {
         minP = Math.min(minP, ind.emaFast);
         maxP = Math.max(maxP, ind.emaFast);
       }
-      if (showEma && ind?.emaSlow) {
+      if (effectiveShowEma && ind?.emaSlow) {
         minP = Math.min(minP, ind.emaSlow);
         maxP = Math.max(maxP, ind.emaSlow);
       }
     }
 
-    if (showBrackets && pos) {
+    if (effectiveShowBrackets && pos) {
       minP = Math.min(minP, pos.exitPlan.activeStopLoss, pos.entryPrice);
       maxP = Math.max(maxP, pos.exitPlan.takeProfit2, pos.entryPrice);
     }
@@ -141,7 +159,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
       emaSlowPath: buildLine((i) => indicators[i]?.emaSlow ?? null),
       vwapPath: buildLine((i) => indicators[i]?.vwap ?? null),
     };
-  }, [candles, indicators, pos, pair.lastPrice, showEma, showBrackets]);
+  }, [candles, indicators, pos, pair.lastPrice, effectiveShowEma, effectiveShowBrackets]);
 
   const ind = pair.indicators;
   const adxValue = ind.adx ?? 0;
@@ -227,12 +245,14 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
           </button>
           <button
             type="button"
+            disabled={transportSwitchDisabled}
+            title={transportSwitchDisabled ? 'Target transport mode is disabled in Feature Toggles' : undefined}
             onClick={() =>
               onSimulateTransport(
                 transportMode === 'WsPrimary' ? 'RestFallback' : 'WsPrimary'
               )
             }
-            className={`flex items-center gap-1 rounded border px-2.5 py-1 font-mono text-[11px] font-semibold transition whitespace-nowrap ${
+            className={`flex items-center gap-1 rounded border px-2.5 py-1 font-mono text-[11px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap ${
               transportMode === 'WsPrimary'
                 ? 'border-emerald-500/30 bg-emerald-950/30 text-emerald-300'
                 : 'border-amber-500/35 bg-amber-950/30 text-amber-300'
@@ -247,31 +267,34 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
         {showIndicatorsMenu && (
           <div className="absolute left-36 top-10 z-30 w-56 rounded-lg border border-white/10 bg-[#0D1015] p-3 shadow-xl space-y-2 text-xs">
             <div className="font-semibold text-slate-200">Overlay Indicators</div>
-            <label className="flex items-center justify-between text-slate-300">
+            <label className={`flex items-center justify-between ${emaEnabled ? 'text-slate-300' : 'text-slate-500 opacity-50'}`}>
               <span>EMA Stack (9 / 21 / 50)</span>
               <input
                 type="checkbox"
-                checked={showEma}
+                disabled={!emaEnabled}
+                checked={effectiveShowEma}
                 onChange={(e) => setShowEma(e.target.checked)}
-                className="h-3.5 w-3.5"
+                className="h-3.5 w-3.5 disabled:cursor-not-allowed"
               />
             </label>
-            <label className="flex items-center justify-between text-slate-300">
+            <label className={`flex items-center justify-between ${vwapEnabled ? 'text-slate-300' : 'text-slate-500 opacity-50'}`}>
               <span>Session VWAP</span>
               <input
                 type="checkbox"
-                checked={showVwap}
+                disabled={!vwapEnabled}
+                checked={effectiveShowVwap}
                 onChange={(e) => setShowVwap(e.target.checked)}
-                className="h-3.5 w-3.5"
+                className="h-3.5 w-3.5 disabled:cursor-not-allowed"
               />
             </label>
-            <label className="flex items-center justify-between text-slate-300">
+            <label className={`flex items-center justify-between ${atrExitsEnabled ? 'text-slate-300' : 'text-slate-500 opacity-50'}`}>
               <span>ATR SL / TP Brackets</span>
               <input
                 type="checkbox"
-                checked={showBrackets}
+                disabled={!atrExitsEnabled}
+                checked={effectiveShowBrackets}
                 onChange={(e) => setShowBrackets(e.target.checked)}
-                className="h-3.5 w-3.5"
+                className="h-3.5 w-3.5 disabled:cursor-not-allowed"
               />
             </label>
           </div>
@@ -293,32 +316,35 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
             </button>
             <button
               type="button"
+              disabled={!emaEnabled}
               onClick={() => setShowEma((v) => !v)}
-              aria-pressed={showEma}
+              aria-pressed={effectiveShowEma}
               aria-label="Toggle EMA trend lines"
-              className={`rounded p-1.5 transition ${
-                showEma ? 'bg-white/10 text-sky-400' : 'text-slate-500 hover:text-slate-200'
+              className={`rounded p-1.5 transition disabled:cursor-not-allowed disabled:opacity-35 ${
+                effectiveShowEma ? 'bg-white/10 text-sky-400' : 'text-slate-500 hover:text-slate-200'
               }`}
             >
               <TrendingUp className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
               type="button"
+              disabled={!atrExitsEnabled}
               onClick={() => setShowBrackets((v) => !v)}
-              aria-pressed={showBrackets}
+              aria-pressed={effectiveShowBrackets}
               aria-label="Toggle ATR SL and TP price levels"
-              className={`rounded p-1.5 transition ${
-                showBrackets ? 'bg-white/10 text-emerald-400' : 'text-slate-500 hover:text-slate-200'
+              className={`rounded p-1.5 transition disabled:cursor-not-allowed disabled:opacity-35 ${
+                effectiveShowBrackets ? 'bg-white/10 text-emerald-400' : 'text-slate-500 hover:text-slate-200'
               }`}
             >
               <Minus className="h-4 w-4" aria-hidden="true" />
             </button>
             <button
               type="button"
+              disabled={!vwapEnabled}
               onClick={() => setShowVwap((v) => !v)}
               aria-label="Toggle VWAP overlay"
-              className={`rounded p-1.5 transition ${
-                showVwap ? 'text-slate-200 hover:bg-white/5' : 'text-slate-500 hover:text-slate-200'
+              className={`rounded p-1.5 transition disabled:cursor-not-allowed disabled:opacity-35 ${
+                effectiveShowVwap ? 'text-slate-200 hover:bg-white/5' : 'text-slate-500 hover:text-slate-200'
               }`}
             >
               <Plus className="h-4 w-4" aria-hidden="true" />
@@ -434,7 +460,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                 })}
 
                 {/* Indicator Overlays */}
-                {showVwap && chartMath.vwapPath && (
+                {effectiveShowVwap && chartMath.vwapPath && (
                   <path
                     d={chartMath.vwapPath}
                     fill="none"
@@ -444,13 +470,13 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                     opacity="0.65"
                   />
                 )}
-                {showEma && chartMath.emaSlowPath && (
+                {effectiveShowEma && chartMath.emaSlowPath && (
                   <path d={chartMath.emaSlowPath} fill="none" stroke="#A78BFA" strokeWidth="1.3" opacity="0.8" />
                 )}
-                {showEma && chartMath.emaMidPath && (
+                {effectiveShowEma && chartMath.emaMidPath && (
                   <path d={chartMath.emaMidPath} fill="none" stroke="#FBBF24" strokeWidth="1.3" opacity="0.85" />
                 )}
-                {showEma && chartMath.emaFastPath && (
+                {effectiveShowEma && chartMath.emaFastPath && (
                   <path d={chartMath.emaFastPath} fill="none" stroke="#38BDF8" strokeWidth="1.4" />
                 )}
 
@@ -538,7 +564,7 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
                 })()}
 
                 {/* Active Position ATR SL / BE / TP Brackets */}
-                {showBrackets && pos && (
+                {effectiveShowBrackets && pos && (
                   <g>
                     {[
                       ...(pos.exitPlan.tpTargets && pos.exitPlan.tpTargets.length > 0

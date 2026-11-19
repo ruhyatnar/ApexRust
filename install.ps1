@@ -4,7 +4,7 @@
 [CmdletBinding()]
 param(
   [Parameter(ValueFromRemainingArguments = $true)]
-  [string[]]$PassThruArgs
+  [string[]]$PassThruArgs = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,8 +28,14 @@ function Refresh-SessionPath {
 function Test-NodeOk {
   $cmd = Get-Command node -ErrorAction SilentlyContinue
   if (-not $cmd) { return $false }
-  & node -e "const [a,b]=process.versions.node.split('.').map(Number); process.exit((a===20&&b>=19)||(a===22&&b>=12)||a>=23 ? 0 : 1)" 2>$null
-  return ($LASTEXITCODE -eq 0)
+  $prevPref = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & node -e "const [a,b]=process.versions.node.split('.').map(Number); process.exit((a===20&&b>=19)||(a===22&&b>=12)||a>=23 ? 0 : 1)" 2>$null
+    return ($LASTEXITCODE -eq 0)
+  } finally {
+    $ErrorActionPreference = $prevPref
+  }
 }
 
 function Test-RustOk {
@@ -55,16 +61,24 @@ function Test-MsvcOk {
   if (Get-Command cl.exe -ErrorAction SilentlyContinue) { return $true }
   $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
   if (-not (Test-Path $vswhere)) { return $false }
-  $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-  return [bool]($found -and $found.Trim().Length -gt 0)
+  $prevPref = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $found = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null)
+    return [bool]($found -and $found.Trim().Length -gt 0)
+  } finally {
+    $ErrorActionPreference = $prevPref
+  }
 }
 
 $AutoYes = ($PassThruArgs -contains '-y') -or ($PassThruArgs -contains '--yes') -or ($PassThruArgs -contains '--non-interactive')
 $NeedRust = $true
 for ($i = 0; $i -lt $PassThruArgs.Count; $i++) {
-  if ($PassThruArgs[$i] -eq '--components=web') { $NeedRust = $false }
-  elseif ($PassThruArgs[$i] -eq '--components' -and ($i + 1) -lt $PassThruArgs.Count -and $PassThruArgs[$i + 1] -eq 'web') {
-    $NeedRust = $false
+  $argLower = $PassThruArgs[$i].ToLowerInvariant()
+  if ($argLower -eq '--components=web' -or $argLower -eq '--role=client') { $NeedRust = $false }
+  elseif (($argLower -eq '--components' -or $argLower -eq '--role') -and ($i + 1) -lt $PassThruArgs.Count) {
+    $nextLower = $PassThruArgs[$i + 1].ToLowerInvariant()
+    if ($nextLower -eq 'web' -or $nextLower -eq 'client') { $NeedRust = $false }
   }
 }
 
@@ -105,12 +119,16 @@ if (-not (Test-NodeOk)) {
 if ($NeedRust) {
   if (-not (Test-RustOk)) {
     if (Get-Command rustup -ErrorAction SilentlyContinue) {
-      Write-Host '==> Updating Rust toolchain via rustup...' -ForegroundColor Cyan
+      Write-Host '==> Installing/updating Rust stable toolchain via rustup...' -ForegroundColor Cyan
+      & rustup toolchain install stable
+      if ($LASTEXITCODE -ne 0) { Write-Error 'rustup toolchain install stable failed.' }
       & rustup default stable
       if ($LASTEXITCODE -ne 0) { Write-Error 'rustup default stable failed.' }
     } else {
       Confirm-WingetInstall 'Rustup (Rust toolchain)' 'Rustlang.Rustup'
       if (Get-Command rustup -ErrorAction SilentlyContinue) {
+        & rustup toolchain install stable
+        if ($LASTEXITCODE -ne 0) { Write-Error 'rustup toolchain install stable failed.' }
         & rustup default stable
         if ($LASTEXITCODE -ne 0) { Write-Error 'rustup default stable failed.' }
       }

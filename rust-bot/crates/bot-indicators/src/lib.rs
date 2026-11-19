@@ -331,22 +331,28 @@ impl RollingVolumeSma {
     }
 
     pub fn next(&mut self, volume: f64) -> (Option<f64>, Option<f64>) {
-        let prior_avg = self.value;
-        self.window.push_back(volume);
-        self.sum += volume;
+        let clean_vol = if volume.is_finite() { volume.max(0.0) } else { 0.0 };
+        let prior_avg = if !self.window.is_empty() {
+            self.sum / self.window.len() as f64
+        } else {
+            clean_vol
+        };
+        self.window.push_back(clean_vol);
+        self.sum += clean_vol;
         if self.window.len() > self.period {
             if let Some(old) = self.window.pop_front() {
                 self.sum -= old;
             }
         }
-        if self.window.len() == self.period {
-            self.value = Some(self.sum / self.period as f64);
+        if !self.window.is_empty() {
+            self.value = Some(self.sum / self.window.len() as f64);
         }
-        let ratio = prior_avg
-            .or(self.value)
-            .filter(|&avg| avg > f64::EPSILON)
-            .map(|avg| volume / avg);
-        (self.value, ratio)
+        let ratio = if prior_avg > 1e-12 {
+            clean_vol / prior_avg
+        } else {
+            1.0
+        };
+        (self.value, Some(ratio))
     }
 }
 

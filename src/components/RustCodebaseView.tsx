@@ -1,9 +1,15 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Copy, FileCode2, FolderTree, Search, Terminal } from 'lucide-react';
 
-// Dynamically bundle all source/config/doc files from /rust-bot/ (excluding Cargo target artifacts)
+// Dynamically bundle all source/config/doc files from /rust-bot/ (excluding Cargo target and secret config artifacts)
 const rawRustModules = import.meta.glob(
-  ['/rust-bot/**/*', '!/rust-bot/target/**', '!/rust-bot/Cargo.lock'],
+  [
+    '/rust-bot/**/*',
+    '!/rust-bot/target/**',
+    '!/rust-bot/Cargo.lock',
+    '!/rust-bot/config/bot.toml',
+    '!/rust-bot/config/bot.toml.bak',
+  ],
   {
     query: '?raw',
     import: 'default',
@@ -50,6 +56,13 @@ export const RustCodebaseView: React.FC = () => {
     );
   });
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+    };
+  }, []);
 
   const filteredFiles = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -77,7 +90,8 @@ export const RustCodebaseView: React.FC = () => {
     try {
       await navigator.clipboard.writeText(activeFile.content);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => setCopied(false), 1600);
     } catch {
       // Clipboard fallback ignored if blocked in headless frame
     }

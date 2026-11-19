@@ -24,10 +24,6 @@ export class Ema {
     }
     return this.value;
   }
-
-  current(): number | null {
-    return this.value;
-  }
 }
 
 export class WilderRsi {
@@ -114,10 +110,6 @@ export class Atr {
     if (this.warmupCount === this.period) {
       this.value = this.trSum / this.period;
     }
-    return this.value;
-  }
-
-  current(): number | null {
     return this.value;
   }
 }
@@ -227,7 +219,7 @@ export class SessionVwap {
   }
 }
 
-export class VolumeSma {
+class VolumeSma {
   private readonly period: number;
   private readonly ring: number[] = [];
   private sum = 0;

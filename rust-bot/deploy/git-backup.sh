@@ -16,7 +16,7 @@ fi
 
 # Ensure secret files are always excluded
 touch .gitignore
-for pattern in ".env" ".env.*" "*.pem" "*.key" "config/bot.toml" "backups/*.secret*"; do
+for pattern in ".env" ".env.*" "*.pem" "*.key" "rust-bot/config/bot.toml" "rust-bot/config/bot.toml.bak" "bot.toml" "bot.toml.bak" "backups/*.secret*"; do
   if ! grep -Fxq "$pattern" .gitignore 2>/dev/null; then
     echo "$pattern" >> .gitignore
   fi

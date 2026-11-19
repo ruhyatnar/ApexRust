@@ -1,13 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import {
+  aggregateTradesByOrderId,
+  buildBinanceSyncTimeWindows,
   computeOrderPerformanceMetrics,
   computeUtcDatePresetRange,
+  detectOrphanPairs,
   filterOrderLogs,
   formatOrderLogsCsv,
   getOrderStatusBadgeMeta,
   parseUtcDateRangeBounds,
 } from './orderHistoryAnalytics';
+import { OrderHistoryDatabase } from './orderDatabase';
 import type { OrderExecutionLog } from './types';
 
 function makeLog(overrides: Partial<OrderExecutionLog> = {}): OrderExecutionLog {
@@ -186,7 +193,7 @@ test('formatOrderLogsCsv safely escapes commas and neutralizes formula injection
       symbol: 'BTCUSDT',
     }),
   ]);
-  assert.match(csv, /^timestamp_iso,.*,error_message\n/);
+  assert.match(csv, /^order_time_iso,update_time_iso,order_id,.*,error_message\n/);
   assert.match(csv, /"'=HYPERLINK/);
   assert.match(csv, /"Filter failure: MIN_NOTIONAL, check size"/);
 });
@@ -266,5 +273,147 @@ test('getOrderStatusBadgeMeta maps each OrderExecutionStatus to deterministic la
   assert.deepEqual(getOrderStatusBadgeMeta('NEW'), { label: 'NEW', tone: 'amber' });
   assert.deepEqual(getOrderStatusBadgeMeta('CANCELED'), { label: 'CANCELED', tone: 'slate' });
   assert.deepEqual(getOrderStatusBadgeMeta('EXPIRED'), { label: 'EXPIRED', tone: 'slate' });
+  assert.deepEqual(getOrderStatusBadgeMeta('EXPIRED_IN_MATCH'), { label: 'EXP IN MATCH', tone: 'slate' });
+  assert.deepEqual(getOrderStatusBadgeMeta('PENDING_CANCEL'), { label: 'PENDING CANCEL', tone: 'amber' });
   assert.deepEqual(getOrderStatusBadgeMeta('REJECTED'), { label: 'REJECTED', tone: 'rose' });
+});
+
+test('buildBinanceSyncTimeWindows obeys Spot <24h and Futures <=7d official window limits for 1d, 3d, 7d, and 30d', () => {
+  const nowMs = Date.UTC(2026, 10, 18, 12, 0, 0, 0);
+
+  const spot7d = buildBinanceSyncTimeWindows('Spot', '7d', nowMs);
+  assert.ok(spot7d.length >= 7);
+  for (const w of spot7d) {
+    assert.ok(w.endTime - w.startTime < 86_400_000, 'Spot window must be < 24h');
+  }
+
+  const fut30d = buildBinanceSyncTimeWindows('Futures', '30d', nowMs);
+  assert.equal(fut30d.length, 5);
+  for (const w of fut30d) {
+    assert.ok(w.endTime - w.startTime <= 7 * 86_400_000, 'Futures window must be <= 7d');
+  }
+  assert.equal(fut30d[0].startTime, nowMs - 30 * 86_400_000);
+  assert.equal(fut30d[fut30d.length - 1].endTime, nowMs);
+});
+
+test('aggregateTradesByOrderId and detectOrphanPairs enrich fills and classify exchange/local orphans', () => {
+  const tradeMap = aggregateTradesByOrderId(
+    [
+      { orderId: '701', commission: '0.15', commissionAsset: 'USDT', maker: true, realizedPnl: '12.5', qty: '0.5', price: '100', quoteQty: '50' },
+      { orderId: '701', commission: '0.25', commissionAsset: 'USDT', maker: false, realizedPnl: '7.5', qty: '0.5', price: '100', quoteQty: '50' },
+    ],
+    'Futures'
+  );
+  const agg = tradeMap.get('701')!;
+  assert.ok(Math.abs(agg.commission - 0.4) < 1e-9);
+  assert.equal(agg.isMaker, true);
+  assert.equal(agg.realizedPnlUsdt, 20);
+
+  const orphans = detectOrphanPairs({
+    configuredPairs: ['BTCUSDT', 'ETHUSDT'],
+    venue: 'Futures',
+    environment: 'Testnet',
+    dbLogs: [
+      makeLog({
+        id: 'stale-1',
+        orderId: '888',
+        symbol: 'BTCUSDT',
+        venue: 'Futures',
+        environment: 'Testnet',
+        accountMode: 'Live',
+        status: 'NEW',
+      }),
+      makeLog({
+        id: 'old-pair',
+        orderId: '889',
+        symbol: 'LINKUSDT',
+        venue: 'Futures',
+        environment: 'Testnet',
+        accountMode: 'Live',
+        status: 'FILLED',
+      }),
+    ],
+    exchangeOpenOrders: [{ symbol: 'DOGEUSDT', orderId: '991' }],
+    exchangeAlgoOrders: [{ symbol: 'DOGEUSDT', algoId: '1001' }],
+    exchangePositions: [{ symbol: 'XRPUSDT', positionAmt: '-250', unRealizedProfit: '14.2' }],
+  });
+
+  const bySymbol = new Map(orphans.map((o) => [o.symbol, o]));
+  assert.ok(bySymbol.get('DOGEUSDT')?.kinds.includes('exchange_untracked_pair'));
+  assert.ok(bySymbol.get('XRPUSDT')?.kinds.includes('exchange_untracked_pair'));
+  assert.ok(bySymbol.get('BTCUSDT')?.kinds.includes('stale_local_open_order'));
+  assert.ok(bySymbol.get('LINKUSDT')?.kinds.includes('db_unconfigured_pair'));
+});
+
+test('OrderHistoryDatabase persists via SQLite WAL, migrates legacy JSON, and isolates Live vs Paper quotas', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apexrust-order-db-'));
+  const dbPath = path.join(tmpDir, 'orders.sqlite');
+  const legacyPath = path.join(tmpDir, 'legacy.json');
+
+  try {
+    fs.writeFileSync(
+      legacyPath,
+      JSON.stringify([
+        makeLog({
+          id: 'legacy-live-1',
+          orderId: '5001',
+          accountMode: 'Live',
+          symbol: 'BTCUSDT',
+          timestampMs: 1_760_000_000_000,
+        }),
+      ]),
+      'utf8'
+    );
+
+    const db = new OrderHistoryDatabase({
+      dbPath,
+      legacyJsonPath: legacyPath,
+      maxLiveQuota: 100,
+      maxPaperQuota: 100,
+    });
+    assert.equal(db.getSummary().liveCount, 1);
+
+    // Insert 105 Paper records; Paper quota (100) must NOT evict the Live record
+    const paperBatch: OrderExecutionLog[] = [];
+    for (let i = 0; i < 105; i += 1) {
+      paperBatch.push(
+        makeLog({
+          id: `paper-${i}`,
+          orderId: String(6000 + i),
+          accountMode: 'Paper',
+          timestampMs: 1_760_000_100_000 + i * 1000,
+        })
+      );
+    }
+    db.upsertLogs(paperBatch);
+    const summary = db.getSummary();
+    assert.equal(summary.liveCount, 1);
+    assert.equal(summary.paperCount, 100);
+
+    db.recordSyncWatermark({
+      symbol: 'BTCUSDT',
+      venue: 'Spot',
+      environment: 'Testnet',
+      lookback: '7d',
+      windowStartMs: 1_759_000_000_000,
+      syncedCount: 12,
+    });
+    db.close();
+
+    // Reopen from disk and verify persistence
+    const reopened = new OrderHistoryDatabase({ dbPath, legacyJsonPath: legacyPath });
+    assert.equal(reopened.getSummary().liveCount, 1);
+    assert.equal(reopened.getSummary().paperCount, 100);
+    assert.equal(reopened.getSummary().watermarks.length, 1);
+    const spotStored = reopened.queryLogs({ accountMode: 'Live' })[0];
+    assert.equal(spotStored.workingType, undefined);
+
+    const pruned = reopened.deleteLogs({ accountMode: 'Paper' });
+    assert.equal(pruned.deleted, 100);
+    assert.equal(reopened.getSummary().paperCount, 0);
+    assert.equal(reopened.getSummary().liveCount, 1);
+    reopened.close();
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

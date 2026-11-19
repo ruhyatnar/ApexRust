@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   SlidersHorizontal,
 } from 'lucide-react';
+import { fmtPx, fmtUsdMagnitude } from '../engine/formatters';
 import { evaluateUtcSessionWindows } from '../engine/sessionWindows';
 import type {
   BotConfig,
@@ -50,6 +51,9 @@ interface TradingDeskViewProps {
   onUpdateFuturesSettings: (leverage: number, marginType: MarginType) => void;
   onResetCircuitBreaker: () => void;
   onOpenLiveCredentials: () => void;
+  serverTargetLabel?: string;
+  isRemoteVpsDaemon?: boolean;
+  onOpenVpsConnection?: () => void;
   onSyncLiveTrades?: (symbol: string) => Promise<{
     ok: boolean;
     added: number;
@@ -65,17 +69,10 @@ const PROFILE_LABELS: Record<BotConfig['automation']['strategyProfile'], string>
 };
 
 function fmtUsd(val: number): string {
-  const abs = Math.abs(val).toLocaleString('en-US', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-  return `${val < 0 ? '-' : ''}$${abs}`;
+  return `${val < 0 ? '-' : ''}$${fmtUsdMagnitude(val)}`;
 }
 
-function fmtPrice(px: number): string {
-  const decimals = px >= 100 ? 2 : px >= 1 ? 4 : 6;
-  return px.toFixed(decimals);
-}
+const fmtPrice = fmtPx;
 
 export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
   snapshot,
@@ -100,6 +97,9 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
   onUpdateFuturesSettings,
   onResetCircuitBreaker,
   onOpenLiveCredentials,
+  serverTargetLabel = '🖥️ This Computer',
+  isRemoteVpsDaemon = false,
+  onOpenVpsConnection,
   onSyncLiveTrades,
 }) => {
   const [ledgerTab, setLedgerTab] = useState<'positions' | 'pending' | 'trades' | 'events'>('positions');
@@ -116,6 +116,18 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
     Boolean(config.features.sessionWindowFilter)
   );
 
+  const activeVenueAllowed =
+    config.trading.venue === 'Spot'
+      ? config.features.spotMarket
+      : config.features.futuresMarket;
+  const canRunAutoScan =
+    config.features.automatedTrading &&
+    config.features.signalGenerator &&
+    activeVenueAllowed &&
+    !(isRemoteVpsDaemon && snapshot.accountMode === 'Live');
+
+  const localAutoManagedByVps = isRemoteVpsDaemon && snapshot.accountMode === 'Live';
+
   return (
     <div className="space-y-4">
       {/* Compact Automated Trading & Strategy Control Strip */}
@@ -126,10 +138,14 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
             <span className="font-semibold text-slate-100">Auto-Trading</span>
             <span
               className={`font-mono text-[11px] font-bold ${
-                auto.enabled ? 'text-[#7DF2AD]' : 'text-amber-400'
+                localAutoManagedByVps
+                  ? 'text-cyan-300'
+                  : auto.enabled
+                    ? 'text-[#7DF2AD]'
+                    : 'text-amber-400'
               }`}
             >
-              {auto.enabled ? 'ACTIVE' : 'PAUSED'}
+              {localAutoManagedByVps ? '☁️ 24/7 VPS MANAGED' : auto.enabled ? 'ACTIVE' : 'PAUSED'}
             </span>
           </div>
 
@@ -193,8 +209,16 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            disabled={!canRunAutoScan}
+            title={
+              localAutoManagedByVps
+                ? '☁️ Automated Trading is managed 24/7 by your Remote VPS'
+                : !canRunAutoScan
+                  ? 'Enable Automated Trading, Signal Generator, and active Market Venue in Feature Toggles'
+                  : undefined
+            }
             onClick={onRunAutoScan}
-            className="flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-[#7DF2AD]/50 hover:text-[#7DF2AD] whitespace-nowrap"
+            className="flex items-center gap-1.5 rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-[#7DF2AD]/50 hover:text-[#7DF2AD] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap"
           >
             <Radar className="h-3.5 w-3.5" aria-hidden="true" />
             Scan Now
@@ -202,8 +226,16 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
 
           <button
             type="button"
+            disabled={!config.features.automatedTrading || localAutoManagedByVps}
+            title={
+              localAutoManagedByVps
+                ? '☁️ Use Open 24/7 VPS Bot Monitor to pause or resume the 24/7 VPS Bot'
+                : !config.features.automatedTrading
+                  ? 'Automated Trading Engine is toggled OFF in Bot -> Feature Toggles'
+                  : undefined
+            }
             onClick={onToggleAutomation}
-            className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-semibold transition whitespace-nowrap ${
+            className={`flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap ${
               auto.enabled
                 ? 'border border-white/[0.08] bg-[#0D1015] text-slate-200 hover:border-amber-400/50 hover:text-amber-300'
                 : 'bg-[#7DF2AD] text-[#0B0F17] hover:bg-[#95F7BD]'
@@ -217,7 +249,7 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
             ) : (
               <>
                 <Play className="h-3.5 w-3.5" aria-hidden="true" />
-                Enable Auto
+                Auto Disabled (OFF)
               </>
             )}
           </button>
@@ -240,6 +272,30 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Remote VPS 24/7 Daemon Context Banner */}
+      {isRemoteVpsDaemon && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-cyan-400/35 bg-cyan-950/25 px-4 py-2.5 text-xs text-cyan-100"
+        >
+          <div className="flex items-center gap-2.5">
+            <Bot className="h-4 w-4 shrink-0 text-cyan-300" aria-hidden="true" />
+            <span>
+              <strong>Connected to {serverTargetLabel}:</strong> 24/7 Automated Trading & ATR Exits run continuously on your Remote VPS. Manual Live Orders placed here are routed directly to your 24/7 VPS Bot.
+            </span>
+          </div>
+          {onOpenVpsConnection && (
+            <button
+              type="button"
+              onClick={onOpenVpsConnection}
+              className="rounded-md bg-cyan-400 px-3 py-1 text-xs font-bold text-[#0B0F17] transition hover:bg-cyan-300 whitespace-nowrap"
+            >
+              Open 24/7 VPS Bot Monitor
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Circuit Breaker Alert Banner when Halted or Cooldown */}
       {risk.state !== 'Active' && (
@@ -266,8 +322,10 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
           </div>
           <button
             type="button"
+            disabled={!config.features.circuitBreaker}
+            title={!config.features.circuitBreaker ? 'Circuit Breaker is disabled in Feature Toggles' : undefined}
             onClick={onResetCircuitBreaker}
-            className="rounded-md bg-[#7DF2AD] px-3.5 py-1.5 text-xs font-bold text-[#0B0F17] transition hover:bg-[#9AF7BF] whitespace-nowrap shrink-0"
+            className="rounded-md bg-[#7DF2AD] px-3.5 py-1.5 text-xs font-bold text-[#0B0F17] transition hover:bg-[#9AF7BF] disabled:cursor-not-allowed disabled:opacity-40 whitespace-nowrap shrink-0"
           >
             Reset Circuit Breaker
           </button>
@@ -315,6 +373,7 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
               activePair={activePair}
               liveStatus={liveStatus}
               liveTicker={liveTicker}
+              isRemoteVpsDaemon={isRemoteVpsDaemon}
               onSelectSymbol={onSelectSymbol}
               onSubmitOrder={onSubmitOrder}
               onToggleFeedSource={onToggleFeedSource}
@@ -336,6 +395,7 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
               timeframe={config.trading.timeframe}
               adxMinTrend={config.indicators.adxMinTrend}
               transportMode={snapshot.transport.mode}
+              features={config.features}
               onChangeTimeframe={onChangeTimeframe}
               onStepBar={onStepBar}
               onSimulateTransport={onSimulateTransport}

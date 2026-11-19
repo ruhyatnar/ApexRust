@@ -13,3 +13,4 @@ bot-risk = { path = "../bot-risk" }
 tokio = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+serde_json = { workspace = true }

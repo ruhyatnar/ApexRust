@@ -34,20 +34,37 @@ impl BotConfig {
         if self.trading.pairs.is_empty() {
             return Err(crate::BotError::Config("trading.pairs must not be empty".into()));
         }
+        if self.exchange.leverage == 0 || self.exchange.leverage > 20 {
+            return Err(crate::BotError::Config("exchange.leverage must be in 1..=20".into()));
+        }
+        if self.exchange.ws_heartbeat_timeout_ms == 0 {
+            return Err(crate::BotError::Config("exchange.ws_heartbeat_timeout_ms must be > 0".into()));
+        }
         if self.trading.initial_equity_usdt <= 0.0 || !self.trading.initial_equity_usdt.is_finite() {
             return Err(crate::BotError::Config("trading.initial_equity_usdt must be > 0".into()));
+        }
+        if self.trading.base_risk_per_trade_pct <= 0.0 || !self.trading.base_risk_per_trade_pct.is_finite() {
+            return Err(crate::BotError::Config("trading.base_risk_per_trade_pct must be > 0".into()));
         }
         if self.trading.max_concurrent_positions == 0 {
             return Err(crate::BotError::Config("trading.max_concurrent_positions must be > 0".into()));
         }
-        if self.exits.atr_sl_multiplier <= 0.0 {
-            return Err(crate::BotError::Config("exits.atr_sl_multiplier must be > 0".into()));
+        if self.exits.atr_sl_multiplier <= 0.0
+            || self.exits.atr_tp1_multiplier <= 0.0
+            || self.exits.atr_tp2_multiplier <= 0.0
+            || self.exits.atr_trailing_multiplier <= 0.0
+        {
+            return Err(crate::BotError::Config("Exit ATR multipliers must all be > 0".into()));
         }
         if !(0.0..=1.0).contains(&self.exits.tp1_close_ratio) || self.exits.tp1_close_ratio <= 0.0 {
             return Err(crate::BotError::Config("exits.tp1_close_ratio must be in (0, 1]".into()));
         }
-        if self.risk.max_daily_drawdown_pct <= 0.0 || self.risk.max_pair_daily_drawdown_pct <= 0.0 {
-            return Err(crate::BotError::Config("Drawdown limits must be positive".into()));
+        if self.risk.max_daily_drawdown_pct <= 0.0
+            || self.risk.max_pair_daily_drawdown_pct <= 0.0
+            || self.risk.max_daily_profit_pct <= 0.0
+            || !self.risk.max_daily_profit_pct.is_finite()
+        {
+            return Err(crate::BotError::Config("Drawdown and profit limits must be positive".into()));
         }
         if self.exchange.rest_poll_interval_ms == 0 || self.exchange.ws_reconnect_initial_ms == 0 {
             return Err(crate::BotError::Config("Exchange poll and reconnect intervals must be > 0 ms".into()));
@@ -62,6 +79,7 @@ impl BotConfig {
                 )));
             }
         }
+        self.web.validate_bind_safety()?;
         Ok(())
     }
 }
@@ -120,7 +138,6 @@ pub struct ExchangeConfig {
     pub paper_trading: bool,
     pub credentials: Option<LiveCredentialsConfig>,
     pub ws_stream_url: String,
-    pub ws_api_url: String,
     pub rest_base_url: String,
     pub ws_heartbeat_timeout_ms: u64,
     pub rest_poll_interval_ms: u64,
@@ -292,29 +309,50 @@ impl Default for AutomationConfig {
     }
 }
 
+fn default_true_toggle() -> bool {
+    true
+}
+
 /// Granular runtime feature toggles enabling operators to switch any subsystem independently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureToggles {
+    #[serde(default = "default_true_toggle")]
     pub automated_trading: bool,
+    #[serde(default = "default_true_toggle")]
     pub manual_trading: bool,
+    #[serde(default = "default_true_toggle")]
     pub signal_generator: bool,
+    #[serde(default = "default_true_toggle")]
     pub ws_primary_feed: bool,
+    #[serde(default = "default_true_toggle")]
     pub rest_fallback: bool,
+    #[serde(default = "default_true_toggle")]
     pub ema_trend_filter: bool,
+    #[serde(default = "default_true_toggle")]
     pub rsi_momentum_filter: bool,
+    #[serde(default = "default_true_toggle")]
     pub adx_strength_filter: bool,
+    #[serde(default = "default_true_toggle")]
     pub vwap_bias_filter: bool,
     #[serde(default)]
     pub volume_confirmation_filter: bool,
     #[serde(default)]
     pub session_window_filter: bool,
+    #[serde(default = "default_true_toggle")]
     pub atr_dynamic_exits: bool,
+    #[serde(default = "default_true_toggle")]
     pub take_profit_ladder: bool,
+    #[serde(default = "default_true_toggle")]
     pub break_even_stop: bool,
+    #[serde(default = "default_true_toggle")]
     pub trailing_stop: bool,
+    #[serde(default = "default_true_toggle")]
     pub circuit_breaker: bool,
+    #[serde(default = "default_true_toggle")]
     pub spot_market: bool,
+    #[serde(default = "default_true_toggle")]
     pub futures_market: bool,
+    #[serde(default)]
     pub git_auto_backup: bool,
 }
 
@@ -448,6 +486,120 @@ pub struct RiskConfig {
 pub struct WebConfig {
     pub bind_addr: String,
     pub allowed_origin: String,
+    #[serde(default)]
+    pub auth_token: String,
+}
+
+impl WebConfig {
+    /// Resolve active authentication token (`APEXRUST_WEB_TOKEN` or `APEXRUST_ENGINE_TOKEN` env overrides `web.auth_token`).
+    pub fn resolved_auth_token(&self) -> Option<String> {
+        if let Ok(env_tok) = std::env::var("APEXRUST_WEB_TOKEN") {
+            let trimmed = env_tok.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        if let Ok(env_tok) = std::env::var("APEXRUST_ENGINE_TOKEN") {
+            let trimmed = env_tok.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+        let trimmed = self.auth_token.trim();
+        if !trimmed.is_empty() {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    }
+
+    pub fn validate_bind_safety(&self) -> crate::Result<()> {
+        let bind = self.bind_addr.trim();
+        let token = self.resolved_auth_token();
+        if let Some(ref t) = token {
+            if t.len() < 32 {
+                return Err(crate::BotError::Config(
+                    "web.auth_token / APEXRUST_WEB_TOKEN must be at least 32 characters when set".into(),
+                ));
+            }
+        }
+        if bind.is_empty() || is_private_or_zero_trust_bind_addr(bind) {
+            return Ok(());
+        }
+        let trust_mesh = std::env::var("APEXRUST_TRUST_ZERO_TRUST_MESH")
+            .ok()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+        if trust_mesh || token.as_ref().is_some_and(|t| t.len() >= 32) {
+            return Ok(());
+        }
+        Err(crate::BotError::Config(format!(
+            "Refusing to bind non-private web.bind_addr '{}' without a >= 32 character APEXRUST_WEB_TOKEN or web.auth_token (use 127.0.0.1:8080 or Cloudflare One WARP IP 100.96.x.y:8080)",
+            bind
+        )))
+    }
+}
+
+/// Returns true if the `host:port` or `host` string targets loopback (`127.0.0.0/8`, `::1`, `localhost`),
+/// RFC1918 private IPs (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), or CGNAT / Cloudflare One WARP mesh (`100.64.0.0/10`).
+pub fn is_private_or_zero_trust_bind_addr(raw: &str) -> bool {
+    let trimmed = raw.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let host = if trimmed.starts_with('[') {
+        trimmed
+            .find(']')
+            .map(|idx| &trimmed[1..idx])
+            .unwrap_or(trimmed.as_str())
+    } else if let Some((h, _port)) = trimmed.rsplit_once(':') {
+        if h.contains(':') {
+            trimmed.as_str()
+        } else {
+            h
+        }
+    } else {
+        trimmed.as_str()
+    };
+    if host == "localhost" {
+        return true;
+    }
+    if host == "0.0.0.0" || host == "::" {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let is_priv_v4 = |v4: std::net::Ipv4Addr| {
+            let [a, b, _, _] = v4.octets();
+            if a == 0 {
+                return false;
+            }
+            a == 127
+                || a == 10
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 100 && (64..=127).contains(&b))
+        };
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_priv_v4(v4),
+            std::net::IpAddr::V6(v6) => {
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    return is_priv_v4(mapped);
+                }
+                if v6.is_loopback() {
+                    return true;
+                }
+                if v6.is_unspecified() {
+                    return false;
+                }
+                let seg0 = v6.segments()[0];
+                // IPv6 ULA fc00::/7 or link-local fe80::/10
+                (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".ts.net")
+        || host.ends_with(".cfargotunnel.com")
 }
 
 #[cfg(test)]
@@ -493,5 +645,53 @@ mod tests {
             enabled: true,
         });
         assert!(bad_win.validate().is_err());
+    }
+
+    #[test]
+    fn cloudflare_zero_trust_and_web_bind_safety_validation() {
+        assert!(is_private_or_zero_trust_bind_addr("127.0.0.1:8080"));
+        assert!(is_private_or_zero_trust_bind_addr("localhost:8080"));
+        assert!(is_private_or_zero_trust_bind_addr("100.96.1.10:8080"));
+        assert!(is_private_or_zero_trust_bind_addr("10.1.2.3:8080"));
+        assert!(!is_private_or_zero_trust_bind_addr("0.0.0.0:8080"));
+        assert!(!is_private_or_zero_trust_bind_addr("203.0.113.10:8080"));
+        assert!(!is_private_or_zero_trust_bind_addr("fc-public.example.com:8080"));
+        assert!(is_private_or_zero_trust_bind_addr("[::ffff:127.0.0.1]:8080"));
+        assert!(is_private_or_zero_trust_bind_addr("[fd12:3456:789a::1]:8080"));
+
+        let safe_loopback = WebConfig {
+            bind_addr: "127.0.0.1:8080".into(),
+            allowed_origin: "http://localhost:3000".into(),
+            auth_token: "".into(),
+        };
+        assert!(safe_loopback.validate_bind_safety().is_ok());
+
+        let safe_cf_warp = WebConfig {
+            bind_addr: "100.96.5.20:8080".into(),
+            allowed_origin: "http://localhost:3000".into(),
+            auth_token: "".into(),
+        };
+        assert!(safe_cf_warp.validate_bind_safety().is_ok());
+
+        let unsafe_wildcard = WebConfig {
+            bind_addr: "0.0.0.0:8080".into(),
+            allowed_origin: "http://localhost:3000".into(),
+            auth_token: "".into(),
+        };
+        assert!(unsafe_wildcard.validate_bind_safety().is_err());
+
+        let short_token = WebConfig {
+            bind_addr: "0.0.0.0:8080".into(),
+            allowed_origin: "http://localhost:3000".into(),
+            auth_token: "too-short".into(),
+        };
+        assert!(short_token.validate_bind_safety().is_err());
+
+        let strong_token = WebConfig {
+            bind_addr: "0.0.0.0:8080".into(),
+            allowed_origin: "http://localhost:3000".into(),
+            auth_token: "0123456789abcdef0123456789abcdef".into(),
+        };
+        assert!(strong_token.validate_bind_safety().is_ok());
     }
 }

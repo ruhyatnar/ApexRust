@@ -9,6 +9,7 @@ import {
   RefreshCw,
   ShieldCheck,
 } from 'lucide-react';
+import { apiFetch } from '../engine/apiClient';
 import type { BotConfig, EngineSnapshot } from '../engine/types';
 
 interface GitCommitEntry {
@@ -28,9 +29,14 @@ interface GitStatusPayload {
 interface GitBackupViewProps {
   config: BotConfig;
   snapshot: EngineSnapshot;
+  serverTargetLabel?: string;
 }
 
-export const GitBackupView: React.FC<GitBackupViewProps> = ({ config, snapshot }) => {
+export const GitBackupView: React.FC<GitBackupViewProps> = ({
+  config,
+  snapshot,
+  serverTargetLabel = '🖥️ This Computer',
+}) => {
   const [status, setStatus] = useState<GitStatusPayload | null>(null);
   const [lastBackupAt, setLastBackupAt] = useState<string | null>(null);
   const [remoteUrlInput, setRemoteUrlInput] = useState('');
@@ -40,7 +46,7 @@ export const GitBackupView: React.FC<GitBackupViewProps> = ({ config, snapshot }
 
   const loadStatus = useCallback(async () => {
     try {
-      const resp = await fetch('/api/git/status');
+      const resp = await apiFetch('/api/git/status');
       if (!resp.ok) return;
       const data = (await resp.json()) as { ok?: boolean; status?: GitStatusPayload };
       const resolved = data.status;
@@ -62,7 +68,7 @@ export const GitBackupView: React.FC<GitBackupViewProps> = ({ config, snapshot }
     setBusy('init');
     setFeedback(null);
     try {
-      const resp = await fetch('/api/git/init', { method: 'POST' });
+      const resp = await apiFetch('/api/git/init', { method: 'POST' });
       const data = (await resp.json()) as {
         ok?: boolean;
         error?: string;
@@ -86,7 +92,7 @@ export const GitBackupView: React.FC<GitBackupViewProps> = ({ config, snapshot }
     setBusy('remote');
     setFeedback(null);
     try {
-      const resp = await fetch('/api/git/remote', {
+      const resp = await apiFetch('/api/git/remote', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ remoteUrl: remoteUrlInput }),
@@ -113,7 +119,7 @@ export const GitBackupView: React.FC<GitBackupViewProps> = ({ config, snapshot }
     setBusy(push ? 'push' : 'commit');
     setFeedback(null);
     try {
-      const resp = await fetch('/api/git/backup', {
+      const resp = await apiFetch('/api/git/backup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -168,15 +174,29 @@ export const GitBackupView: React.FC<GitBackupViewProps> = ({ config, snapshot }
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => void loadStatus()}
-          disabled={busy !== null}
-          className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#141820] px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-[#7DF2AD]/40 whitespace-nowrap"
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${busy ? 'animate-spin' : ''}`} aria-hidden="true" />
-          Refresh Status
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-md border border-cyan-400/30 bg-cyan-950/30 px-2.5 py-1 text-[11px] font-semibold text-cyan-200">
+            📦 Repository Location: {serverTargetLabel}
+          </span>
+          <span
+            className={`rounded-md border px-2.5 py-1 font-mono text-[11px] font-semibold ${
+              config.features.gitAutoBackup
+                ? 'border-[#7DF2AD]/35 bg-[#7DF2AD]/10 text-[#7DF2AD]'
+                : 'border-white/[0.08] bg-[#0D1015] text-slate-400'
+            }`}
+          >
+            Auto-Backup on Save: {config.features.gitAutoBackup ? 'ON' : 'OFF'}
+          </span>
+          <button
+            type="button"
+            onClick={() => void loadStatus()}
+            disabled={busy !== null}
+            className="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#141820] px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:border-[#7DF2AD]/40 whitespace-nowrap"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${busy ? 'animate-spin' : ''}`} aria-hidden="true" />
+            Refresh Status
+          </button>
+        </div>
       </div>
 
       {/* Top Metrics Row */}

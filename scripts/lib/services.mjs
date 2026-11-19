@@ -1,6 +1,6 @@
 // Pure renderers for OS auto-start services (systemd, launchd, Windows Scheduled Tasks).
 
-export const SERVICE_LABELS = {
+const SERVICE_LABELS = {
   web: 'Web Command Center & Express Proxy',
   bot: 'Rust Trading Engine Daemon',
 };
@@ -110,10 +110,11 @@ export function renderWindowsTaskScript({ component, repoDir, nodePath, logPath 
   const argument = `-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "${inner.replace(/"/g, '\\"')}"`;
   return [
     "$ErrorActionPreference = 'Stop'",
+    "$principalUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name",
     `$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ${psQuote(argument)} -WorkingDirectory ${psQuote(repoDir)}`,
-    '$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME',
-    '$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew',
-    '$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited',
+    '$trigger = New-ScheduledTaskTrigger -AtLogOn -User $principalUser',
+    '$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew',
+    '$principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited',
     `Register-ScheduledTask -TaskName ${psQuote(windowsTaskName(component))} -Description ${psQuote(`ApexRust Quant ${SERVICE_LABELS[component]}`)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null`,
     '',
   ].join('\n');

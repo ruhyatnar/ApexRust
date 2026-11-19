@@ -55,7 +55,7 @@ export function readTomlValue(text, section, key) {
     const m = re.exec(line);
     if (m) {
       const raw = m[2];
-      if (raw.startsWith('"')) return raw.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      if (raw.startsWith('"')) return raw.slice(1, -1).replace(/\\(["\\])/g, '$1');
       if (raw.startsWith("'")) return raw.slice(1, -1);
       if (raw === 'true' || raw === 'false') return raw === 'true';
       const num = Number(raw);
@@ -140,7 +140,8 @@ export function renderBotToml(exampleText, opts) {
   const leverage = Math.min(20, Math.max(1, Math.round(Number(opts.leverage ?? 3)) || 3));
   const marginType = opts.marginType === 'CROSSED' ? 'CROSSED' : 'ISOLATED';
   const authMethod = opts.authMethod === 'ed25519' ? 'ed25519' : 'hmac-sha256';
-  const botHost = opts.botHost === '0.0.0.0' ? '0.0.0.0' : '127.0.0.1';
+  const rawBotHost = String(opts.botHost ?? '127.0.0.1').trim();
+  const botHost = rawBotHost || '127.0.0.1';
   const botPort = Number(opts.botPort ?? 8080) || 8080;
   const webPort = Number(opts.webPort ?? 3000) || 3000;
 
@@ -152,6 +153,26 @@ export function renderBotToml(exampleText, opts) {
     credentials.ed25519_key_path = String(opts.ed25519KeyPath);
   }
 
+  const endpoints = { ...ENDPOINTS[venue][environment] };
+  if (environment === 'testnet' && venue === 'futures') {
+    const customFutRest = String(opts.futuresTestnetRest ?? process.env.BINANCE_FUTURES_TESTNET_REST ?? '').trim().replace(/\/+$/, '');
+    if (customFutRest) {
+      endpoints.rest_base_url = customFutRest;
+      if (customFutRest.includes('demo-fapi.binance.com')) {
+        endpoints.ws_stream_url = 'wss://demo-fstream.binance.com/stream';
+      }
+    }
+  } else if (environment === 'testnet' && venue === 'spot') {
+    const customSpotRest = String(opts.spotTestnetRest ?? process.env.BINANCE_SPOT_TESTNET_REST ?? '').trim().replace(/\/+$/, '');
+    if (customSpotRest) {
+      endpoints.rest_base_url = customSpotRest;
+      if (customSpotRest.includes('demo-api.binance.com')) {
+        endpoints.ws_stream_url = 'wss://demo-stream.binance.com/stream';
+        endpoints.ws_api_url = 'wss://demo-ws-api.binance.com/ws-api/v3';
+      }
+    }
+  }
+
   return applyTomlEdits(exampleText, {
     exchange: {
       environment,
@@ -159,12 +180,13 @@ export function renderBotToml(exampleText, opts) {
       leverage,
       margin_type: marginType,
       paper_trading: true,
-      ...ENDPOINTS[venue][environment],
+      ...endpoints,
     },
     'exchange.credentials': credentials,
     web: {
       bind_addr: `${botHost}:${botPort}`,
       allowed_origin: `http://localhost:${webPort}`,
+      auth_token: '',
     },
   });
 }

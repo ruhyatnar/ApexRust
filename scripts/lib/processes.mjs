@@ -48,6 +48,115 @@ export function runningPid(component) {
   return null;
 }
 
+export function formatHostPort(host, port) {
+  const clean = String(host || '127.0.0.1').trim().replace(/^\[|\]$/g, '') || '127.0.0.1';
+  return clean.includes(':') ? `[${clean}]:${port}` : `${clean}:${port}`;
+}
+
+function parseBindHostFlag(raw) {
+  const clean = String(raw ?? '').trim().replace(/^\[|\]$/g, '');
+  if (!clean) {
+    throw new Error('Invalid --host: value cannot be empty.');
+  }
+  if (clean.includes('://') || /\s/.test(clean) || clean.includes('/')) {
+    throw new Error(
+      `Invalid --host "${raw}": expected an IP address or hostname (e.g. 0.0.0.0, 127.0.0.1, or 100.96.1.10).`
+    );
+  }
+  const colons = (clean.match(/:/g) || []).length;
+  if (colons === 1) {
+    throw new Error(`Invalid --host "${raw}": pass the port separately via --web-port or --bot-port.`);
+  }
+  return clean;
+}
+
+function validatePortFlag(raw, name) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error(`Invalid --${name} "${raw}": must be an integer between 1 and 65535.`);
+  }
+  return n;
+}
+
+/**
+ * Resolves per-component bind host, port, and child env overrides for `start` / `restart`.
+ * Note: `--host` / `--lan` binds the public-facing `web` proxy when starting `both` (keeping
+ * `bot-web` on 127.0.0.1 behind the gateway), and binds `bot` only when `target === 'bot'`.
+ */
+export function resolveComponentLaunchConfig({
+  component,
+  target,
+  flags = {},
+  basePorts,
+}) {
+  if (flags.host === true) {
+    throw new Error('Missing value for --host');
+  }
+  if (flags.token === true) {
+    throw new Error('Missing value for --token');
+  }
+  const hostFlag = flags.lan
+    ? '0.0.0.0'
+    : flags.host !== undefined
+      ? parseBindHostFlag(flags.host)
+      : null;
+  const hasWebPortFlag = flags['web-port'] !== undefined;
+  const hasBotPortFlag = flags['bot-port'] !== undefined;
+  const webPort = hasWebPortFlag ? validatePortFlag(flags['web-port'], 'web-port') : basePorts.webPort;
+  const botPort = hasBotPortFlag ? validatePortFlag(flags['bot-port'], 'bot-port') : basePorts.botPort;
+  const tokenFlag = flags.token !== undefined ? String(flags.token).trim() : null;
+
+  if (component === 'web') {
+    const bindHost = hostFlag ?? basePorts.host;
+    const envOverrides = {};
+    if (hostFlag !== null) envOverrides.HOST = bindHost;
+    if (hasWebPortFlag) envOverrides.PORT = String(webPort);
+    if (tokenFlag !== null) envOverrides.APEXRUST_PROXY_TOKEN = tokenFlag;
+    if (hasBotPortFlag) {
+      const upstreamHost =
+        !basePorts.botHost || basePorts.botHost === '0.0.0.0' || basePorts.botHost === '::'
+          ? '127.0.0.1'
+          : basePorts.botHost;
+      envOverrides.APEXRUST_ENGINE_URL = `http://${formatHostPort(upstreamHost, botPort)}`;
+    }
+    return {
+      component: 'web',
+      bindHost,
+      port: webPort,
+      envOverrides,
+      shouldRestart: Boolean(
+        flags.forceRestart ||
+          hostFlag !== null ||
+          hasWebPortFlag ||
+          hasBotPortFlag ||
+          tokenFlag !== null
+      ),
+    };
+  }
+
+  const appliesHostToBot = target === 'bot' && hostFlag !== null;
+  const bindHost = appliesHostToBot ? hostFlag : basePorts.botHost;
+  const envOverrides = {};
+  if (appliesHostToBot || hasBotPortFlag) {
+    envOverrides.BOT_WEB_BIND = formatHostPort(bindHost, botPort);
+  }
+  if (tokenFlag !== null) {
+    envOverrides.APEXRUST_WEB_TOKEN = tokenFlag;
+  }
+  return {
+    component: 'bot',
+    bindHost,
+    port: botPort,
+    envOverrides,
+    shouldRestart: Boolean(
+      flags.forceRestart ||
+        appliesHostToBot ||
+        hasBotPortFlag ||
+        (target === 'bot' && tokenFlag !== null)
+    ),
+  };
+}
+
 /** Launch `node scripts/apexrust.mjs run <component>` detached, logging to .apexrust/logs. */
 export function startDetached(component, env = process.env) {
   ensureRuntimeDirs();
@@ -72,8 +181,14 @@ function sleep(ms) {
 export async function killTree(pid, timeoutMs = 15000) {
   if (!isAlive(pid)) return true;
   if (IS_WIN) {
-    spawnSync('taskkill', ['/PID', String(pid), '/T'], { windowsHide: true });
-  } else {
+    // Console/hidden Node & Rust child processes ignore WM_CLOSE; terminate tree directly with /T /F
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
+    await sleep(300);
+    return !isAlive(pid);
+  }
+  try {
+    process.kill(-pid, 'SIGTERM');
+  } catch {
     try {
       process.kill(pid, 'SIGTERM');
     } catch {
@@ -82,20 +197,25 @@ export async function killTree(pid, timeoutMs = 15000) {
   }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isAlive(pid)) return true;
+    let groupAlive = isAlive(pid);
+    if (!groupAlive) {
+      try {
+        process.kill(-pid, 0);
+        groupAlive = true;
+      } catch (err) {
+        groupAlive = err.code === 'EPERM';
+      }
+    }
+    if (!groupAlive) return true;
     await sleep(250);
   }
-  if (IS_WIN) {
-    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
-  } else {
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
     try {
-      process.kill(-pid, 'SIGKILL');
+      process.kill(pid, 'SIGKILL');
     } catch {
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        // ignore
-      }
+      // ignore
     }
   }
   await sleep(300);

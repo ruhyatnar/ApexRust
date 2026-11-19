@@ -9,7 +9,7 @@
 
 ## 2. Binance API Compliance (`developers.binance.com`)
 - **USD-M Futures (`/fapi/v1/order`)**: Use `newOrderRespType = RESULT` (never `FULL`, which is Spot-only).
-- **USD-M Futures Conditional TP/SL**: Route `TAKE_PROFIT_MARKET` / `STOP_MARKET` through `/fapi/v1/algoOrder` (`algoType=CONDITIONAL`, lowercase `priceProtect="true"`, `closePosition="true"`, `workingType="MARK_PRICE"`), and query `/fapi/v1/algoOpenOrders` alongside `/fapi/v1/openOrders`.
+- **USD-M Futures Conditional TP/SL**: Route `TAKE_PROFIT_MARKET` / `STOP_MARKET` through `POST /fapi/v1/algoOrder` (`algoType=CONDITIONAL`, lowercase `priceProtect="true"`, `closePosition="true"`, `workingType="MARK_PRICE"`), query open algo orders via `GET /fapi/v1/openAlgoOrders` alongside `/fapi/v1/openOrders`, cancel all via `DELETE /fapi/v1/algoOpenOrders`, and cancel single algo orders via `DELETE /fapi/v1/algoOrder` (`algoId` without `symbol`).
 - **Futures `reduceOnly` Exits**: Skip `/fapi/v1/marginType` and `/fapi/v1/leverage` on `reduceOnly` exit orders so Binance error `-4048` never blocks protective closes.
 - **Binance Spot**: Use `/api/v3/orderList/oco` (`aboveType`/`belowType`) and reject Spot short-open attempts.
 - **Resting Order Reconciliation**: When reconciling pending live orders, verify `/api/v3/order` or `/fapi/v1/order` status before removing locally—promote `FILLED` orders to open positions rather than treating missing open orders as canceled.
