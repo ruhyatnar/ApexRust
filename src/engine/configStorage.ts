@@ -1,5 +1,13 @@
 import { DEFAULT_BOT_CONFIG } from './simulator';
-import type { BotConfig, ExecutionAccountMode, UtcTimeWindow } from './types';
+import type {
+  BotConfig,
+  ExecutionAccountMode,
+  PairSelectionMode,
+  TrendingCategory,
+  TrendingRankingSource,
+  UtcTimeWindow,
+} from './types';
+import { normalizeSymbolList } from './watchlist';
 
 export const BOT_CONFIG_STORAGE_KEY = 'apexrust_bot_config_v1';
 export const UI_STATE_STORAGE_KEY = 'apexrust_ui_state_v1';
@@ -57,16 +65,61 @@ export function mergeBotConfigWithDefaults(
         }))
     : null;
 
+  const rawSelectionMode = tradingRaw.pairSelectionMode;
+  const pairSelectionMode: PairSelectionMode =
+    rawSelectionMode === 'static' || rawSelectionMode === 'hybrid' || rawSelectionMode === 'dynamic'
+      ? rawSelectionMode
+      : (base.trading.pairSelectionMode ?? 'hybrid');
+
+  const rawCategory = tradingRaw.trendingCategory;
+  const trendingCategory: TrendingCategory =
+    rawCategory === 'hot_volume' ||
+    rawCategory === 'top_gainers' ||
+    rawCategory === 'top_losers' ||
+    rawCategory === 'volatility_leaders'
+      ? rawCategory
+      : (base.trading.trendingCategory ?? 'hot_volume');
+
+  const rawRankingSource = tradingRaw.rankingSource;
+  const rankingSource: TrendingRankingSource =
+    rawRankingSource === 'auto' ||
+    rawRankingSource === 'production' ||
+    rawRankingSource === 'environment'
+      ? rawRankingSource
+      : (base.trading.rankingSource ?? 'auto');
+
   const merged: BotConfig = {
     trading: {
       ...base.trading,
       ...(tradingRaw as Partial<BotConfig['trading']>),
-      pairs:
-        Array.isArray(tradingRaw.pairs) &&
-        tradingRaw.pairs.length > 0 &&
-        tradingRaw.pairs.every((p) => typeof p === 'string')
-          ? (tradingRaw.pairs as string[])
-          : base.trading.pairs,
+      pairs: normalizeSymbolList(tradingRaw.pairs, base.trading.pairs),
+      pairSelectionMode,
+      trendingCategory,
+      rankingSource,
+      maxWatchlistPairs: Math.min(
+        40,
+        Math.max(1, Math.round(Number(tradingRaw.maxWatchlistPairs ?? base.trading.maxWatchlistPairs ?? 20)))
+      ),
+      trendingTopN: Math.min(
+        20,
+        Math.max(1, Math.round(Number(tradingRaw.trendingTopN ?? base.trading.trendingTopN ?? 5)))
+      ),
+      trendingMinQuoteVolumeUsdt: Math.max(
+        0,
+        Number(tradingRaw.trendingMinQuoteVolumeUsdt ?? base.trading.trendingMinQuoteVolumeUsdt ?? 10_000_000)
+      ),
+      trendingMinDwellMinutes: Math.max(
+        0,
+        Math.round(Number(tradingRaw.trendingMinDwellMinutes ?? base.trading.trendingMinDwellMinutes ?? 15))
+      ),
+      trendingHysteresisRankBuffer: Math.max(
+        0,
+        Math.round(Number(tradingRaw.trendingHysteresisRankBuffer ?? base.trading.trendingHysteresisRankBuffer ?? 3))
+      ),
+      maxSameDirectionPositions: Math.max(
+        0,
+        Math.round(Number(tradingRaw.maxSameDirectionPositions ?? base.trading.maxSameDirectionPositions ?? 2))
+      ),
     },
     indicators: {
       ...base.indicators,
@@ -93,6 +146,11 @@ export function mergeBotConfigWithDefaults(
       ...(featuresRaw as Partial<BotConfig['features']>),
     },
   };
+
+  if (merged.trading.venue === 'Spot') {
+    merged.automation.directionPolicy = 'long_only';
+    merged.automation.autoFlipOnReversal = false;
+  }
 
   // Keep automatedTrading feature flag and automation.enabled aligned
   if (typeof featuresRaw.automatedTrading === 'boolean') {

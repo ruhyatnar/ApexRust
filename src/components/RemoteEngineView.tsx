@@ -25,6 +25,7 @@ import {
   mapRustEngineSnapshot,
   mapRustFeatureToggles,
 } from '../engine/engineSnapshotAdapter';
+import { fmtPx } from '../engine/formatters';
 import type { FeatureToggles } from '../engine/types';
 
 export interface ServerConnectionHealth {
@@ -480,19 +481,21 @@ export const RemoteEngineView: React.FC<RemoteEngineViewProps> = ({
                   2. Access Permission
                 </div>
                 <div className="mt-0.5 text-[11px] text-slate-400">
-                  {connectionHealth.authOk
-                    ? connectionHealth.zeroTrustUser
-                      ? `Cloudflare Zero Trust (${connectionHealth.zeroTrustUser})`
-                      : connectionHealth.authRequired
-                        ? 'Access Token Verified'
-                        : 'Cloudflare One Mesh / Local Trusted'
-                    : 'Access Token Rejected (401)'}
+                  {!connectionHealth.reachable
+                    ? 'Pending VPS connection'
+                    : connectionHealth.authOk
+                      ? connectionHealth.zeroTrustUser
+                        ? `Cloudflare Zero Trust (${connectionHealth.zeroTrustUser})`
+                        : connectionHealth.authRequired
+                          ? 'Access Token Verified'
+                          : 'Cloudflare One Mesh / Local Trusted'
+                      : connectionHealth.error || 'Access Token Rejected (401)'}
                 </div>
               </div>
             </div>
 
             <div className="flex items-start gap-2.5 rounded-lg border border-white/[0.06] bg-[#141820] p-3">
-              {connectionHealth.engineReachable ? (
+              {connectionHealth.reachable && connectionHealth.authOk && connectionHealth.engineReachable ? (
                 <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[#7DF2AD]" aria-hidden="true" />
               ) : (
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" />
@@ -502,27 +505,39 @@ export const RemoteEngineView: React.FC<RemoteEngineViewProps> = ({
                   3. 24/7 Rust Trading Daemon
                 </div>
                 <div className="mt-0.5 text-[11px] text-slate-400">
-                  {connectionHealth.engineReachable
-                    ? connectionHealth.engineRunning
-                      ? 'Online & Actively Scanning'
-                      : 'Online (Paused)'
-                    : 'Not Running (Web Proxy Only)'}
+                  {!connectionHealth.reachable
+                    ? 'Unknown while unreachable'
+                    : !connectionHealth.authOk
+                      ? 'Locked until Access Token is verified'
+                      : connectionHealth.engineReachable
+                        ? connectionHealth.engineRunning
+                          ? 'Online & Actively Scanning'
+                          : 'Online (Paused)'
+                        : 'Not Running (Web Proxy Only)'}
                 </div>
               </div>
             </div>
 
             <div className="flex items-start gap-2.5 rounded-lg border border-white/[0.06] bg-[#141820] p-3">
-              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[#7DF2AD]" aria-hidden="true" />
+              {connectionHealth.reachable && connectionHealth.authOk ? (
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-[#7DF2AD]" aria-hidden="true" />
+              ) : (
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" aria-hidden="true" />
+              )}
               <div>
                 <div className="text-xs font-semibold text-slate-200">
                   4. Active Binance Account Mode
                 </div>
                 <div className="mt-0.5 text-[11px] text-slate-400">
-                  {connectionHealth.venue} · {connectionHealth.environment} (
-                  {connectionHealth.engineAuthority === 'daemon'
-                    ? '24/7 VPS Bot in Charge'
-                    : 'Desktop Window in Charge'}
-                  )
+                  {!connectionHealth.reachable
+                    ? 'Unknown while unreachable'
+                    : !connectionHealth.authOk
+                      ? 'Locked until Access Token is verified'
+                      : `${connectionHealth.venue} · ${connectionHealth.environment} (${
+                          connectionHealth.engineAuthority === 'daemon'
+                            ? '24/7 VPS Bot in Charge'
+                            : 'Desktop Window in Charge'
+                        })`}
                 </div>
               </div>
             </div>
@@ -804,23 +819,23 @@ export const RemoteEngineView: React.FC<RemoteEngineViewProps> = ({
                     <tr key={p.symbol} className="hover:bg-white/[0.02]">
                       <td className="px-3 py-2 font-mono font-bold text-slate-100">{p.symbol}</td>
                       <td className="px-3 py-2 font-mono text-slate-200">
-                        ${p.lastPrice.toFixed(4)}
+                        ${fmtPx(p.lastPrice)}
                       </td>
                       <td className="px-3 py-2 font-mono text-slate-300">
-                        {p.emaFast !== null ? p.emaFast.toFixed(2) : '-'} /{' '}
-                        {p.emaSlow !== null ? p.emaSlow.toFixed(2) : '-'}
+                        {p.emaFast !== null ? fmtPx(p.emaFast) : '-'} /{' '}
+                        {p.emaSlow !== null ? fmtPx(p.emaSlow) : '-'}
                       </td>
                       <td className="px-3 py-2 font-mono text-slate-300">
                         RSI {p.rsi !== null ? p.rsi.toFixed(1) : '-'} · ADX{' '}
                         {p.adx !== null ? p.adx.toFixed(1) : '-'} · ATR{' '}
-                        {p.atr !== null ? p.atr.toFixed(4) : '-'}
+                        {p.atr !== null ? fmtPx(p.atr) : '-'}
                       </td>
                       <td className="px-3 py-2 font-mono">
                         {p.openPosition ? (
                           <span className="text-[#7DF2AD]">
                             {p.openPosition.side} {p.openPosition.remainingQuantity.toFixed(4)} @ $
-                            {p.openPosition.entryPrice.toFixed(4)} (SL $
-                            {p.openPosition.currentStopLoss.toFixed(4)})
+                            {fmtPx(p.openPosition.entryPrice)} (SL $
+                            {fmtPx(p.openPosition.currentStopLoss)})
                           </span>
                         ) : (
                           <span className="text-slate-500">FLAT</span>
@@ -922,7 +937,7 @@ export const RemoteEngineView: React.FC<RemoteEngineViewProps> = ({
                       {
                         action: 'manual_order',
                         symbol: manualSym,
-                        side: manualSide,
+                        side: manualSide === 'short' ? 'Short' : 'Long',
                         notional_usdt: parsedNotional,
                         order_method: 'MARKET',
                       },

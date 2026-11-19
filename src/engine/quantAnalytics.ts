@@ -460,11 +460,13 @@ export function computePortfolioCorrelationMatrix(
   const pearson = (a: number[], b: number[]): number => {
     const len = Math.min(a.length, b.length);
     if (len < 3) return 0;
+    const aOffset = a.length - len;
+    const bOffset = b.length - len;
     let meanA = 0;
     let meanB = 0;
     for (let i = 0; i < len; i += 1) {
-      meanA += a[i];
-      meanB += b[i];
+      meanA += a[aOffset + i];
+      meanB += b[bOffset + i];
     }
     meanA /= len;
     meanB /= len;
@@ -472,8 +474,8 @@ export function computePortfolioCorrelationMatrix(
     let denA = 0;
     let denB = 0;
     for (let i = 0; i < len; i += 1) {
-      const da = a[i] - meanA;
-      const db = b[i] - meanB;
+      const da = a[aOffset + i] - meanA;
+      const db = b[bOffset + i] - meanB;
       num += da * db;
       denA += da * da;
       denB += db * db;

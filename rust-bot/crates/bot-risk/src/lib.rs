@@ -332,6 +332,7 @@ mod tests {
             position_sizing_mode: bot_core::PositionSizingMode::FixedUsdt,
             initial_equity_usdt: 10_000.0,
             taker_fee_bps: 10.0,
+            ..TradingConfig::default()
         };
         let now = Utc::now();
         let mut rm = RiskManager::new(risk_cfg, trading_cfg, now);
@@ -361,6 +362,7 @@ mod tests {
             position_sizing_mode: bot_core::PositionSizingMode::FixedUsdt,
             initial_equity_usdt: 0.0,
             taker_fee_bps: 10.0,
+            ..TradingConfig::default()
         };
         let now = Utc::now();
         let mut rm = RiskManager::new(risk_cfg, trading_cfg, now);

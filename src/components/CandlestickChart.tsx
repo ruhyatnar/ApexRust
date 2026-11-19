@@ -30,9 +30,12 @@ interface CandlestickChartProps {
 }
 
 function fmtPrice(val: number): string {
+  if (!Number.isFinite(val)) return '0.00';
   if (val >= 1000) return val.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   if (val >= 10) return val.toFixed(2);
-  return val.toFixed(4);
+  if (val >= 1) return val.toFixed(4);
+  if (val >= 0.01) return val.toFixed(6);
+  return val.toFixed(8);
 }
 
 const TIMEFRAMES: Timeframe[] = ['1m', '3m', '5m', '15m', '1h'];
@@ -107,8 +110,8 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
     }
 
     if (effectiveShowBrackets && pos) {
-      minP = Math.min(minP, pos.exitPlan.activeStopLoss, pos.entryPrice);
-      maxP = Math.max(maxP, pos.exitPlan.takeProfit2, pos.entryPrice);
+      minP = Math.min(minP, pos.exitPlan.activeStopLoss, pos.exitPlan.takeProfit2, pos.entryPrice);
+      maxP = Math.max(maxP, pos.exitPlan.activeStopLoss, pos.exitPlan.takeProfit2, pos.entryPrice);
     }
 
     if (!Number.isFinite(minP) || !Number.isFinite(maxP) || minP === maxP) {

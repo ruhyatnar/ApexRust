@@ -14,9 +14,9 @@ if [ ! -d ".git" ]; then
   git init -b "$BRANCH"
 fi
 
-# Ensure secret files are always excluded
+# Ensure secret files & local runtime DBs are always excluded
 touch .gitignore
-for pattern in ".env" ".env.*" "*.pem" "*.key" "rust-bot/config/bot.toml" "rust-bot/config/bot.toml.bak" "bot.toml" "bot.toml.bak" "backups/*.secret*"; do
+for pattern in ".env" ".env.*" "!.env.example" "*.pem" "*.key" "rust-bot/config/bot.toml" "rust-bot/config/bot.toml.bak" "bot.toml" "bot.toml.bak" "backups/*.secret*" ".apexrust-order-logs.json" ".apexrust-orders.sqlite" ".apexrust-orders.sqlite-*"; do
   if ! grep -Fxq "$pattern" .gitignore 2>/dev/null; then
     echo "$pattern" >> .gitignore
   fi

@@ -274,7 +274,7 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
   onSelectSymbol,
   onSyncLiveTrades,
 }) => {
-  const [lifecycleFilter, setLifecycleFilter] = useState<'ALL' | 'ENTRY' | 'EXIT'>('ALL');
+  const [lifecycleFilter, setLifecycleFilter] = useState<'ALL' | 'ENTRY' | 'EXIT' | 'CANCEL'>('ALL');
   const [sideFilter, setSideFilter] = useState<'ALL' | 'BUY' | 'SELL'>('ALL');
   const [symbolFilter, setSymbolFilter] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -578,9 +578,9 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
       {/* Filter Bar */}
       <div className="px-3.5 py-2 border-b border-[#1C2230] bg-[#11151E] flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
-          {/* Lifecycle Filter: ALL / ENTRY / EXIT */}
+          {/* Lifecycle Filter: ALL / ENTRY / EXIT / CANCEL */}
           <div className="flex items-center bg-[#0B0E14] p-0.5 rounded-sm border border-[#1C2230]">
-            {(['ALL', 'ENTRY', 'EXIT'] as const).map((lf) => (
+            {(['ALL', 'ENTRY', 'EXIT', 'CANCEL'] as const).map((lf) => (
               <button
                 key={lf}
                 onClick={() => setLifecycleFilter(lf)}
@@ -590,7 +590,13 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
                     : 'text-[#64748B] hover:text-[#94A3B8]'
                 }`}
               >
-                {lf === 'ALL' ? 'All Fills' : lf === 'ENTRY' ? 'Entries Only' : 'Exits Only'}
+                {lf === 'ALL'
+                  ? 'All'
+                  : lf === 'ENTRY'
+                    ? 'Entries'
+                    : lf === 'EXIT'
+                      ? 'Exits'
+                      : 'Canceled'}
               </button>
             ))}
           </div>
@@ -722,7 +728,11 @@ export const TradeHistoryView: React.FC<TradeHistoryViewProps> = ({
                       <div className="flex items-center gap-1.5">
                         <span
                           className={`text-[10px] font-semibold tracking-wider uppercase ${
-                            isEntry ? 'text-[#60A5FA]' : 'text-[#A855F7]'
+                            rec.lifecycle === 'CANCEL'
+                              ? 'text-amber-300'
+                              : isEntry
+                                ? 'text-[#60A5FA]'
+                                : 'text-[#A855F7]'
                           }`}
                         >
                           {rec.lifecycle}

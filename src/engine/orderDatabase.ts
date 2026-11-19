@@ -4,6 +4,7 @@ import { createRequire } from 'module';
 import type {
   ExchangeVenue,
   ExecutionAccountMode,
+  ExitReason,
   OrderDatabaseSummary,
   OrderExecutionLog,
   OrderExecutionStatus,
@@ -382,56 +383,9 @@ export class OrderHistoryDatabase {
 
   private persistAll(): void {
     this.lastUpdatedAtMs = Date.now();
+    // Never wipe SQLite WAL rows via DELETE FROM order_history; active SQLite writes
+    // always commit incrementally through writeUpsertRowsInOpenTx / persistWatermark / deleteLogs.
     if (this.sqlite) {
-      try {
-        this.sqlite.exec('BEGIN IMMEDIATE TRANSACTION;');
-        this.sqlite.exec('DELETE FROM order_history;');
-        const insertStmt = this.sqlite.prepare(`
-          INSERT OR REPLACE INTO order_history (
-            id, composite_key, account_mode, venue, environment, symbol, order_id, lifecycle, status, timestamp_ms, payload_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-        for (const log of this.logs) {
-          insertStmt.run(
-            log.id,
-            compositeKeyOf(log),
-            log.accountMode,
-            log.venue,
-            log.environment,
-            log.symbol,
-            log.orderId,
-            log.lifecycle,
-            log.status,
-            log.timestampMs,
-            JSON.stringify(log)
-          );
-        }
-        this.sqlite.exec('DELETE FROM sync_watermarks;');
-        const wmStmt = this.sqlite.prepare(`
-          INSERT OR REPLACE INTO sync_watermarks (
-            key, symbol, venue, environment, last_synced_at_ms, oldest_synced_start_ms, last_lookback, last_synced_count
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `);
-        for (const wm of this.watermarks.values()) {
-          wmStmt.run(
-            wm.key,
-            wm.symbol,
-            wm.venue,
-            wm.environment,
-            wm.lastSyncedAtMs,
-            wm.oldestSyncedStartMs,
-            wm.lastLookback,
-            wm.lastSyncedCount
-          );
-        }
-        this.sqlite.exec('COMMIT;');
-      } catch {
-        try {
-          this.sqlite.exec('ROLLBACK;');
-        } catch {
-          // Ignore rollback failure
-        }
-      }
       return;
     }
 
@@ -603,6 +557,7 @@ export class OrderHistoryDatabase {
       this.writeUpsertRowsInOpenTx(touchedLogs, evictedIds);
       if (txStarted && this.sqlite) {
         this.sqlite.exec('COMMIT;');
+        this.lastSqliteDataVersion = this.readSqliteDataVersion();
       }
     } catch {
       if (txStarted && this.sqlite) {
@@ -614,6 +569,112 @@ export class OrderHistoryDatabase {
       }
     }
     return { added, updated, total: this.logs.length };
+  }
+
+  /**
+   * Transitions a resting ENTRY order (NEW / PARTIALLY_FILLED) to CANCELED in-place
+   * on the same composite_key so DB queries never double-count canceled pending entries.
+   */
+  markEntryCanceled(params: {
+    symbol: string;
+    venue: ExchangeVenue;
+    environment: 'Testnet' | 'Production';
+    accountMode?: ExecutionAccountMode;
+    orderId?: string;
+    clientOrderId?: string;
+    rationale?: string;
+    exitReason?: ExitReason | string | null;
+    timestampMs?: number;
+  }): OrderExecutionLog | null {
+    this.syncIfExternallyModified();
+    const cleanSym = params.symbol.trim().toUpperCase();
+    const oid = String(params.orderId ?? '').trim();
+    const cid = String(params.clientOrderId ?? '').trim();
+    const target = this.logs.find((log) => {
+      if (log.lifecycle !== 'ENTRY') return false;
+      if (log.symbol !== cleanSym || log.venue !== params.venue || log.environment !== params.environment) {
+        return false;
+      }
+      if (params.accountMode && log.accountMode !== params.accountMode) return false;
+      if (oid && log.orderId === oid) return true;
+      if (cid && log.clientOrderId === cid) return true;
+      return !oid && !cid && (log.status === 'NEW' || log.status === 'PARTIALLY_FILLED');
+    });
+    if (!target) return null;
+
+    const nowMs = params.timestampMs ?? Date.now();
+    const updated: OrderExecutionLog = {
+      ...target,
+      status: 'CANCELED',
+      exitReason: params.exitReason ?? target.exitReason ?? 'Canceled',
+      rationale: params.rationale?.trim() ? params.rationale : target.rationale,
+      updateTimeMs: nowMs,
+      timestampMs: Math.max(target.timestampMs, nowMs),
+    };
+    this.upsertLogs([updated]);
+    return updated;
+  }
+
+  /**
+   * Transitions a resting ENTRY order (NEW / PARTIALLY_FILLED) to FILLED or PARTIALLY_FILLED
+   * in-place when cancel races with a fill or partial-fill-before-cancel occurs on Binance.
+   */
+  markEntryFilledOrPartial(params: {
+    symbol: string;
+    venue: ExchangeVenue;
+    environment: 'Testnet' | 'Production';
+    accountMode?: ExecutionAccountMode;
+    orderId?: string;
+    clientOrderId?: string;
+    status: 'FILLED' | 'PARTIALLY_FILLED';
+    executedQty: number;
+    avgPrice?: number;
+    quoteQty?: number;
+    rationale?: string;
+    timestampMs?: number;
+  }): OrderExecutionLog | null {
+    this.syncIfExternallyModified();
+    const cleanSym = params.symbol.trim().toUpperCase();
+    const oid = String(params.orderId ?? '').trim();
+    const cid = String(params.clientOrderId ?? '').trim();
+    const target = this.logs.find((log) => {
+      if (log.lifecycle !== 'ENTRY') return false;
+      if (log.symbol !== cleanSym || log.venue !== params.venue || log.environment !== params.environment) {
+        return false;
+      }
+      if (params.accountMode && log.accountMode !== params.accountMode) return false;
+      if (oid && log.orderId === oid) return true;
+      if (cid && log.clientOrderId === cid) return true;
+      return !oid && !cid && (log.status === 'NEW' || log.status === 'PARTIALLY_FILLED');
+    });
+    if (!target) return null;
+
+    const nowMs = params.timestampMs ?? Date.now();
+    const execQty = Math.max(target.executedQty, Number(params.executedQty) || 0);
+    const avgPx =
+      typeof params.avgPrice === 'number' && params.avgPrice > 0
+        ? params.avgPrice
+        : target.avgPrice ?? target.price;
+    const quoteQty =
+      typeof params.quoteQty === 'number' && params.quoteQty > 0
+        ? params.quoteQty
+        : execQty > 0 && avgPx > 0
+          ? execQty * avgPx
+          : target.quoteQty;
+    const updated: OrderExecutionLog = {
+      ...target,
+      status: params.status,
+      executedQty: execQty,
+      avgPrice: avgPx,
+      price: avgPx > 0 ? avgPx : target.price,
+      quoteQty,
+      exitReason: null,
+      rationale: params.rationale?.trim() ? params.rationale : target.rationale,
+      updateTimeMs: nowMs,
+      timestampMs: Math.max(target.timestampMs, nowMs),
+    };
+    this.upsertLogs([updated]);
+    return updated;
   }
 
   getAllLogs(): OrderExecutionLog[] {
@@ -749,6 +810,7 @@ export class OrderHistoryDatabase {
           }
         }
         this.sqlite.exec('COMMIT;');
+        this.lastSqliteDataVersion = this.readSqliteDataVersion();
       } else {
         this.persistAll();
       }

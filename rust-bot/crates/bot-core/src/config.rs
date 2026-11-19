@@ -31,8 +31,11 @@ impl BotConfig {
 
     /// Perform invariant checks before the trading engine boots.
     pub fn validate(&self) -> crate::Result<()> {
-        if self.trading.pairs.is_empty() {
-            return Err(crate::BotError::Config("trading.pairs must not be empty".into()));
+        if self.trading.pairs.is_empty() && self.trading.pair_selection_mode != PairSelectionMode::Dynamic {
+            return Err(crate::BotError::Config("trading.pairs must not be empty unless pair_selection_mode = dynamic".into()));
+        }
+        if self.trading.max_watchlist_pairs == 0 || self.trading.max_watchlist_pairs > 40 {
+            return Err(crate::BotError::Config("trading.max_watchlist_pairs must be in 1..=40".into()));
         }
         if self.exchange.leverage == 0 || self.exchange.leverage > 20 {
             return Err(crate::BotError::Config("exchange.leverage must be in 1..=20".into()));
@@ -172,6 +175,35 @@ pub enum DirectionPolicy {
     #[default]
     LongOnly,
     Both,
+    ShortOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PairSelectionMode {
+    Static,
+    #[default]
+    Hybrid,
+    Dynamic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendingCategory {
+    #[default]
+    HotVolume,
+    TopGainers,
+    TopLosers,
+    VolatilityLeaders,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendingRankingSource {
+    #[default]
+    Auto,
+    Production,
+    Environment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -245,6 +277,25 @@ fn parse_utc_hhmm_minutes(hhmm: &str) -> Option<u32> {
     Some(h * 60 + m)
 }
 
+fn default_max_pending_order_bars() -> u32 {
+    6
+}
+fn default_max_pending_runaway_atr() -> f64 {
+    1.8
+}
+fn default_exhaustion_min_profit_r() -> f64 {
+    1.0
+}
+fn default_exhaustion_trail_factor() -> f64 {
+    0.55
+}
+fn default_exhaustion_rsi_high() -> f64 {
+    76.0
+}
+fn default_exhaustion_rsi_low() -> f64 {
+    24.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationConfig {
     pub enabled: bool,
@@ -259,6 +310,30 @@ pub struct AutomationConfig {
     pub auto_close_on_exit: bool,
     #[serde(default = "default_session_windows")]
     pub session_windows: Vec<UtcSessionWindow>,
+    #[serde(default = "default_true")]
+    pub cancel_pending_on_signal_reversal: bool,
+    #[serde(default = "default_true")]
+    pub cancel_pending_on_exhaustion: bool,
+    #[serde(default = "default_max_pending_order_bars")]
+    pub max_pending_order_bars: u32,
+    #[serde(default = "default_max_pending_runaway_atr")]
+    pub max_pending_runaway_atr: f64,
+    #[serde(default)]
+    pub apply_dynamic_cancel_to_manual_orders: bool,
+    #[serde(default = "default_true")]
+    pub exit_position_on_signal_reversal: bool,
+    #[serde(default = "default_true")]
+    pub tighten_trailing_on_exhaustion: bool,
+    #[serde(default = "default_exhaustion_min_profit_r")]
+    pub exhaustion_min_profit_r: f64,
+    #[serde(default = "default_exhaustion_trail_factor")]
+    pub exhaustion_trail_factor: f64,
+    #[serde(default = "default_exhaustion_rsi_high")]
+    pub exhaustion_rsi_high: f64,
+    #[serde(default = "default_exhaustion_rsi_low")]
+    pub exhaustion_rsi_low: f64,
+    #[serde(default)]
+    pub auto_flip_on_reversal: bool,
 }
 
 impl AutomationConfig {
@@ -305,6 +380,18 @@ impl Default for AutomationConfig {
             auto_order_notional_usdt: 150.0,
             auto_close_on_exit: true,
             session_windows: default_session_windows(),
+            cancel_pending_on_signal_reversal: true,
+            cancel_pending_on_exhaustion: true,
+            max_pending_order_bars: 6,
+            max_pending_runaway_atr: 1.8,
+            apply_dynamic_cancel_to_manual_orders: false,
+            exit_position_on_signal_reversal: true,
+            tighten_trailing_on_exhaustion: true,
+            exhaustion_min_profit_r: 1.0,
+            exhaustion_trail_factor: 0.55,
+            exhaustion_rsi_high: 76.0,
+            exhaustion_rsi_low: 24.0,
+            auto_flip_on_reversal: false,
         }
     }
 }
@@ -403,6 +490,28 @@ impl Default for GitBackupConfig {
     }
 }
 
+fn default_quote_asset() -> String {
+    "USDT".into()
+}
+fn default_max_watchlist_pairs() -> usize {
+    20
+}
+fn default_trending_top_n() -> usize {
+    5
+}
+fn default_trending_min_quote_volume_usdt() -> f64 {
+    10_000_000.0
+}
+fn default_trending_min_dwell_minutes() -> u64 {
+    15
+}
+fn default_trending_hysteresis_rank_buffer() -> usize {
+    3
+}
+fn default_max_same_direction_positions() -> usize {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradingConfig {
     pub mode: StrategyMode,
@@ -414,6 +523,57 @@ pub struct TradingConfig {
     pub position_sizing_mode: PositionSizingMode,
     pub initial_equity_usdt: f64,
     pub taker_fee_bps: f64,
+    #[serde(default)]
+    pub pair_selection_mode: PairSelectionMode,
+    #[serde(default = "default_quote_asset")]
+    pub quote_asset: String,
+    #[serde(default = "default_max_watchlist_pairs")]
+    pub max_watchlist_pairs: usize,
+    #[serde(default)]
+    pub trending_category: TrendingCategory,
+    #[serde(default = "default_trending_top_n")]
+    pub trending_top_n: usize,
+    #[serde(default = "default_trending_min_quote_volume_usdt")]
+    pub trending_min_quote_volume_usdt: f64,
+    #[serde(default = "default_trending_min_dwell_minutes")]
+    pub trending_min_dwell_minutes: u64,
+    #[serde(default = "default_trending_hysteresis_rank_buffer")]
+    pub trending_hysteresis_rank_buffer: usize,
+    #[serde(default)]
+    pub ranking_source: TrendingRankingSource,
+    #[serde(default = "default_max_same_direction_positions")]
+    pub max_same_direction_positions: usize,
+}
+
+impl Default for TradingConfig {
+    fn default() -> Self {
+        Self {
+            mode: StrategyMode::Scalping,
+            timeframe: "5m".into(),
+            pairs: vec![
+                "BTCUSDT".into(),
+                "ETHUSDT".into(),
+                "SOLUSDT".into(),
+                "BNBUSDT".into(),
+                "AVAXUSDT".into(),
+            ],
+            max_concurrent_positions: 3,
+            base_risk_per_trade_pct: 0.75,
+            position_sizing_mode: PositionSizingMode::FixedUsdt,
+            initial_equity_usdt: 10_000.0,
+            taker_fee_bps: 10.0,
+            pair_selection_mode: PairSelectionMode::Hybrid,
+            quote_asset: "USDT".into(),
+            max_watchlist_pairs: 20,
+            trending_category: TrendingCategory::HotVolume,
+            trending_top_n: 5,
+            trending_min_quote_volume_usdt: 10_000_000.0,
+            trending_min_dwell_minutes: 15,
+            trending_hysteresis_rank_buffer: 3,
+            ranking_source: TrendingRankingSource::Auto,
+            max_same_direction_positions: 2,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -430,6 +590,27 @@ fn default_atr_expansion_ratio_threshold() -> f64 {
 }
 fn default_volatility_alert_cooldown_sec() -> u64 {
     60
+}
+fn default_min_warmup_bars() -> usize {
+    50
+}
+fn default_max_ema_mid_extension_atr() -> f64 {
+    2.2
+}
+fn default_max_vwap_extension_atr() -> f64 {
+    2.8
+}
+fn default_min_close_strength_ratio() -> f64 {
+    0.55
+}
+fn default_min_candle_body_ratio() -> f64 {
+    0.30
+}
+fn default_min_di_spread() -> f64 {
+    3.0
+}
+fn default_max_spread_bps() -> f64 {
+    20.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,6 +638,58 @@ pub struct IndicatorConfig {
     pub atr_expansion_ratio_threshold: f64,
     #[serde(default = "default_volatility_alert_cooldown_sec")]
     pub volatility_alert_cooldown_sec: u64,
+    #[serde(default = "default_min_warmup_bars")]
+    pub min_warmup_bars: usize,
+    #[serde(default = "default_max_ema_mid_extension_atr")]
+    pub max_ema_mid_extension_atr: f64,
+    #[serde(default = "default_max_vwap_extension_atr")]
+    pub max_vwap_extension_atr: f64,
+    #[serde(default = "default_min_close_strength_ratio")]
+    pub min_close_strength_ratio: f64,
+    #[serde(default = "default_min_candle_body_ratio")]
+    pub min_candle_body_ratio: f64,
+    #[serde(default = "default_true")]
+    pub require_rising_adx: bool,
+    #[serde(default = "default_min_di_spread")]
+    pub min_di_spread: f64,
+    #[serde(default = "default_true")]
+    pub require_macro_ema_in_scalping: bool,
+    #[serde(default = "default_max_spread_bps")]
+    pub max_spread_bps: f64,
+}
+
+impl Default for IndicatorConfig {
+    fn default() -> Self {
+        Self {
+            ema_fast: 9,
+            ema_mid: 21,
+            ema_slow: 50,
+            ema_macro: 200,
+            rsi_period: 14,
+            rsi_long_pullback_min: 42.0,
+            rsi_long_pullback_max: 58.0,
+            rsi_short_pullback_min: 42.0,
+            rsi_short_pullback_max: 58.0,
+            adx_period: 14,
+            adx_min_trend: 25.0,
+            atr_period: 14,
+            require_vwap_alignment: true,
+            min_volume_expansion_mult: 1.5,
+            volatility_alerts_enabled: true,
+            atr_spike_pct_threshold: 0.45,
+            atr_expansion_ratio_threshold: 1.25,
+            volatility_alert_cooldown_sec: 60,
+            min_warmup_bars: 50,
+            max_ema_mid_extension_atr: 2.2,
+            max_vwap_extension_atr: 2.8,
+            min_close_strength_ratio: 0.55,
+            min_candle_body_ratio: 0.30,
+            require_rising_adx: true,
+            min_di_spread: 3.0,
+            require_macro_ema_in_scalping: true,
+            max_spread_bps: 20.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

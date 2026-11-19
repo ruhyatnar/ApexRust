@@ -6,7 +6,19 @@ export type StrategyProfile = 'trend_pullback' | 'ema_breakout' | 'vwap_reversio
 
 export type ExecutionOrderMethod = 'MARKET' | 'LIMIT' | 'LIMIT_MAKER' | 'OCO';
 
-export type DirectionPolicy = 'long_only' | 'both';
+export type DirectionPolicy = 'long_only' | 'both' | 'short_only';
+
+export type PairSelectionMode = 'static' | 'hybrid' | 'dynamic';
+
+export type TrendingCategory =
+  | 'hot_volume'
+  | 'top_gainers'
+  | 'top_losers'
+  | 'volatility_leaders';
+
+export type TrendingRankingSource = 'auto' | 'production' | 'environment';
+
+export type PairSourceTag = 'pinned' | 'trending' | 'protected_position';
 
 export type TimeInForce = 'GTC' | 'IOC' | 'FOK';
 
@@ -46,7 +58,7 @@ export interface ManualOrderInput {
 
 export interface LiveAutoIntent {
   id: string;
-  kind: 'ENTRY' | 'EXIT';
+  kind: 'ENTRY' | 'EXIT' | 'CANCEL_PENDING';
   symbol: string;
   side: Side;
   binanceSide: 'BUY' | 'SELL';
@@ -56,7 +68,15 @@ export interface LiveAutoIntent {
   limitPrice?: number;
   timeInForce: TimeInForce;
   reason: string;
+  exchangeOrderId?: string;
+  pendingOrderId?: string;
+  positionSide?: 'BOTH' | 'LONG' | 'SHORT';
   input?: ManualOrderInput;
+  flipAfterExit?: {
+    side: Side;
+    reason: string;
+    input: ManualOrderInput;
+  };
 }
 
 export type ExitReason =
@@ -65,6 +85,8 @@ export type ExitReason =
   | 'TrailingStop'
   | 'TakeProfit1'
   | 'TakeProfit2'
+  | 'SignalReversal'
+  | 'MomentumExhaustion'
   | 'CircuitBreakerFlatten'
   | 'ManualClose';
 
@@ -85,15 +107,19 @@ export interface IndicatorSnapshot {
   emaMid: number | null;
   emaSlow: number | null;
   emaMacro: number | null;
+  prevEmaMid?: number | null;
   rsi: number | null;
   prevRsi: number | null;
   adx: number | null;
+  prevAdx?: number | null;
   plusDi: number | null;
   minusDi: number | null;
   atr: number | null;
   vwap: number | null;
   volumeSma20?: number | null;
   volumeRatio?: number | null;
+  warmupBarsCount?: number;
+  hasBarGap?: boolean;
 }
 
 export type PositionSizingMode =
@@ -165,7 +191,7 @@ export interface BinanceExecutionRecord {
   venue: ExchangeVenue;
   environment: 'Testnet' | 'Production';
   accountMode: ExecutionAccountMode;
-  lifecycle: 'ENTRY' | 'EXIT';
+  lifecycle: 'ENTRY' | 'EXIT' | 'CANCEL';
   side: Side;
   binanceSide: 'BUY' | 'SELL';
   positionSide: 'BOTH' | 'LONG' | 'SHORT';
@@ -179,7 +205,7 @@ export interface BinanceExecutionRecord {
     | 'TAKE_PROFIT_MARKET';
   uiOrderType: OrderType;
   execType: 'TRADE';
-  orderStatus: 'FILLED' | 'PARTIALLY_FILLED';
+  orderStatus: 'FILLED' | 'PARTIALLY_FILLED' | 'NEW' | 'CANCELED';
   timeInForce: TimeInForce | 'GTX';
   price: number;
   entryPrice: number;
@@ -193,7 +219,7 @@ export interface BinanceExecutionRecord {
   marginType: MarginType;
   realizedPnlUsdt: number | null;
   rMultiple: number | null;
-  exitReason: ExitReason | null;
+  exitReason: ExitReason | string | null;
   strategyRationale: string;
   transactTime: number;
 }
@@ -338,6 +364,16 @@ export interface TradingConfig {
   positionSizingMode?: PositionSizingMode;
   initialEquityUsdt: number;
   takerFeeBps: number;
+  pairSelectionMode?: PairSelectionMode;
+  quoteAsset?: string;
+  maxWatchlistPairs?: number;
+  trendingCategory?: TrendingCategory;
+  trendingTopN?: number;
+  trendingMinQuoteVolumeUsdt?: number;
+  trendingMinDwellMinutes?: number;
+  trendingHysteresisRankBuffer?: number;
+  rankingSource?: TrendingRankingSource;
+  maxSameDirectionPositions?: number;
 }
 
 export interface IndicatorConfig {
@@ -359,6 +395,15 @@ export interface IndicatorConfig {
   atrSpikePctThreshold?: number;
   atrExpansionRatioThreshold?: number;
   volatilityAlertCooldownSec?: number;
+  minWarmupBars?: number;
+  maxEmaMidExtensionAtr?: number;
+  maxVwapExtensionAtr?: number;
+  minCloseStrengthRatio?: number;
+  minCandleBodyRatio?: number;
+  requireRisingAdx?: boolean;
+  minDiSpread?: number;
+  requireMacroEmaInScalping?: boolean;
+  maxSpreadBps?: number;
 }
 
 export interface VolatilitySpikeAlert {
@@ -403,7 +448,7 @@ export interface UtcTimeWindow {
   enabled: boolean;
 }
 
-interface AutomationConfig {
+export interface AutomationConfig {
   enabled: boolean;
   strategyProfile: StrategyProfile;
   directionPolicy: DirectionPolicy;
@@ -414,6 +459,18 @@ interface AutomationConfig {
   autoOrderNotionalUsdt: number;
   autoCloseOnExit: boolean;
   sessionWindows?: UtcTimeWindow[];
+  cancelPendingOnSignalReversal?: boolean;
+  cancelPendingOnExhaustion?: boolean;
+  maxPendingOrderBars?: number;
+  maxPendingRunawayAtr?: number;
+  applyDynamicCancelToManualOrders?: boolean;
+  exitPositionOnSignalReversal?: boolean;
+  tightenTrailingOnExhaustion?: boolean;
+  exhaustionMinProfitR?: number;
+  exhaustionTrailFactor?: number;
+  exhaustionRsiHigh?: number;
+  exhaustionRsiLow?: number;
+  autoFlipOnReversal?: boolean;
 }
 
 export interface FeatureToggles {
@@ -471,6 +528,41 @@ export interface PairRuntimeState {
   indicators: IndicatorSnapshot;
   openPosition: Position | null;
   lastSignalNote: string | null;
+  sourceTag?: PairSourceTag;
+  tradableOnActiveVenue?: boolean;
+  quoteVolume24hUsdt?: number;
+  bestBid?: number;
+  bestAsk?: number;
+  spreadBps?: number;
+  barsWarmedUp?: number;
+}
+
+export interface MarketTicker24h {
+  symbol: string;
+  venue: ExchangeVenue;
+  lastPrice: number;
+  openPrice24h: number;
+  highPrice24h: number;
+  lowPrice24h: number;
+  priceChangePercent: number;
+  baseVolume: number;
+  quoteVolume: number;
+  rangePct24h: number;
+  tradableOnActiveEnv: boolean;
+  inWatchlist?: boolean;
+  sourceTag?: PairSourceTag;
+  updatedAtMs: number;
+}
+
+export interface ScreenerSnapshotPayload {
+  venue: ExchangeVenue;
+  environment: 'Testnet' | 'Production';
+  rankingSourceUsed: 'production' | 'environment';
+  streamConnected: boolean;
+  totalTradableSymbols: number;
+  updatedAtMs: number;
+  rateWeightUsed1m?: number;
+  tickers: MarketTicker24h[];
 }
 
 export type ExecutionAccountMode = 'Paper' | 'Live';
@@ -534,6 +626,10 @@ export interface PendingOrder {
   targets: Array<{ pctOffset: number; allocationPct: number }>;
   createdAtMs: number;
   exchangeOrderId?: string;
+  source?: 'auto' | 'manual';
+  createdBarIndex?: number;
+  ageBars?: number;
+  dynamicStatusNote?: string;
 }
 
 interface AutoTradingStats {

@@ -9,6 +9,8 @@ bot-core = { path = "../bot-core" }
 bot-engine = { path = "../bot-engine" }
 bot-web = { path = "../bot-web" }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

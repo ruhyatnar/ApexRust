@@ -10,8 +10,8 @@ function stripIpv6BracketsAndZone(rawHost: string): string {
   let host = rawHost.trim().toLowerCase();
   if (host.startsWith('[') && host.includes(']')) {
     host = host.slice(1, host.indexOf(']'));
-  } else if (host.includes(':') && !host.includes('::')) {
-    // host:port IPv4 or hostname
+  } else if (host.includes(':') && host.indexOf(':') === host.lastIndexOf(':')) {
+    // host:port IPv4 or hostname (single colon only; multi-colon is a bare IPv6 literal)
     host = host.slice(0, host.lastIndexOf(':'));
   }
   const zoneIdx = host.indexOf('%');
@@ -74,8 +74,8 @@ export function isPrivateOrZeroTrustHost(rawHost: string): boolean {
     if (a === 100 && b >= 64 && b <= 127) return true;
     return false;
   }
-  // IPv6 ULA (fc00::/7 -> fc.. or fd..) and Link-Local (fe80::/10)
-  if (host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80:')) {
+  // IPv6 ULA (fc00::/7 -> fc00..fdff) and Link-Local (fe80::/10 -> fe80..febf)
+  if (host.includes(':') && (/^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host))) {
     return true;
   }
   // Private Zero Trust / internal DNS suffixes
@@ -242,10 +242,12 @@ const ALLOWED_ENGINE_ROUTES: ReadonlyArray<{ method: string; path: string }> = [
   { method: 'GET', path: '/health' },
   { method: 'GET', path: '/config' },
   { method: 'GET', path: '/snapshot' },
+  { method: 'GET', path: '/market/screener' },
   { method: 'GET', path: '/orders/history' },
   { method: 'DELETE', path: '/orders/history' },
   { method: 'GET', path: '/orders/orphans' },
   { method: 'POST', path: '/control' },
+  { method: 'POST', path: '/watchlist' },
 ];
 
 /**

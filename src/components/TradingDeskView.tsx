@@ -181,7 +181,20 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
           <span className="text-slate-400">
             Bias:{' '}
             <strong className="font-mono font-medium text-slate-200">
-              {auto.directionPolicy === 'long_only' ? 'Spot Long' : 'Long/Short'}
+              {config.trading.venue === 'Spot'
+                ? 'Spot Long Only'
+                : auto.directionPolicy === 'long_only'
+                  ? 'Futures Long Only'
+                  : auto.directionPolicy === 'short_only'
+                    ? 'Futures Short Only'
+                    : 'Futures Long & Short'}
+            </strong>
+          </span>
+
+          <span className="text-slate-400">
+            Watchlist:{' '}
+            <strong className="font-mono font-medium capitalize text-[#7DF2AD]">
+              {config.trading.pairSelectionMode ?? 'hybrid'} ({snapshot.pairs.length})
             </strong>
           </span>
 
@@ -595,23 +608,51 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
                     <thead>
                       <tr className="border-b border-white/[0.06] text-slate-400">
                         <th className="px-4 py-2.5 font-medium">Pair / Side</th>
-                        <th className="px-4 py-2.5 font-medium">Method</th>
+                        <th className="px-4 py-2.5 font-medium">Method / Origin</th>
                         <th className="px-4 py-2.5 text-right font-medium">Limit Price</th>
                         <th className="px-4 py-2.5 text-right font-medium">Notional</th>
-                        <th className="px-4 py-2.5 text-right font-medium">TIF</th>
+                        <th className="px-4 py-2.5 text-right font-medium">TIF / Age</th>
                         <th className="px-4 py-2.5 text-right font-medium">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/[0.05] font-mono tabular-nums">
-                      {snapshot.pendingOrders.map((ord) => (
+                      {snapshot.pendingOrders.map((ord) => {
+                        const pairState = snapshot.pairs.find((p) => p.symbol === ord.symbol);
+                        const closedBars = pairState?.barsWarmedUp ?? pairState?.candles.filter((c) => c.isClosed).length ?? 0;
+                        const barsAged =
+                          typeof ord.ageBars === 'number'
+                            ? Math.max(0, ord.ageBars)
+                            : typeof ord.createdBarIndex === 'number'
+                              ? Math.max(0, closedBars - ord.createdBarIndex)
+                              : 0;
+                        const maxAge = config.automation.maxPendingOrderBars ?? 6;
+                        return (
                         <tr key={ord.id} className="hover:bg-white/[0.02]">
                           <td className="px-4 py-2.5 font-sans font-semibold text-slate-100">
-                            {ord.symbol}{' '}
-                            <span className={ord.side === 'Long' ? 'text-emerald-400' : 'text-rose-400'}>
-                              · {ord.side}
+                            <div>
+                              {ord.symbol}{' '}
+                              <span className={ord.side === 'Long' ? 'text-emerald-400' : 'text-rose-400'}>
+                                · {ord.side}
+                              </span>
+                            </div>
+                            {ord.dynamicStatusNote && (
+                              <div className="mt-0.5 text-[10px] font-normal text-amber-300/90">
+                                {ord.dynamicStatusNote}
+                              </div>
+                            )}
+                          </td>
+                          <td className="px-4 py-2.5 text-slate-300">
+                            <span>{ord.orderType}</span>{' '}
+                            <span
+                              className={`ml-1 rounded px-1 py-0.5 text-[9px] font-bold uppercase ${
+                                ord.source === 'manual'
+                                  ? 'bg-sky-500/15 text-sky-300'
+                                  : 'bg-[#7DF2AD]/15 text-[#7DF2AD]'
+                              }`}
+                            >
+                              {ord.source ?? 'auto'}
                             </span>
                           </td>
-                          <td className="px-4 py-2.5 text-slate-300">{ord.orderType}</td>
                           <td className="px-4 py-2.5 text-right text-amber-300">
                             ${ord.limitPrice >= 100 ? ord.limitPrice.toFixed(2) : ord.limitPrice.toFixed(4)}
                           </td>
@@ -619,7 +660,10 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
                             {fmtUsd(ord.usdtAmount)}
                           </td>
                           <td className="px-4 py-2.5 text-right text-slate-400">
-                            {ord.orderMethod === 'LIMIT_MAKER' ? 'POST-ONLY' : ord.timeInForce}
+                            {ord.orderMethod === 'LIMIT_MAKER' ? 'POST-ONLY' : ord.timeInForce} ·{' '}
+                            <span className="text-slate-300">
+                              {ord.source === 'manual' ? `${barsAged}b` : `${barsAged}/${maxAge}b`}
+                            </span>
                           </td>
                           <td className="px-4 py-2.5 text-right font-sans">
                             <button
@@ -631,7 +675,8 @@ export const TradingDeskView: React.FC<TradingDeskViewProps> = ({
                             </button>
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 )}

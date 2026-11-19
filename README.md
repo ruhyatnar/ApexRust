@@ -47,11 +47,13 @@ Once installed, manage everything with the bundled CLI (`./apexrust` on Linux/ma
 ./apexrust uninstall         # add --purge to remove .env, bot.toml, node_modules, dist & rust-bot/target
 ```
 
-For unattended CI / server setup:
+For unattended CI / server setup (Linux, macOS, Windows):
 
 ```bash
-./install.sh --yes --non-interactive --components web --env testnet --venue spot --no-service
+./install.sh --yes --non-interactive --components both --env testnet --venue spot --pair-mode hybrid --trending-category hot_volume --no-service
 ```
+
+*(Windows equivalent: `.\install.ps1 --yes --non-interactive --components web --env testnet --venue spot --pair-mode hybrid --no-service`, or double-click `install.cmd` for interactive setup.)*
 
 ---
 
@@ -203,13 +205,13 @@ ApexRust Quant maintains parity across two runtimes sharing an identical domain 
 | Express Control Proxy (server.ts :3000)                                     |
 |  - In-memory API Vault (HMAC-SHA256 / Ed25519 signing, zero disk secrets)   |
 |  - Exchange filter rounding (tickSize / stepSize) & max notional safety cap |
-|  - Order execution log store (.apexrust-order-logs.json) + allOrders sync   |
+|  - Order execution SQLite WAL DB (.apexrust-orders.sqlite) + allOrders sync   |
 |  - Sanitized Git backup writer (backups/bot-config-backup.json + TOML)      |
 +------------------------------+----------------------------------------------+
                                |
                                v
 +-----------------------------------------------------------------------------+
-| Binance Spot (/api/v3/*) & USD-M Futures (/fapi/v1/*, /fapi/v2/*)           |
+| Binance Spot (/api/v3/*) & USD-M Futures (/fapi/v1/*, /fapi/v3/*)           |
 |  - Testnet & Production REST + WebSocket Streams                            |
 +------------------------------^----------------------------------------------+
                                | (Native 24/7 Alternative / Parity Engine)
@@ -227,7 +229,6 @@ ApexRust Quant maintains parity across two runtimes sharing an identical domain 
 ```text
 .
 ├── index.html                        # HTML shell, PWA icons/meta, dark theme bootstrap
-├── metadata.json                     # App manifest metadata
 ├── package.json                      # Node scripts (dev, build, start, preview, clean, lint)
 ├── tsconfig.json                     # TypeScript compiler configuration
 ├── vite.config.ts                    # Vite + Tailwind CSS v4 + VitePWA (Workbox offline cache)
@@ -305,13 +306,20 @@ ApexRust Quant maintains parity across two runtimes sharing an identical domain 
 
 ### 1. Multi-Venue Execution (Binance Spot & USD-M Futures)
 
-- **Venues & Environments**: Supports **Binance Spot** (`/api/v3/*`) and **Binance USD-M Futures** (`/fapi/v1/*`, `/fapi/v2/*`) on both **Testnet** and **Production**.
-- **Futures Controls**: Configurable leverage (`1x–20x`), `ISOLATED` or `CROSSED` margin alignment (`/fapi/v1/marginType`, `/fapi/v1/leverage`), and `long_only` (Spot-safe) vs `both` (Futures Long & Short) direction policies.
+- **Venues, Modes & Environments**: Supports **Binance Spot** (`/api/v3/*`) and **Binance USD-M Futures** (`/fapi/v1/*`, `/fapi/v3/*` with automatic `/fapi/v2/*` fallback) in One-Way (`BOTH` + `reduceOnly`) or Hedge Mode (`LONG`/`SHORT`) across **Testnet** and **Production**. Spot strictly enforces `long_only` (rejects Spot short-open attempts and disables `autoFlipOnReversal`).
+- **3 Watchlist & Pair Discovery Modes**:
+  - `static` (*Static Only*): Trades exclusively your pinned watchlist pairs.
+  - `hybrid` (*Pinned + Auto-Trending*, default): Monitors your pinned watchlist alongside auto-rotating trending pairs (`trendingTopN`) up to `maxWatchlistPairs`.
+  - `dynamic` (*Full Auto-Trending*): Continuously rotates active watchlist pairs via Binance's live `!miniTicker@arr` WebSocket screener (`hot_volume`, `top_gainers`, `top_losers` for Futures shorts, `volatility_leaders`) with **Zero Orphan Protection** (open positions and pending orders are never dropped), rank hysteresis buffer (`N + 3`), `15m` minimum dwell, and `exchangeInfo` venue/environment validation.
+- **WebSocket-First & Binance Rate-Limit Compliant**: Combined `<sym>@kline_<tf>` + `<sym>@bookTicker` streams plus `!miniTicker@arr` screener WS use debounced in-place `SUBSCRIBE`/`UNSUBSCRIBE` diffs (respecting Spot `<= 5 msg/s`, Futures `<= 10 msg/s`, `<= 1024 streams/conn`, and `< 23h` reconnect), 30-minute `exchangeInfo` TTL cache, staggered 220-bar warmup, and `X-MBX-USED-WEIGHT-1M >= 70%` + `429`/`418 Retry-After` throttling.
+- **11-Layer Anti-False-Signal Mitigation Matrix**: Enforces EMA `9/21/50/200` alignment (`requireMacroEmaInScalping`), distance caps (`maxEmaMidExtensionAtr`, `maxVwapExtensionAtr`), candle close strength & body ratio anti-wick gates, ADX + `minDiSpread` (+ optional rising ADX), volume expansion multiplier, live `@bookTicker` spread guard (`maxSpreadBps`), `minWarmupBars`, and per-direction concurrency limits (`maxSameDirectionPositions`).
+- **Dynamic Pending Auto-Cancel & Early Reversal Protection**: Auto-cancels resting auto limits when signals reverse (`SignalReversed` + cooldown bypass for fast opposite entries), momentum exhausts (`MomentumExhaustion`), price runs away (`PriceRunaway`), or TTL bars expire (`ExpiredBars`). Uses `POST /api/live/cancel-order` so Binance `-2011` (`Unknown order sent`) verifies order status and promotes already-`FILLED` limits instead of dropping them. Early open-position management supports `SignalReversal` exits (Spot safe close; optional Futures `autoFlipOnReversal`) and `0.55×` ATR trailing tightening (`tightenTrailingOnExhaustion`).
+- **Futures Controls**: Configurable leverage (`1x–20x`), `ISOLATED` or `CROSSED` margin alignment (`/fapi/v1/marginType`, `/fapi/v1/leverage`), skipping margin/leverage calls on `reduceOnly` exits so Binance error `-4048` never blocks protective closes.
 - **Order Types & Safeguards**:
   - `MARKET` (Spot `quoteOrderQty` on buys or filter-rounded `quantity` on sells/Futures)
   - `LIMIT` with configurable `timeInForce` (`GTC`, `IOC`, `FOK`) and `limitOffsetBps`
   - Post-Only Maker (`LIMIT_MAKER` on Spot; `LIMIT` + `GTX` on USD-M Futures)
-  - `ATR SCALP` and **OCO Brackets** (Spot `/api/v3/orderList/oco`; Futures protective `TAKE_PROFIT_MARKET` + `STOP_MARKET` on `MARK_PRICE` with `priceProtect = TRUE`)
+  - `ATR SCALP` and **OCO Brackets** (Spot `/api/v3/orderList/oco`; Futures conditional `/fapi/v1/algoOrder` `TAKE_PROFIT_MARKET` + `STOP_MARKET` on `MARK_PRICE` with `priceProtect = "true"`)
   - Optional preflight validation (`/api/v3/order/test` or `/fapi/v1/order/test`) and server-enforced `maxOrderNotionalUsdt` cap (`$250` default).
 
 ### 2. Strict Paper Sandbox vs Live Execution Isolation
@@ -402,20 +410,23 @@ Express runs on port `3000` (`0.0.0.0:3000`), mounting Vite middleware in develo
 | Method & Path | Purpose |
 | :--- | :--- |
 | `GET /api/health`, `/_ah/health` | Health check returning active environment and venue |
+| `GET /api/market/screener` | Live Binance `!miniTicker@arr` WebSocket screener snapshot (`hot_volume`, `top_gainers`, `top_losers`, `volatility_leaders`) filtered by active venue/env `exchangeInfo` |
+| `WS /ws/screener` | Pushes real-time `screener_snapshot` updates and accepts live JSON filter updates without polling |
+| `WS /ws/telemetry` | Streams real-time Rust daemon telemetry snapshots to the Web UI and `bot-desktop` CLI |
 | `GET /api/market/klines` | Public Binance Spot/Futures kline proxy (avoids browser CORS on Futures/Testnet) |
 | `GET /api/market/ticker` | Public Binance Spot/Futures ticker proxy |
 | `GET /api/live/config` | Masked vault status (`apiKeyMasked`, venue, environment, leverage, balances; secrets never returned) |
 | `POST /api/live/config` | Stores Binance Spot/Futures credentials (`HMAC-SHA256` or `Ed25519`), venue, leverage, margin & notional cap in server memory |
-| `POST /api/live/verify` | Executes signed `/api/v3/account` or `/fapi/v2/account` check & syncs wallet balances |
+| `POST /api/live/verify` | Executes signed `/api/v3/account` or `/fapi/v3/account` (with `/fapi/v2/account` fallback) check & syncs wallet balances |
 | `POST /api/live/arm` | Arms or disarms live order execution (requires explicit confirmation in `Production`) |
 | `POST /api/live/order` | Runs optional `/order/test` preflight and executes `MARKET`, `LIMIT`, `LIMIT_MAKER`/`GTX`, or `OCO`/bracket orders with filter rounding & `maxOrderNotionalUsdt` cap |
-| `GET /api/live/open-orders` | Queries open Binance Spot/Futures orders (`/api/v3/openOrders` or `/fapi/v1/openOrders` + `/fapi/v1/algoOpenOrders`) |
+| `GET /api/live/open-orders` | Queries open Binance Spot/Futures orders (`/api/v3/openOrders` or `/fapi/v1/openOrders` + `GET /fapi/v1/openAlgoOrders`) |
 | `GET /api/live/order-status` | Queries single order status (`/api/v3/order` or `/fapi/v1/order`) to reconcile filled vs canceled resting limit orders |
 | `POST /api/live/cancel-open-brackets` | Cancels open Spot OCO order lists or Futures algo orders for a symbol |
-| `DELETE /api/live/order` | Cancels an open Spot/Futures order, OCO list, or Futures algo order |
+| `POST /api/live/cancel-order` / `DELETE /api/live/order` | Cancels an open Spot/Futures order, OCO list, or Futures algo order (`-2011` checks status, promotes fills, and updates SQLite `NEW -> CANCELED`) |
 | `GET /api/live/trades` | Pulls signed account trade fills (`/api/v3/myTrades` or `/fapi/v1/userTrades`) |
 | `DELETE /api/live/config` | Clears credentials from server memory and disarms live execution |
-| `GET /api/orders/history` | Queries persisted order execution logs (`.apexrust-order-logs.json`), optionally syncing Binance `allOrders` |
+| `GET /api/orders/history` | Queries persisted SQLite WAL DB (`.apexrust-orders.sqlite`), merging incremental `allOrders` sync across active + historical DB pairs |
 | `POST /api/orders/history` | Upserts paper or live order execution logs |
 | `DELETE /api/orders/history` | Clears order execution logs (`Paper`, `Live`, or `ALL`) |
 | `GET /api/git/status` | Returns Git initialization state, branch, sanitized remote URL, dirty files, and recent commits |
@@ -471,8 +482,8 @@ The `rust-bot/` workspace implements the full trading engine in Rust (`edition =
 | `bot-risk` | Pair & cumulative daily drawdown limits, profit lock, streak cooldowns & Circuit Breaker |
 | `bot-exchange` | `binance-sdk` Spot + USD-M Futures REST/WS clients, `MARKET`/`LIMIT`/`GTX`/`OCO`, and `FailoverGateway` |
 | `bot-engine` | Tokio multi-pair orchestrator, UTC session window gating, volatility spike monitor & `git_sync` |
-| `bot-web` | Embedded Axum HTTP + WebSocket telemetry bridge (`:8080`): `GET /api/health`, `/api/config`, `/api/snapshot`, `POST /api/control` (`pause`, `resume`, `trip_cb`, `reset_cb`, `flatten_all`, `backup_now`, `manual_order`), `WS /ws/telemetry` |
-| `bot-desktop` | Linux Desktop CLI & `systemd` daemon (`--config <path>`, `--web-port <port>`, `0` disables web bridge) |
+| `bot-web` | Embedded Axum HTTP + WebSocket telemetry bridge (`:8080`): `GET /api/health`, `/api/config`, `/api/snapshot`, `GET /api/market/screener`, `POST /api/watchlist`, `POST /api/control`, `WS /ws/telemetry`, `WS /ws/screener` |
+| `bot-desktop` | Cross-platform Desktop CLI & daemon (`Linux`/`macOS`/`Windows`): local/VPS engine plus `remote watch` (`/ws/telemetry` WS + HTTP fallback), `remote trending`, `remote watchlist`, `remote orders`, and `remote manual-order` |
 
 ### Linux `systemd` & Sanitized Git Backup
 

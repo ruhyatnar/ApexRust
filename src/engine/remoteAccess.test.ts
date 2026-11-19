@@ -376,3 +376,57 @@ test('Shared SQLite WAL OrderHistoryDatabase reloads external daemon writes and 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('Audit regressions: IPv6 ULA vs public fc*/fd* hostnames, full IPv6 loopback, and Rust snapshot indicator/toggle mapping', () => {
+  // Public domains starting with fc/fd must NOT be treated as private IPv6 ULA
+  assert.equal(isPrivateOrZeroTrustHost('fc-public.example.com'), false);
+  assert.equal(isPrivateOrZeroTrustHost('fd-api.binance.com'), false);
+  assert.equal(isPrivateOrZeroTrustHost('fd-host.com:8080'), false);
+
+  // Genuine IPv6 ULA, Link-Local, and full-form loopback MUST be recognized
+  assert.equal(isPrivateOrZeroTrustHost('fc00::1'), true);
+  assert.equal(isPrivateOrZeroTrustHost('fd12:3456:789a:1::1'), true);
+  assert.equal(isPrivateOrZeroTrustHost('fe80::1%eth0'), true);
+  assert.equal(isLoopbackHost('0:0:0:0:0:0:0:1'), true);
+  assert.equal(isPrivateOrZeroTrustHost('0:0:0:0:0:0:0:1'), true);
+
+  // mapRustEngineSnapshot maps all indicators & mapRustFeatureToggles uses correct opt-in defaults
+  const mapped = mapRustEngineSnapshot({
+    running: true,
+    venue: 'futures',
+    pairs: [
+      {
+        symbol: 'ETHUSDT',
+        last_price: 3200,
+        daily_pnl_usdt: 0,
+        daily_pnl_pct: 0,
+        indicators: {
+          ema_fast: 3195,
+          ema_mid: 3180,
+          ema_slow: 3150,
+          ema_macro: 3050,
+          rsi: 54.5,
+          prev_rsi: 51.2,
+          atr: 22,
+          adx: 28,
+          plus_di: 26,
+          minus_di: 14,
+          vwap: 3185,
+          volume_ratio: 1.75,
+        },
+        open_position: null,
+      },
+    ],
+  });
+  assert.equal(mapped.pairs[0].emaMid, 3180);
+  assert.equal(mapped.pairs[0].emaMacro, 3050);
+  assert.equal(mapped.pairs[0].prevRsi, 51.2);
+  assert.equal(mapped.pairs[0].plusDi, 26);
+  assert.equal(mapped.pairs[0].minusDi, 14);
+  assert.equal(mapped.pairs[0].volumeRatio, 1.75);
+
+  const defaults = mapRustFeatureToggles({ features: {} });
+  assert.equal(defaults?.volumeConfirmationFilter, false);
+  assert.equal(defaults?.sessionWindowFilter, false);
+  assert.equal(defaults?.gitAutoBackup, false);
+});

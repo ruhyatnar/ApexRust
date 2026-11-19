@@ -1,3 +1,4 @@
+import { pricePrecisionDecimals } from './formatters';
 import { IndicatorPipeline } from './indicators';
 import {
   calculateQuantitativePositionSizeUsdt,
@@ -7,7 +8,19 @@ import {
 } from './quantAnalytics';
 import { RiskManager } from './risk';
 import { DEFAULT_UTC_SESSION_WINDOWS, evaluateUtcSessionWindows } from './sessionWindows';
-import { buildExitPlan, evaluateEntrySignal, managePositionTick } from './strategy';
+import {
+  buildExitPlan,
+  evaluateEntrySignal,
+  evaluateOpenPositionDynamicAction,
+  evaluatePendingOrderDynamicAction,
+  managePositionTick,
+} from './strategy';
+import {
+  hasCandleSequenceGap,
+  normalizeSymbolList,
+  resolveEffectiveWatchlist,
+  type WatchlistDwellState,
+} from './watchlist';
 import type {
   BinanceExecutionRecord,
   BotConfig,
@@ -19,6 +32,7 @@ import type {
   ExitReason,
   LiveAutoIntent,
   ManualOrderInput,
+  MarketTicker24h,
   PairRuntimeState,
   PendingOrder,
   Position,
@@ -43,6 +57,16 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     positionSizingMode: 'fixed_usdt',
     initialEquityUsdt: 10000,
     takerFeeBps: 10,
+    pairSelectionMode: 'hybrid',
+    quoteAsset: 'USDT',
+    maxWatchlistPairs: 20,
+    trendingCategory: 'hot_volume',
+    trendingTopN: 5,
+    trendingMinQuoteVolumeUsdt: 10_000_000,
+    trendingMinDwellMinutes: 15,
+    trendingHysteresisRankBuffer: 3,
+    rankingSource: 'auto',
+    maxSameDirectionPositions: 2,
   },
   indicators: {
     emaFast: 9,
@@ -63,6 +87,15 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     atrSpikePctThreshold: 0.45,
     atrExpansionRatioThreshold: 1.25,
     volatilityAlertCooldownSec: 60,
+    minWarmupBars: 50,
+    maxEmaMidExtensionAtr: 2.2,
+    maxVwapExtensionAtr: 2.8,
+    minCloseStrengthRatio: 0.55,
+    minCandleBodyRatio: 0.3,
+    requireRisingAdx: true,
+    minDiSpread: 3.0,
+    requireMacroEmaInScalping: true,
+    maxSpreadBps: 20.0,
   },
   exits: {
     atrSlMultiplier: 1.5,
@@ -94,6 +127,18 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     autoOrderNotionalUsdt: 150,
     autoCloseOnExit: true,
     sessionWindows: structuredClone(DEFAULT_UTC_SESSION_WINDOWS),
+    cancelPendingOnSignalReversal: true,
+    cancelPendingOnExhaustion: true,
+    maxPendingOrderBars: 6,
+    maxPendingRunawayAtr: 1.8,
+    applyDynamicCancelToManualOrders: false,
+    exitPositionOnSignalReversal: true,
+    tightenTrailingOnExhaustion: true,
+    exhaustionMinProfitR: 1.0,
+    exhaustionTrailFactor: 0.55,
+    exhaustionRsiHigh: 76,
+    exhaustionRsiLow: 24,
+    autoFlipOnReversal: false,
   },
   features: {
     automatedTrading: true,
@@ -180,6 +225,11 @@ export class SimulationRuntime {
   private closedBarCounts = new Map<string, number>();
   private syncedLiveBalance: { free: number; locked: number } | null = null;
   private lastVolatilityAlertAtMs = new Map<string, number>();
+  private trailingTightenFactor = new Map<string, number>();
+  private reversalBypassCooldownSide = new Map<string, Side>();
+  private watchlistDwellState: WatchlistDwellState = { enteredAtMs: new Map() };
+  private lastScreenerTickers: MarketTicker24h[] = [];
+  private tradableSymbolsSet = new Set<string>();
   private pendingLiveIntents: LiveAutoIntent[] = [];
   private pendingVolatilityAlerts: VolatilitySpikeAlert[] = [];
   private lastClockMs: number;
@@ -234,6 +284,9 @@ export class SimulationRuntime {
         indicators: pipe.snapshot(),
         openPosition: null,
         lastSignalNote: null,
+        sourceTag: 'pinned',
+        tradableOnActiveVenue: true,
+        barsWarmedUp: candles.length,
       });
     }
 
@@ -685,6 +738,56 @@ export class SimulationRuntime {
     return rec;
   }
 
+  private recordCanceledPendingExecution(
+    pending: PendingOrder,
+    reason: string,
+    nowMs = Date.now()
+  ): void {
+    this.nextOrderSeq += 1;
+    const parsedOrdId = pending.exchangeOrderId ? Number(pending.exchangeOrderId) : NaN;
+    const orderId =
+      Number.isFinite(parsedOrdId) && parsedOrdId > 0 ? parsedOrdId : this.nextOrderSeq;
+    const venue = pending.venue ?? this.config.trading.venue;
+    const qty = pending.limitPrice > 0 ? pending.usdtAmount / pending.limitPrice : 0;
+    const rec: BinanceExecutionRecord = {
+      id: `exec-cancel-${pending.id}-${nowMs}`,
+      tradeId: 0,
+      orderId,
+      orderListId: -1,
+      clientOrderId: `apex_cancel_${pending.symbol.toLowerCase()}_${orderId}`,
+      symbol: pending.symbol,
+      venue,
+      environment: this.snapshot.transport.environment,
+      accountMode: this.snapshot.accountMode,
+      lifecycle: 'CANCEL',
+      side: pending.side,
+      binanceSide: pending.side === 'Long' ? 'BUY' : 'SELL',
+      positionSide: venue === 'Futures' ? 'BOTH' : 'LONG',
+      orderType: pending.orderMethod === 'LIMIT_MAKER' ? 'LIMIT_MAKER' : 'LIMIT',
+      uiOrderType: pending.orderType,
+      execType: 'TRADE',
+      orderStatus: 'CANCELED',
+      timeInForce: pending.timeInForce,
+      price: pending.limitPrice,
+      entryPrice: pending.limitPrice,
+      origQty: qty,
+      executedQty: 0,
+      cummulativeQuoteQty: 0,
+      commission: 0,
+      commissionAsset: 'USDT',
+      isMaker: pending.orderMethod === 'LIMIT_MAKER',
+      leverage: venue === 'Futures' ? this.config.trading.leverage : 1,
+      marginType: this.config.trading.marginType,
+      realizedPnlUsdt: null,
+      rMultiple: null,
+      exitReason: 'Canceled',
+      strategyRationale: reason,
+      transactTime: nowMs,
+    };
+    this.snapshot.executionHistory.unshift(rec);
+    this.snapshot.executionHistory = this.snapshot.executionHistory.slice(0, 120);
+  }
+
   recordExternalLiveOrder(
     input: ManualOrderInput,
     note: string,
@@ -693,6 +796,7 @@ export class SimulationRuntime {
       executedQty?: number;
       avgPrice?: number;
       commission?: number;
+      baseCommission?: number;
       commissionAsset?: string;
       orderId?: string;
       ocoOrderListId?: number;
@@ -707,27 +811,30 @@ export class SimulationRuntime {
     const slDist =
       input.stopLossMode === 'ATR' && this.config.features.atrDynamicExits
         ? atr * this.config.exits.atrSlMultiplier
-        : entryPrice * (Math.max(0.2, input.stopLossPct) / 100);
+        : entryPrice * (Math.max(0.2, input.stopLossPct ?? 2.0) / 100);
     const initialSl = input.side === 'Long' ? entryPrice - slDist : entryPrice + slDist;
     const rawQty =
       fillDetails?.executedQty && fillDetails.executedQty > 0
         ? fillDetails.executedQty
-        : input.usdtAmount / Math.max(entryPrice, 1e-6);
+        : input.usdtAmount / Math.max(entryPrice, 1e-9);
     const knownQuotes = ['USDT', 'USDC', 'FDUSD', 'TUSD', 'BUSD', 'BNB', 'ETH', 'BTC'];
     const upperSym = input.symbol.toUpperCase();
     const matchedQuote = knownQuotes.find((q) => upperSym.length > q.length && upperSym.endsWith(q));
     const baseAsset = matchedQuote ? upperSym.slice(0, upperSym.length - matchedQuote.length) : upperSym;
     const commAssetUpper = fillDetails?.commissionAsset?.trim().toUpperCase();
     const baseCommissionDeducted =
-      this.config.trading.venue === 'Spot' &&
-      commAssetUpper === baseAsset &&
-      typeof fillDetails?.commission === 'number' &&
-      fillDetails.commission > 0
-        ? fillDetails.commission
+      this.config.trading.venue === 'Spot'
+        ? typeof fillDetails?.baseCommission === 'number' && fillDetails.baseCommission > 0
+          ? fillDetails.baseCommission
+          : commAssetUpper === baseAsset &&
+              typeof fillDetails?.commission === 'number' &&
+              fillDetails.commission > 0
+            ? fillDetails.commission
+            : 0
         : 0;
     const qty = rawQty;
     const remainingQuantity = Math.max(0, rawQty - baseCommissionDeducted);
-    const cleanTargets: TakeProfitTarget[] = input.targets
+    const cleanTargets: TakeProfitTarget[] = (Array.isArray(input.targets) ? input.targets : [])
       .filter((t) => t.pctOffset > 0 && t.allocationPct > 0)
       .map((t, idx) => ({
         id: `live-tp-${idx + 1}`,
@@ -761,6 +868,28 @@ export class SimulationRuntime {
       externalCommission: fillDetails?.commission,
     });
 
+    const isUsdStableComm =
+      !commAssetUpper ||
+      commAssetUpper === 'USDT' ||
+      commAssetUpper === 'USDC' ||
+      commAssetUpper === 'FDUSD' ||
+      commAssetUpper === 'BUSD' ||
+      commAssetUpper === 'TUSD';
+    let feePaidUsdt = entryRec.commission;
+    if (baseCommissionDeducted > 0) {
+      feePaidUsdt = baseCommissionDeducted * entryPrice;
+    } else if (fillDetails?.commission !== undefined && fillDetails.commission > 0) {
+      if (isUsdStableComm) {
+        feePaidUsdt = fillDetails.commission;
+      } else {
+        const commPair = this.snapshot.pairs.find((p) => p.symbol === `${commAssetUpper}USDT`);
+        feePaidUsdt =
+          commPair && commPair.lastPrice > 0
+            ? fillDetails.commission * commPair.lastPrice
+            : entryRec.commission;
+      }
+    }
+
     pair.openPosition = {
       id: `${input.symbol}-live-${nowMs}`,
       symbol: input.symbol,
@@ -774,10 +903,7 @@ export class SimulationRuntime {
           : entryPrice * remainingQuantity,
       unrealizedPnlUsdt: 0,
       realizedPnlUsdt: 0,
-      feePaidUsdt:
-        fillDetails?.commission !== undefined && fillDetails.commission > 0
-          ? fillDetails.commission
-          : entryRec.commission,
+      feePaidUsdt,
       commissionAsset: fillDetails?.commissionAsset ?? 'USDT',
       highestFavorablePrice: entryPrice,
       exitPlan: {
@@ -808,7 +934,8 @@ export class SimulationRuntime {
     limitPrice: number,
     exchangeOrderId: string | undefined,
     note: string,
-    nowMs = Date.now()
+    nowMs = Date.now(),
+    source: 'auto' | 'manual' = 'manual'
   ): void {
     const pending: PendingOrder = {
       id: `${input.symbol}-live-lim-${nowMs}`,
@@ -827,6 +954,8 @@ export class SimulationRuntime {
       targets: input.targets,
       createdAtMs: nowMs,
       exchangeOrderId,
+      source,
+      createdBarIndex: this.closedBarCounts.get(input.symbol) ?? 0,
     };
     this.snapshot.pendingOrders.unshift(pending);
     this.pushLog('info', note);
@@ -913,12 +1042,15 @@ export class SimulationRuntime {
     const ep = SimulationRuntime.resolveEndpoints(this.snapshot.transport.environment, venue);
     this.snapshot.transport.wsEndpoint = ep.wsEndpoint;
     this.snapshot.transport.restEndpoint = ep.restEndpoint;
-    if (venue === 'Futures' && this.config.automation.directionPolicy === 'long_only') {
+    if (venue === 'Spot') {
+      this.config.automation.directionPolicy = 'long_only';
+      this.config.automation.autoFlipOnReversal = false;
+    } else if (venue === 'Futures' && this.config.automation.directionPolicy === 'long_only') {
       this.config.automation.directionPolicy = 'both';
     }
     this.pushLog(
       'info',
-      `Switched execution venue to Binance ${venue}${venue === 'Futures' ? ` (${this.config.trading.leverage}x ${this.config.trading.marginType})` : ''}`
+      `Switched execution venue to Binance ${venue}${venue === 'Futures' ? ` (${this.config.trading.leverage}x ${this.config.trading.marginType})` : ' (Long-Only Enforced)'}`
     );
   }
 
@@ -1071,13 +1203,21 @@ export class SimulationRuntime {
     return alert;
   }
 
-  cancelPendingOrder(orderId: string): boolean {
+  cancelPendingOrder(orderId: string, reason?: string, nowMs = this.lastClockMs): boolean {
     const idx = this.snapshot.pendingOrders.findIndex((o) => o.id === orderId);
     if (idx === -1) return false;
     const [removed] = this.snapshot.pendingOrders.splice(idx, 1);
-    this.pushLog('info', `Cancelled resting ${removed.orderType} order on ${removed.symbol} @ $${removed.limitPrice.toFixed(2)}`);
+    const note =
+      reason?.trim() ||
+      `Cancelled resting ${removed.orderType} order on ${removed.symbol} @ $${removed.limitPrice.toFixed(2)}`;
+    this.recordCanceledPendingExecution(removed, note, nowMs);
+    this.pushLog('info', note);
     this.syncRiskToSnapshot();
     return true;
+  }
+
+  confirmLivePendingCanceled(pendingOrderId: string, reason: string, nowMs = Date.now()): boolean {
+    return this.cancelPendingOrder(pendingOrderId, reason, nowMs);
   }
 
   private settleClosedExit(params: {
@@ -1172,6 +1312,12 @@ export class SimulationRuntime {
     const isPartial = ratio < 0.999 && pos.remainingQuantity - closeQty > 1e-9;
     if (reason === 'TakeProfit1') {
       pos.exitPlan.tp1Hit = true;
+      if (pos.exitPlan.tpTargets && pos.exitPlan.tpTargets.length > 0) {
+        const nextUnhit = pos.exitPlan.tpTargets.find((t) => !t.hit);
+        if (nextUnhit) {
+          nextUnhit.hit = true;
+        }
+      }
       if (isPartial) {
         pos.exchangeListId = undefined;
       }
@@ -1225,16 +1371,61 @@ export class SimulationRuntime {
     if (activeVenue === 'Futures' && !this.config.features.futuresMarket) {
       return { ok: false, reason: 'Binance Futures market trading is toggled off in Feature Toggles.' };
     }
+    if (activeVenue === 'Spot' && input.side === 'Short' && !input.reduceOnly) {
+      return {
+        ok: false,
+        reason: 'Short entries are disabled on Binance Spot (Long-Only). Switch venue to USD-M Futures for Short orders.',
+      };
+    }
 
     const pair = this.snapshot.pairs.find((p) => p.symbol === input.symbol);
     if (!pair) {
       return { ok: false, reason: `Unknown pair ${input.symbol}` };
     }
-    if (pair.openPosition) {
-      return { ok: false, reason: `${input.symbol} already has an open position` };
-    }
     if (!Number.isFinite(input.usdtAmount) || input.usdtAmount <= 0) {
       return { ok: false, reason: 'Order allocation must be greater than $0' };
+    }
+
+    if (input.reduceOnly) {
+      const existing = pair.openPosition;
+      if (!existing) {
+        return { ok: false, reason: `No open position to reduce on ${input.symbol}` };
+      }
+      const isOppositeDirection =
+        (existing.side === 'Long' && input.side === 'Short') ||
+        (existing.side === 'Short' && input.side === 'Long');
+      if (!isOppositeDirection) {
+        return {
+          ok: false,
+          reason: `Reduce-Only order on ${input.symbol} must be opposite to open ${existing.side} position`,
+        };
+      }
+      const isLimitOrder = input.orderType === 'LIMIT' || input.orderType === 'LIMIT MAKER';
+      const exitPx =
+        isLimitOrder && typeof input.limitPrice === 'number' && input.limitPrice > 0
+          ? input.limitPrice
+          : pair.lastPrice;
+      const requestedQty = exitPx > 0 ? input.usdtAmount / exitPx : existing.remainingQuantity;
+      const closeQty = Math.min(existing.remainingQuantity, Math.max(0, requestedQty));
+      const isPartial = existing.remainingQuantity - closeQty > 1e-9;
+      this.settleClosedExit({
+        pair,
+        pos: existing,
+        closeQty,
+        exitPrice: exitPx,
+        reason: 'ManualClose',
+        isPartial,
+        isMakerExit: input.orderType === 'LIMIT MAKER',
+        rationale: `Manual Reduce-Only ${input.orderType} on ${input.symbol} @ $${exitPx.toFixed(pricePrecisionDecimals(exitPx))}`,
+        tradeIdSuffix: 'reduce',
+        nowMs,
+      });
+      this.syncRiskToSnapshot();
+      return { ok: true, position: pair.openPosition ?? undefined };
+    }
+
+    if (pair.openPosition) {
+      return { ok: false, reason: `${input.symbol} already has an open position` };
     }
 
     const isLimitOrder = input.orderType === 'LIMIT' || input.orderType === 'LIMIT MAKER';
@@ -1267,6 +1458,11 @@ export class SimulationRuntime {
     const openCount =
       this.snapshot.pairs.filter((p) => p.openPosition !== null).length +
       this.snapshot.pendingOrders.length;
+    if (openCount >= this.config.trading.maxConcurrentPositions) {
+      const reason = 'Max concurrent positions reached';
+      this.pushLog('warn', `Manual order rejected (${input.symbol}): ${reason}`);
+      return { ok: false, reason };
+    }
     if (this.config.features.circuitBreaker) {
       const auth = this.riskManager.authorizeEntry(input.symbol, entryPrice, initialSl, openCount, nowMs);
       if (!auth.ok) {
@@ -1307,12 +1503,14 @@ export class SimulationRuntime {
         usdtAmount: cappedUsdt,
         limitPrice: requestedLimit,
         timeInForce: tif,
-        stopLossMode: input.stopLossMode,
-        stopLossPct: input.stopLossPct,
-        useBreakEven: input.useBreakEven,
-        useTrailingStop: input.useTrailingStop,
-        targets: input.targets,
+        stopLossMode: input.stopLossMode ?? 'MARKET',
+        stopLossPct: input.stopLossPct ?? 2.0,
+        useBreakEven: input.useBreakEven ?? true,
+        useTrailingStop: input.useTrailingStop ?? true,
+        targets: Array.isArray(input.targets) ? input.targets : [],
         createdAtMs: nowMs,
+        source: 'manual',
+        createdBarIndex: this.closedBarCounts.get(input.symbol) ?? 0,
       };
       this.snapshot.pendingOrders.unshift(pending);
       this.pushLog(
@@ -1354,11 +1552,11 @@ export class SimulationRuntime {
     const slDist =
       input.stopLossMode === 'ATR' && this.config.features.atrDynamicExits
         ? atr * this.config.exits.atrSlMultiplier
-        : entryPrice * (Math.max(0.2, input.stopLossPct) / 100);
+        : entryPrice * (Math.max(0.2, input.stopLossPct ?? 2.0) / 100);
     const initialSl = input.side === 'Long' ? entryPrice - slDist : entryPrice + slDist;
-    const quantity = cappedUsdt / Math.max(entryPrice, 1e-6);
+    const quantity = cappedUsdt / Math.max(entryPrice, 1e-9);
 
-    const cleanTargets: TakeProfitTarget[] = input.targets
+    const cleanTargets: TakeProfitTarget[] = (Array.isArray(input.targets) ? input.targets : [])
       .filter((t) => t.pctOffset > 0 && t.allocationPct > 0)
       .map((t, idx) => ({
         id: `tp-${idx + 1}`,
@@ -1452,10 +1650,184 @@ export class SimulationRuntime {
     this.syncRiskToSnapshot();
   }
 
+  updatePairBookTicker(symbol: string, bestBid: number, bestAsk: number): void {
+    const clean = symbol.trim().toUpperCase();
+    const pair = this.snapshot.pairs.find((p) => p.symbol === clean);
+    if (!pair || bestBid <= 0 || bestAsk <= 0 || bestAsk < bestBid) return;
+    const mid = (bestBid + bestAsk) * 0.5;
+    pair.bestBid = bestBid;
+    pair.bestAsk = bestAsk;
+    pair.spreadBps = mid > 0 ? ((bestAsk - bestBid) / mid) * 10_000 : 0;
+  }
+
+  hydrateSymbolCandles(
+    symbol: string,
+    candles: Candle[],
+    options?: { resetPipeline?: boolean }
+  ): void {
+    const clean = symbol.trim().toUpperCase();
+    const pair = this.snapshot.pairs.find((p) => p.symbol === clean);
+    if (!pair || candles.length === 0) return;
+
+    const sorted = candles
+      .slice()
+      .sort((a, b) => a.openTimeMs - b.openTimeMs)
+      .slice(-240);
+    const pipe =
+      options?.resetPipeline !== false
+        ? new IndicatorPipeline(this.config.indicators)
+        : this.pipelines.get(clean) ?? new IndicatorPipeline(this.config.indicators);
+
+    const hist: PairRuntimeState['indicatorHistory'] = [];
+    let closedCount = 0;
+    let prevOpenMs: number | null = null;
+    for (const c of sorted) {
+      if (c.isClosed) {
+        const gap = hasCandleSequenceGap(prevOpenMs, c.openTimeMs, this.config.trading.timeframe);
+        hist.push(pipe.update(c, gap));
+        prevOpenMs = c.openTimeMs;
+        closedCount += 1;
+      } else {
+        hist.push(pipe.snapshot());
+      }
+    }
+    this.pipelines.set(clean, pipe);
+    this.closedBarCounts.set(clean, closedCount);
+    const firstClose = sorted[0]?.close ?? pair.lastPrice;
+    const latestClose = sorted[sorted.length - 1]?.close ?? pair.lastPrice;
+    pair.candles = sorted;
+    pair.indicatorHistory = hist;
+    pair.indicators = pipe.snapshot();
+    pair.barsWarmedUp = pipe.snapshot().warmupBarsCount ?? closedCount;
+    if (latestClose > 0) {
+      pair.lastPrice = latestClose;
+      pair.change24hPct = firstClose > 0 ? ((latestClose - firstClose) / firstClose) * 100 : 0;
+    }
+  }
+
+  syncWatchlistPairs(
+    screenerTickers: MarketTicker24h[] = this.lastScreenerTickers,
+    tradableSymbols: string[] = Array.from(this.tradableSymbolsSet),
+    nowMs = Date.now()
+  ): { addedSymbols: string[]; removedSymbols: string[]; activeSymbols: string[] } {
+    if (screenerTickers.length > 0) {
+      this.lastScreenerTickers = screenerTickers;
+    }
+    if (tradableSymbols.length > 0) {
+      this.tradableSymbolsSet = new Set(tradableSymbols.map((s) => s.trim().toUpperCase()).filter(Boolean));
+    }
+    const mode = this.config.trading.pairSelectionMode ?? 'hybrid';
+    const pinnedPairs = normalizeSymbolList(this.config.trading.pairs, []);
+    const protectedSymbols = Array.from(
+      new Set([
+        ...this.snapshot.pairs.filter((p) => p.openPosition !== null).map((p) => p.symbol),
+        ...this.snapshot.pendingOrders.map((o) => o.symbol),
+      ])
+    );
+    const currentTrending = this.snapshot.pairs
+      .filter((p) => p.sourceTag === 'trending')
+      .map((p) => p.symbol);
+
+    const resolved = resolveEffectiveWatchlist({
+      mode,
+      pinnedPairs,
+      trendingTickers: this.lastScreenerTickers,
+      protectedSymbols,
+      currentlyActiveTrending: currentTrending,
+      dwellState: this.watchlistDwellState,
+      tradableVenueSymbols: this.tradableSymbolsSet.size > 0 ? this.tradableSymbolsSet : undefined,
+      tradingCfg: this.config.trading,
+      nowMs,
+    });
+
+    const tickerBySym = new Map<string, MarketTicker24h>();
+    for (const t of this.lastScreenerTickers) {
+      tickerBySym.set(t.symbol, t);
+    }
+    const existingBySym = new Map<string, PairRuntimeState>();
+    for (const p of this.snapshot.pairs) {
+      existingBySym.set(p.symbol, p);
+    }
+
+    const addedSymbols: string[] = [];
+    const nextPairs: PairRuntimeState[] = [];
+    for (const entry of resolved) {
+      const ticker = tickerBySym.get(entry.symbol);
+      const existing = existingBySym.get(entry.symbol);
+      if (existing) {
+        existing.sourceTag = entry.sourceTag;
+        existing.tradableOnActiveVenue =
+          this.tradableSymbolsSet.size === 0 || this.tradableSymbolsSet.has(entry.symbol);
+        if (ticker) {
+          existing.quoteVolume24hUsdt = ticker.quoteVolume;
+        }
+        nextPairs.push(existing);
+      } else {
+        addedSymbols.push(entry.symbol);
+        const isLiveOrRealTicker =
+          this.snapshot.transport.feedSource === 'BinanceLive' ||
+          this.snapshot.accountMode === 'Live' ||
+          Boolean(ticker);
+        const candles = isLiveOrRealTicker
+          ? []
+          : generateSeedCandles(entry.symbol, 220, nowMs);
+        const pipe = new IndicatorPipeline(this.config.indicators);
+        const indicatorHistory = candles.map((c) => pipe.update(c));
+        this.pipelines.set(entry.symbol, pipe);
+        if (!this.rngMap.has(entry.symbol)) {
+          const seed = entry.symbol.split('').reduce((acc, ch) => acc * 37 + ch.charCodeAt(0), 19);
+          this.rngMap.set(entry.symbol, mulberry32(seed));
+        }
+        const seedPx = ticker?.lastPrice ?? candles[candles.length - 1]?.close ?? 0;
+        nextPairs.push({
+          symbol: entry.symbol,
+          candles,
+          indicatorHistory,
+          lastPrice: seedPx,
+          change24hPct: ticker?.priceChangePercent ?? 0,
+          dailyPnlUsdt: this.riskManager.getPairDailyPnl(entry.symbol),
+          dailyPnlPct:
+            (this.riskManager.getPairDailyPnl(entry.symbol) /
+              Math.max(1, this.snapshot.risk.startingDailyEquity)) *
+            100,
+          indicators: pipe.snapshot(),
+          openPosition: null,
+          lastSignalNote: isLiveOrRealTicker ? 'Warming up 220 historical bars…' : null,
+          sourceTag: entry.sourceTag,
+          tradableOnActiveVenue:
+            this.tradableSymbolsSet.size === 0 || this.tradableSymbolsSet.has(entry.symbol),
+          quoteVolume24hUsdt: ticker?.quoteVolume,
+          barsWarmedUp: candles.length,
+        });
+      }
+    }
+
+    const activeSet = new Set(nextPairs.map((p) => p.symbol));
+    const removedSymbols = this.snapshot.pairs
+      .map((p) => p.symbol)
+      .filter((s) => !activeSet.has(s));
+
+    this.snapshot.pairs = nextPairs;
+    this.syncRiskToSnapshot();
+    return {
+      addedSymbols,
+      removedSymbols,
+      activeSymbols: resolved.map((e) => e.symbol),
+    };
+  }
+
   updateConfig(nextConfig: BotConfig): void {
     const prevVenue = this.config.trading.venue;
+    const prevPairs = JSON.stringify(this.config.trading.pairs);
+    const prevMode = this.config.trading.pairSelectionMode ?? 'hybrid';
+    const prevTopN = this.config.trading.trendingTopN;
+    const prevCat = this.config.trading.trendingCategory;
     this.config = structuredClone(nextConfig);
     this.config.automation.enabled = this.config.features.automatedTrading;
+    if (this.config.trading.venue === 'Spot') {
+      this.config.automation.directionPolicy = 'long_only';
+      this.config.automation.autoFlipOnReversal = false;
+    }
     this.riskManager.updateConfigs(this.config.risk, this.config.trading);
     if (prevVenue !== this.config.trading.venue) {
       this.snapshot.transport.venue = this.config.trading.venue;
@@ -1465,6 +1837,15 @@ export class SimulationRuntime {
       );
       this.snapshot.transport.wsEndpoint = ep.wsEndpoint;
       this.snapshot.transport.restEndpoint = ep.restEndpoint;
+    }
+    if (
+      prevPairs !== JSON.stringify(this.config.trading.pairs) ||
+      prevMode !== (this.config.trading.pairSelectionMode ?? 'hybrid') ||
+      prevTopN !== this.config.trading.trendingTopN ||
+      prevCat !== this.config.trading.trendingCategory ||
+      prevVenue !== this.config.trading.venue
+    ) {
+      this.syncWatchlistPairs(this.lastScreenerTickers, Array.from(this.tradableSymbolsSet));
     }
     this.snapshot.risk = this.riskManager.status();
   }
@@ -1520,6 +1901,20 @@ export class SimulationRuntime {
   }
 
   flattenAllPositions(nowMs = this.lastClockMs): void {
+    const canceledList = this.snapshot.pendingOrders.splice(0, this.snapshot.pendingOrders.length);
+    if (canceledList.length > 0) {
+      for (const pending of canceledList) {
+        this.recordCanceledPendingExecution(
+          pending,
+          `Circuit Breaker emergency flatten canceled resting ${pending.orderType} order on ${pending.symbol}`,
+          nowMs
+        );
+      }
+      this.pushLog(
+        'warn',
+        `Canceled ${canceledList.length} resting pending order(s) during emergency flatten`
+      );
+    }
     for (const pair of this.snapshot.pairs) {
       if (pair.openPosition) {
         this.settleClosedExit({
@@ -1584,7 +1979,7 @@ export class SimulationRuntime {
         const wave = Math.sin(this.snapshot.tickCount / 7 + pair.symbol.length) * 0.0024;
         const impulse = (rand() - 0.47) * 0.0052;
         const open = prev.close;
-        const close = Math.max(0.01, open * (1 + wave + impulse));
+        const close = Math.max(1e-8, open * (1 + wave + impulse));
         const high = Math.max(open, close) + open * rand() * 0.0026;
         const low = Math.min(open, close) - open * rand() * 0.0026;
         nextCandle = {
@@ -1608,22 +2003,36 @@ export class SimulationRuntime {
 
       if (existingIdx !== -1) {
         const wasClosed = pair.candles[existingIdx].isClosed;
+        const prevClosed = [...pair.candles.slice(0, existingIdx)].reverse().find((c) => c.isClosed);
         const updatedCandles = pair.candles.slice();
         updatedCandles[existingIdx] = nextCandle;
         pair.candles = updatedCandles;
         if (nextCandle.isClosed && !wasClosed) {
           isNewlyClosedBar = true;
-          ind = pipe.update(nextCandle);
+          const gap = hasCandleSequenceGap(
+            prevClosed?.openTimeMs,
+            nextCandle.openTimeMs,
+            this.config.trading.timeframe
+          );
+          ind = pipe.update(nextCandle, gap);
           const updatedHist = pair.indicatorHistory.slice();
           updatedHist[existingIdx] = ind;
           pair.indicatorHistory = updatedHist;
         }
       } else {
+        const prevClosed = [...pair.candles].reverse().find((c) => c.isClosed);
         pair.candles = [...pair.candles.slice(-219), nextCandle];
         // Never mutate stateful EMA/RSI/ATR/ADX/VWAP accumulators on unclosed forming bars
         if (nextCandle.isClosed) {
           isNewlyClosedBar = true;
-          ind = pipe.update(nextCandle);
+          const gap =
+            Boolean(externalBar) &&
+            hasCandleSequenceGap(
+              prevClosed?.openTimeMs,
+              nextCandle.openTimeMs,
+              this.config.trading.timeframe
+            );
+          ind = pipe.update(nextCandle, gap);
         } else {
           ind = pipe.snapshot();
         }
@@ -1635,6 +2044,7 @@ export class SimulationRuntime {
       }
 
       pair.indicators = ind;
+      pair.barsWarmedUp = ind.warmupBarsCount ?? pair.barsWarmedUp ?? pair.candles.length;
       pair.lastPrice = nextCandle.close;
       const firstClose = pair.candles[0]?.close ?? nextCandle.close;
       pair.change24hPct = ((nextCandle.close - firstClose) / firstClose) * 100;
@@ -1647,6 +2057,67 @@ export class SimulationRuntime {
           prevCandle?.close ?? nextCandle.open,
           nowMs
         );
+      }
+
+      // Compute opposite/reversal candidate signal on closed bars (with enforceVenueLongOnly=false strictly
+      // so Spot Long positions/orders can exit/cancel on bearish reversal without ever opening Short).
+      const closedBarIdx = this.closedBarCounts.get(pair.symbol) ?? 0;
+      const oppSigClosed = isNewlyClosedBar
+        ? evaluateEntrySignal(pair.symbol, nextCandle, ind, this.config.trading, this.config.indicators, nowMs, {
+            strategyProfile: this.config.automation.strategyProfile,
+            directionPolicy: 'both',
+            recentCandles: pair.candles,
+            features: this.config.features,
+            spreadBps: pair.spreadBps,
+            enforceVenueLongOnly: false,
+          })
+        : null;
+
+      // Dynamic resting pending limit order management on closed bars
+      if (isNewlyClosedBar) {
+        const matchingPendings = this.snapshot.pendingOrders.filter(
+          (o) => o.symbol === pair.symbol && (!o.venue || o.venue === this.config.trading.venue)
+        );
+        for (const pendingOrder of matchingPendings) {
+          const dynPend = evaluatePendingOrderDynamicAction({
+            pending: pendingOrder,
+            candle: nextCandle,
+            ind,
+            automationCfg: this.config.automation,
+            currentBarIndex: closedBarIdx,
+            opposingSignal: oppSigClosed,
+          });
+          if (dynPend.type === 'Cancel') {
+            if (dynPend.reason === 'SignalReversed') {
+              this.reversalBypassCooldownSide.set(
+                pair.symbol,
+                pendingOrder.side === 'Long' ? 'Short' : 'Long'
+              );
+            }
+            if (this.snapshot.accountMode === 'Live') {
+              const alreadyQueued = this.pendingLiveIntents.some(
+                (i) => i.kind === 'CANCEL_PENDING' && i.pendingOrderId === pendingOrder.id
+              );
+              if (!alreadyQueued) {
+                this.pendingLiveIntents.push({
+                  id: `live-cancel-pend-${pair.symbol}-${nowMs}`,
+                  kind: 'CANCEL_PENDING',
+                  symbol: pair.symbol,
+                  side: pendingOrder.side,
+                  binanceSide: pendingOrder.side === 'Long' ? 'BUY' : 'SELL',
+                  orderMethod: pendingOrder.orderMethod,
+                  usdtAmount: pendingOrder.usdtAmount,
+                  timeInForce: pendingOrder.timeInForce,
+                  reason: dynPend.rationale,
+                  exchangeOrderId: pendingOrder.exchangeOrderId,
+                  pendingOrderId: pendingOrder.id,
+                });
+              }
+            } else {
+              this.cancelPendingOrder(pendingOrder.id, dynPend.rationale, nowMs);
+            }
+          }
+        }
       }
 
       // 0. Check resting LIMIT / LIMIT_MAKER orders for Paper fills
@@ -1682,23 +2153,149 @@ export class SimulationRuntime {
         }
       }
 
-      // 1. Manage existing open position (evaluates every price tick including forming bars)
+      // 1. Manage existing open position (evaluates every price tick 24/7 including outside session windows)
       if (pair.openPosition) {
         const pos = pair.openPosition;
-        const atrVal = ind.atr ?? pos.exitPlan.riskDistanceR;
-        const prevTp1Hit = pos.exitPlan.tp1Hit;
-        const action = managePositionTick(
-          pos,
-          nextCandle.close,
-          atrVal,
-          this.config.exits,
-          this.config.features
-        );
+        let handledEarlyExit = false;
+
+        if (isNewlyClosedBar) {
+          const dynPos = evaluateOpenPositionDynamicAction({
+            pos,
+            candle: nextCandle,
+            ind,
+            automationCfg: this.config.automation,
+            opposingSignal: oppSigClosed,
+          });
+          if (dynPos.type === 'TightenTrailing') {
+            this.trailingTightenFactor.set(pair.symbol, dynPos.factor);
+            this.pushLog('info', `${pair.symbol}: ${dynPos.rationale}`);
+          } else if (dynPos.type === 'EarlyReversalExit') {
+            handledEarlyExit = true;
+            const opp = dynPos.opposingSignal;
+            const canAutoFlip =
+              Boolean(this.config.automation.autoFlipOnReversal) &&
+              sessionCheck.allowed &&
+              this.config.trading.venue === 'Futures' &&
+              (this.config.automation.directionPolicy === 'both' ||
+                (this.config.automation.directionPolicy === 'long_only' && opp.side === 'Long') ||
+                (this.config.automation.directionPolicy === 'short_only' && opp.side === 'Short'));
+
+            if (this.snapshot.accountMode === 'Live') {
+              if (
+                this.config.automation.autoCloseOnExit &&
+                !this.pendingLiveIntents.some((i) => i.kind === 'EXIT' && i.symbol === pair.symbol)
+              ) {
+                let flipAfterExit: LiveAutoIntent['flipAfterExit'];
+                if (canAutoFlip) {
+                  this.reversalBypassCooldownSide.set(pair.symbol, opp.side);
+                  const flipPlan = buildExitPlan(opp.side, opp.entryPrice, opp.atr, this.config.exits, this.config.features);
+                  const notional = Math.max(10, this.config.automation.autoOrderNotionalUsdt || 150);
+                  const flipMethod = this.config.automation.orderMethod;
+                  const flipOrderType: ManualOrderInput['orderType'] =
+                    flipMethod === 'LIMIT_MAKER'
+                      ? 'LIMIT MAKER'
+                      : flipMethod === 'LIMIT'
+                        ? 'LIMIT'
+                        : 'MARKET';
+                  const flipOffsetFrac = Math.max(0, this.config.automation.limitOffsetBps) / 10_000;
+                  const flipDecimals = pricePrecisionDecimals(opp.entryPrice);
+                  const flipLimitPrice =
+                    flipMethod === 'LIMIT' || flipMethod === 'LIMIT_MAKER'
+                      ? opp.side === 'Long'
+                        ? Number((opp.entryPrice * (1 - flipOffsetFrac)).toFixed(flipDecimals))
+                        : Number((opp.entryPrice * (1 + flipOffsetFrac)).toFixed(flipDecimals))
+                      : undefined;
+                  flipAfterExit = {
+                    side: opp.side,
+                    reason: `Futures auto-flip after SignalReversal (${opp.rationale})`,
+                    input: {
+                      symbol: pair.symbol,
+                      orderType: flipOrderType,
+                      side: opp.side,
+                      usdtAmount: notional,
+                      limitPrice: flipLimitPrice,
+                      timeInForce: this.config.automation.timeInForce,
+                      workingType: 'MARK_PRICE',
+                      stopLossMode: 'ATR',
+                      stopLossPct: opp.entryPrice > 0 ? Number(((flipPlan.riskDistanceR / opp.entryPrice) * 100).toFixed(3)) : 1.5,
+                      useBreakEven: true,
+                      useTrailingStop: true,
+                      targets: [{ pctOffset: 2.25, allocationPct: 50 }, { pctOffset: 3.75, allocationPct: 50 }],
+                    },
+                  };
+                }
+                this.pendingLiveIntents.push({
+                  id: `live-rev-exit-${pair.symbol}-${nowMs}`,
+                  kind: 'EXIT',
+                  symbol: pair.symbol,
+                  side: pos.side,
+                  binanceSide: pos.side === 'Long' ? 'SELL' : 'BUY',
+                  orderMethod: 'MARKET',
+                  usdtAmount: pos.remainingQuantity * nextCandle.close,
+                  quantity: pos.remainingQuantity,
+                  timeInForce: 'GTC',
+                  reason: dynPos.reason,
+                  flipAfterExit,
+                });
+              }
+            } else {
+              this.trailingTightenFactor.delete(pair.symbol);
+              const { pnl, rMult } = this.settleClosedExit({
+                pair,
+                pos,
+                closeQty: pos.remainingQuantity,
+                exitPrice: nextCandle.close,
+                reason: 'SignalReversal',
+                isPartial: false,
+                isMakerExit: false,
+                rationale: dynPos.rationale,
+                tradeIdSuffix: 'rev',
+                nowMs,
+              });
+              this.pushLog('info', `${pair.symbol} SignalReversal exit ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${rMult.toFixed(2)}R)`);
+              if (
+                this.config.features.circuitBreaker &&
+                this.config.risk.flattenOnCircuitBreaker &&
+                this.riskManager.status().state === 'Halted'
+              ) {
+                this.flattenAllPositions(nowMs);
+                break;
+              }
+              if (canAutoFlip) {
+                this.reversalBypassCooldownSide.set(pair.symbol, opp.side);
+                this.evaluateAutoPair(pair, nextCandle, ind, nowMs, true);
+              }
+            }
+          }
+        }
+
+        if (!handledEarlyExit && pair.openPosition) {
+          const atrVal = ind.atr ?? pos.exitPlan.riskDistanceR;
+          const prevTp1Hit = pos.exitPlan.tp1Hit;
+          const prevTargetHits = pos.exitPlan.tpTargets?.map((t) => t.hit);
+          const tightenFactor = this.trailingTightenFactor.get(pair.symbol);
+          const effectiveTrailOverride =
+            tightenFactor !== undefined
+              ? this.config.exits.atrTrailingMultiplier * tightenFactor
+              : undefined;
+          const action = managePositionTick(
+            pos,
+            nextCandle.close,
+            atrVal,
+            this.config.exits,
+            this.config.features,
+            effectiveTrailOverride
+          );
 
         if (this.snapshot.accountMode === 'Live') {
-          if (action.type === 'PartialClose') {
-            // Do not mark TP1 hit until the exchange confirms the Live exit fill.
+          if (action.type === 'PartialClose' || action.type === 'FullClose') {
+            // Do not permanently mutate TP hit flags until the exchange confirms the Live exit fill.
             pos.exitPlan.tp1Hit = prevTp1Hit;
+            if (pos.exitPlan.tpTargets && prevTargetHits) {
+              pos.exitPlan.tpTargets.forEach((t, idx) => {
+                t.hit = prevTargetHits[idx] ?? false;
+              });
+            }
           }
           if (
             (action.type === 'PartialClose' || action.type === 'FullClose') &&
@@ -1753,6 +2350,7 @@ export class SimulationRuntime {
             tradeIdSuffix: 'exit',
             nowMs,
           });
+          this.trailingTightenFactor.delete(pair.symbol);
           this.pushLog(
             pnl >= 0 ? 'info' : 'warn',
             `${pair.symbol} closed (${action.reason}) ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${rMult.toFixed(2)}R)`
@@ -1764,6 +2362,7 @@ export class SimulationRuntime {
           ) {
             this.flattenAllPositions(nowMs);
           }
+        }
         }
       } else if (autoActive && isNewlyClosedBar) {
         if (sessionCheck.allowed) {
@@ -1870,7 +2469,8 @@ export class SimulationRuntime {
 
     const currentBarIdx = this.closedBarCounts.get(pair.symbol) ?? 0;
     const lastBarIdx = this.lastSignalBarIndex.get(pair.symbol) ?? -9999;
-    if (!ignoreCooldown && currentBarIdx - lastBarIdx < auto.signalCooldownBars) {
+    const bypassSide = this.reversalBypassCooldownSide.get(pair.symbol);
+    if (!ignoreCooldown && !bypassSide && currentBarIdx - lastBarIdx < auto.signalCooldownBars) {
       return { signalDetected: false, dispatched: false };
     }
 
@@ -1886,10 +2486,34 @@ export class SimulationRuntime {
         directionPolicy: auto.directionPolicy,
         recentCandles: pair.candles,
         features: this.config.features,
+        spreadBps: pair.spreadBps,
+        enforceVenueLongOnly: true,
       }
     );
 
     if (!sig) return { signalDetected: false, dispatched: false };
+
+    if (
+      !ignoreCooldown &&
+      currentBarIdx - lastBarIdx < auto.signalCooldownBars &&
+      bypassSide !== sig.side
+    ) {
+      return { signalDetected: false, dispatched: false };
+    }
+    if (bypassSide === sig.side) {
+      this.reversalBypassCooldownSide.delete(pair.symbol);
+    }
+
+    const maxSameDir = this.config.trading.maxSameDirectionPositions ?? 2;
+    if (maxSameDir > 0) {
+      const sameDirCount =
+        this.snapshot.pairs.filter((p) => p.openPosition?.side === sig.side).length +
+        this.snapshot.pendingOrders.filter((o) => o.side === sig.side).length;
+      if (sameDirCount >= maxSameDir) {
+        pair.lastSignalNote = `Blocked: max ${maxSameDir} same-direction (${sig.side}) positions reached`;
+        return { signalDetected: true, dispatched: false };
+      }
+    }
 
     this.snapshot.autoStats.signalsDetected += 1;
     this.lastSignalBarIndex.set(pair.symbol, currentBarIdx);
@@ -1904,6 +2528,10 @@ export class SimulationRuntime {
     const openCount =
       this.snapshot.pairs.filter((p) => p.openPosition !== null).length +
       this.snapshot.pendingOrders.length;
+    if (openCount >= this.config.trading.maxConcurrentPositions) {
+      pair.lastSignalNote = 'Blocked: Max concurrent positions reached';
+      return { signalDetected: true, dispatched: false };
+    }
     if (this.config.features.circuitBreaker) {
       const auth = this.riskManager.authorizeEntry(
         sig.symbol,
@@ -1979,10 +2607,11 @@ export class SimulationRuntime {
     }
 
     const offsetFrac = Math.max(0, auto.limitOffsetBps) / 10_000;
+    const limitDecimals = pricePrecisionDecimals(sig.entryPrice);
     const limitPrice =
       sig.side === 'Long'
-        ? Number((sig.entryPrice * (1 - offsetFrac)).toFixed(sig.entryPrice >= 100 ? 2 : 4))
-        : Number((sig.entryPrice * (1 + offsetFrac)).toFixed(sig.entryPrice >= 100 ? 2 : 4));
+        ? Number((sig.entryPrice * (1 - offsetFrac)).toFixed(limitDecimals))
+        : Number((sig.entryPrice * (1 + offsetFrac)).toFixed(limitDecimals));
 
     const orderType: ManualOrderInput['orderType'] =
       auto.orderMethod === 'LIMIT_MAKER'
@@ -2054,29 +2683,52 @@ export class SimulationRuntime {
 
     // Paper execution
     if (auto.orderMethod === 'LIMIT' || auto.orderMethod === 'LIMIT_MAKER') {
-      const pending: PendingOrder = {
-        id: `${sig.symbol}-auto-lim-${nowMs}`,
-        symbol: sig.symbol,
-        venue: this.config.trading.venue,
-        side: sig.side,
-        orderType,
-        orderMethod: auto.orderMethod,
-        usdtAmount: desiredNotional,
-        limitPrice,
-        timeInForce: auto.timeInForce,
-        stopLossMode: 'ATR',
-        stopLossPct: autoInput.stopLossPct,
-        useBreakEven: true,
-        useTrailingStop: true,
-        targets: autoInput.targets,
-        createdAtMs: nowMs,
-      };
-      this.snapshot.pendingOrders.unshift(pending);
-      this.pushLog(
-        'info',
-        `[AUTO · ${auto.strategyProfile}] Resting ${orderType} ${sig.symbol} ${sig.side} $${desiredNotional.toFixed(2)} @ $${limitPrice.toFixed(2)}`
-      );
-      this.snapshot.autoStats.lastActionSummary = `Paper ${orderType} ${sig.symbol} @ $${limitPrice.toFixed(2)}`;
+      const shouldRestAutoLimit =
+        auto.orderMethod === 'LIMIT_MAKER' ||
+        (sig.side === 'Long'
+          ? limitPrice < sig.entryPrice * 0.9999
+          : limitPrice > sig.entryPrice * 1.0001);
+      if (
+        shouldRestAutoLimit &&
+        auto.orderMethod === 'LIMIT' &&
+        (auto.timeInForce === 'IOC' || auto.timeInForce === 'FOK')
+      ) {
+        const reason = `[AUTO · ${auto.strategyProfile}] ${auto.timeInForce} LIMIT ${sig.symbol} @ $${limitPrice.toFixed(2)} did not cross market ($${sig.entryPrice.toFixed(2)}) and expired`;
+        this.pushLog('warn', reason);
+        pair.lastSignalNote = reason;
+        this.snapshot.autoStats.lastActionSummary = reason;
+        return { signalDetected: true, dispatched: false };
+      }
+      if (shouldRestAutoLimit) {
+        const pending: PendingOrder = {
+          id: `${sig.symbol}-auto-lim-${nowMs}`,
+          symbol: sig.symbol,
+          venue: this.config.trading.venue,
+          side: sig.side,
+          orderType,
+          orderMethod: auto.orderMethod,
+          usdtAmount: desiredNotional,
+          limitPrice,
+          timeInForce: auto.timeInForce,
+          stopLossMode: 'ATR',
+          stopLossPct: autoInput.stopLossPct,
+          useBreakEven: true,
+          useTrailingStop: true,
+          targets: autoInput.targets,
+          createdAtMs: nowMs,
+          source: 'auto',
+          createdBarIndex: currentBarIdx,
+        };
+        this.snapshot.pendingOrders.unshift(pending);
+        this.pushLog(
+          'info',
+          `[AUTO · ${auto.strategyProfile}] Resting ${orderType} ${sig.symbol} ${sig.side} $${desiredNotional.toFixed(2)} @ $${limitPrice.toFixed(2)}`
+        );
+        this.snapshot.autoStats.lastActionSummary = `Paper ${orderType} ${sig.symbol} @ $${limitPrice.toFixed(2)}`;
+      } else {
+        this.openPositionFromInput(pair, autoInput, sig.entryPrice, desiredNotional, nowMs, false);
+        this.snapshot.autoStats.lastActionSummary = `Paper ${orderType} ${sig.side} ${sig.symbol} $${desiredNotional.toFixed(2)} (immediate fill)`;
+      }
     } else {
       this.openPositionFromInput(pair, autoInput, sig.entryPrice, desiredNotional, nowMs, false);
       this.snapshot.autoStats.lastActionSummary = `Paper ${orderType} ${sig.side} ${sig.symbol} $${desiredNotional.toFixed(2)}`;
@@ -2095,9 +2747,10 @@ export class SimulationRuntime {
     const absLoss = Math.abs(lossUsdt);
     const pair = this.snapshot.pairs.find((p) => p.symbol === symbol);
     const refPrice = pair?.lastPrice ?? 100;
-    const entryPrice = Number((refPrice * 1.015).toFixed(2));
-    const exitPrice = Number(refPrice.toFixed(2));
-    const qty = Number((absLoss / Math.max(entryPrice - exitPrice, 0.01)).toFixed(4));
+    const dec = pricePrecisionDecimals(refPrice);
+    const entryPrice = Number((refPrice * 1.015).toFixed(dec));
+    const exitPrice = Number(refPrice.toFixed(dec));
+    const qty = Number((absLoss / Math.max(entryPrice - exitPrice, 1e-8)).toFixed(4));
     this.riskManager.recordRealizedPnl(symbol, -absLoss, nowMs);
     this.snapshot.recentTrades.unshift({
       id: `stress-${nowMs}`,

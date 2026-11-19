@@ -1,11 +1,14 @@
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import dotenv from 'dotenv';
 import express from 'express';
 import { OrderHistoryDatabase } from './src/engine/orderDatabase';
+import { BinanceScreenerHub } from './src/server/binanceScreenerHub';
+import { attachWebSocketRelay } from './src/server/wsRelay';
 import { validateRemoteBaseUrl } from './src/engine/apiClient';
 import {
   aggregateTradesByOrderId,
@@ -27,6 +30,8 @@ import type {
   OrderExecutionLog,
   OrphanResolutionAction,
   SyncLookbackPreset,
+  TrendingCategory,
+  TrendingRankingSource,
 } from './src/engine/types';
 
 dotenv.config();
@@ -340,6 +345,7 @@ const orderHistoryDb = new OrderHistoryDatabase({
   maxPaperQuota: 1000,
   seedInitialPaperLogs: buildInitialPaperOrderLogs,
 });
+const screenerHub = new BinanceScreenerHub();
 
 function maskApiKey(key: string): string | null {
   const clean = key.trim();
@@ -554,7 +560,8 @@ async function getSymbolFilters(
     // Fallback to heuristic precision below if exchangeInfo cannot be reached
   }
 
-  const tickDecimals = fallbackPrice >= 100 ? 2 : 4;
+  const tickDecimals =
+    fallbackPrice >= 100 ? 2 : fallbackPrice >= 1 ? 4 : fallbackPrice >= 0.01 ? 6 : 8;
   const stepSize = venue === 'Futures' ? 0.001 : 0.00001;
   const stepDecimals = venue === 'Futures' ? 3 : 5;
   return {
@@ -725,7 +732,15 @@ async function signedBinanceRequest(
       signal: AbortSignal.timeout(8000),
     });
     const latencyMs = Date.now() - startedAt;
-    const usedWeight1m = Number(resp.headers.get('x-mbx-used-weight-1m') ?? 0) || undefined;
+    const rawUsedWeight = resp.headers.get('x-mbx-used-weight-1m');
+    const usedWeight1m = Number(rawUsedWeight ?? 0) || undefined;
+    screenerHub.reportRestHeaders(
+      authSnap.environment,
+      venue,
+      resp.status,
+      rawUsedWeight,
+      resp.headers.get('retry-after')
+    );
     const rawText = await resp.text();
     let data: Record<string, unknown> = {};
     try {
@@ -781,9 +796,8 @@ function parseFillMetrics(data: Record<string, unknown>, refPrice: number, baseA
 
   let weightedQuote = 0;
   let weightedQty = 0;
-  let totalCommission = 0;
   let baseCommission = 0;
-  let commissionAsset = 'USDT';
+  const commissionByAsset = new Map<string, number>();
   for (const f of fills) {
     const fq = Number(f.qty ?? 0) || 0;
     const fp = Number(f.price ?? 0) || 0;
@@ -792,13 +806,29 @@ function parseFillMetrics(data: Record<string, unknown>, refPrice: number, baseA
       weightedQty += fq;
       weightedQuote += fq * fp;
     }
-    totalCommission += fc;
-    if (f.commissionAsset) {
-      commissionAsset = f.commissionAsset;
-      if (baseAsset && f.commissionAsset.toUpperCase() === baseAsset.toUpperCase()) {
+    const asset = (f.commissionAsset ?? 'USDT').trim().toUpperCase() || 'USDT';
+    if (fc > 0) {
+      commissionByAsset.set(asset, (commissionByAsset.get(asset) ?? 0) + fc);
+      if (baseAsset && asset === baseAsset.toUpperCase()) {
         baseCommission += fc;
       }
     }
+  }
+  let commissionAsset = 'USDT';
+  let totalCommission = 0;
+  if (commissionByAsset.size === 1) {
+    const [[onlyAsset, onlyVal]] = Array.from(commissionByAsset.entries());
+    commissionAsset = onlyAsset;
+    totalCommission = onlyVal;
+  } else if (commissionByAsset.size > 1) {
+    const preferred =
+      commissionByAsset.has('USDT')
+        ? 'USDT'
+        : baseAsset && commissionByAsset.has(baseAsset.toUpperCase())
+          ? baseAsset.toUpperCase()
+          : Array.from(commissionByAsset.entries()).sort((a, b) => b[1] - a[1])[0][0];
+    commissionAsset = preferred;
+    totalCommission = commissionByAsset.get(preferred) ?? 0;
   }
 
   let avgPrice = 0;
@@ -859,6 +889,7 @@ function ensureGitIgnoreDefaults(): void {
   const required = [
     '.env',
     '.env.*',
+    '!.env.example',
     '*.pem',
     '*.key',
     'node_modules/',
@@ -972,8 +1003,29 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
   const marginUpper = String(trading.marginType ?? vault.marginType).toUpperCase() === 'CROSSED' ? 'CROSSED' : 'ISOLATED';
   const modeLower = String(trading.mode ?? 'scalping').toLowerCase() === 'intraday' ? 'intraday' : 'scalping';
   const sizingLower = String(trading.positionSizingMode ?? 'fixed_usdt').toLowerCase();
+  const pairSelectionRaw = String(trading.pairSelectionMode ?? 'hybrid').toLowerCase();
+  const pairSelectionLower =
+    pairSelectionRaw === 'static' || pairSelectionRaw === 'dynamic' ? pairSelectionRaw : 'hybrid';
+  const trendingCatRaw = String(trading.trendingCategory ?? 'hot_volume').toLowerCase();
+  const trendingCatLower =
+    trendingCatRaw === 'top_gainers' ||
+    trendingCatRaw === 'top_losers' ||
+    trendingCatRaw === 'volatility_leaders'
+      ? trendingCatRaw
+      : 'hot_volume';
+  const rankingSourceRaw = String(trading.rankingSource ?? trading.trendingRankingSource ?? 'auto').toLowerCase();
+  const rankingSourceLower =
+    rankingSourceRaw === 'production' || rankingSourceRaw === 'environment'
+      ? rankingSourceRaw
+      : 'auto';
   const profileLower = String(automation.strategyProfile ?? 'trend_pullback').toLowerCase();
-  const dirLower = String(automation.directionPolicy ?? 'long_only').toLowerCase();
+  const dirRaw = String(automation.directionPolicy ?? 'long_only').toLowerCase();
+  const dirLower =
+    !isFutures
+      ? 'long_only'
+      : dirRaw === 'both' || dirRaw === 'short_only'
+        ? dirRaw
+        : 'long_only';
   const rawMethod = String(automation.orderMethod ?? 'MARKET').toUpperCase();
   const orderMethodUpper =
     rawMethod === 'LIMIT' || rawMethod === 'LIMIT_MAKER' || rawMethod === 'OCO' ? rawMethod : 'MARKET';
@@ -1025,6 +1077,16 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     `position_sizing_mode = "${tomlStr(sizingLower)}"`,
     `initial_equity_usdt = ${Math.max(1, tomlNum(trading.initialEquityUsdt, 10000))}`,
     `taker_fee_bps = ${Math.max(0, tomlNum(trading.takerFeeBps, 10))}`,
+    `pair_selection_mode = "${pairSelectionLower}"`,
+    `quote_asset = "${tomlStr(String(trading.quoteAsset ?? 'USDT').toUpperCase())}"`,
+    `max_watchlist_pairs = ${Math.min(40, Math.max(1, Math.round(tomlNum(trading.maxWatchlistPairs, 20))))}`,
+    `trending_category = "${trendingCatLower}"`,
+    `trending_top_n = ${Math.min(20, Math.max(1, Math.round(tomlNum(trading.trendingTopN, 5))))}`,
+    `trending_min_quote_volume_usdt = ${Math.max(0, tomlNum(trading.trendingMinQuoteVolumeUsdt, 10000000))}`,
+    `trending_min_dwell_minutes = ${Math.min(240, Math.max(0, Math.round(tomlNum(trading.trendingMinDwellMinutes, 15))))}`,
+    `trending_hysteresis_rank_buffer = ${Math.min(10, Math.max(0, Math.round(tomlNum(trading.trendingHysteresisRankBuffer, 3))))}`,
+    `ranking_source = "${rankingSourceLower}"`,
+    `max_same_direction_positions = ${Math.min(20, Math.max(0, Math.round(tomlNum(trading.maxSameDirectionPositions, 2))))}`,
     '',
     '[automation]',
     `enabled = ${Boolean(automation.enabled ?? true)}`,
@@ -1036,6 +1098,18 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     `signal_cooldown_bars = ${Math.max(0, Math.round(tomlNum(automation.signalCooldownBars, 2)))}`,
     `auto_order_notional_usdt = ${Math.max(10, tomlNum(automation.autoOrderNotionalUsdt, 150))}`,
     `auto_close_on_exit = ${Boolean(automation.autoCloseOnExit ?? true)}`,
+    `cancel_pending_on_signal_reversal = ${Boolean(automation.cancelPendingOnSignalReversal ?? true)}`,
+    `cancel_pending_on_exhaustion = ${Boolean(automation.cancelPendingOnExhaustion ?? true)}`,
+    `max_pending_order_bars = ${Math.max(0, Math.round(tomlNum(automation.maxPendingOrderBars, 6)))}`,
+    `max_pending_runaway_atr = ${Math.max(0, tomlNum(automation.maxPendingRunawayAtr, 1.8))}`,
+    `apply_dynamic_cancel_to_manual_orders = ${Boolean(automation.applyDynamicCancelToManualOrders ?? false)}`,
+    `exit_position_on_signal_reversal = ${Boolean(automation.exitPositionOnSignalReversal ?? true)}`,
+    `tighten_trailing_on_exhaustion = ${Boolean(automation.tightenTrailingOnExhaustion ?? true)}`,
+    `exhaustion_min_profit_r = ${Math.max(0.1, tomlNum(automation.exhaustionMinProfitR, 1.0))}`,
+    `exhaustion_trail_factor = ${Math.min(0.95, Math.max(0.2, tomlNum(automation.exhaustionTrailFactor, 0.55)))}`,
+    `exhaustion_rsi_high = ${Math.min(95, Math.max(55, tomlNum(automation.exhaustionRsiHigh, 76.0)))}`,
+    `exhaustion_rsi_low = ${Math.min(45, Math.max(5, tomlNum(automation.exhaustionRsiLow, 24.0)))}`,
+    `auto_flip_on_reversal = ${isFutures ? Boolean(automation.autoFlipOnReversal ?? false) : false}`,
     ...sessionWindows.flatMap((w) => [
       '',
       '[[automation.session_windows]]',
@@ -1065,6 +1139,15 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     `atr_spike_pct_threshold = ${tomlNum(indicators.atrSpikePctThreshold, 0.45)}`,
     `atr_expansion_ratio_threshold = ${tomlNum(indicators.atrExpansionRatioThreshold, 1.25)}`,
     `volatility_alert_cooldown_sec = ${Math.max(0, Math.round(tomlNum(indicators.volatilityAlertCooldownSec, 60)))}`,
+    `min_warmup_bars = ${Math.min(500, Math.max(20, Math.round(tomlNum(indicators.minWarmupBars, 50))))}`,
+    `max_ema_mid_extension_atr = ${Math.max(0, tomlNum(indicators.maxEmaMidExtensionAtr, 2.2))}`,
+    `max_vwap_extension_atr = ${Math.max(0, tomlNum(indicators.maxVwapExtensionAtr, 2.8))}`,
+    `min_close_strength_ratio = ${Math.min(1, Math.max(0, tomlNum(indicators.minCloseStrengthRatio, 0.55)))}`,
+    `min_candle_body_ratio = ${Math.min(1, Math.max(0, tomlNum(indicators.minCandleBodyRatio, 0.30)))}`,
+    `require_rising_adx = ${Boolean(indicators.requireRisingAdx ?? true)}`,
+    `min_di_spread = ${Math.max(0, tomlNum(indicators.minDiSpread, 3.0))}`,
+    `require_macro_ema_in_scalping = ${Boolean(indicators.requireMacroEmaInScalping ?? true)}`,
+    `max_spread_bps = ${Math.max(0, tomlNum(indicators.maxSpreadBps, 20.0))}`,
     '',
     '[exits]',
     `atr_sl_multiplier = ${Math.max(0.1, tomlNum(exits.atrSlMultiplier, 1.5))}`,
@@ -1080,8 +1163,8 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     `max_daily_drawdown_pct = ${Math.max(0.1, tomlNum(risk.maxDailyDrawdownPct, 3.0))}`,
     `max_pair_daily_drawdown_pct = ${Math.max(0.1, tomlNum(risk.maxPairDailyDrawdownPct, 1.25))}`,
     `max_daily_profit_pct = ${Math.max(0.1, tomlNum(risk.maxDailyProfitPct, 5.0))}`,
-    `max_win_streak = ${Math.max(1, Math.round(tomlNum(risk.maxWinStreak, 5)))}`,
-    `max_lose_streak = ${Math.max(1, Math.round(tomlNum(risk.maxLoseStreak, 3)))}`,
+    `max_win_streak = ${Math.max(0, Math.round(tomlNum(risk.maxWinStreak, 5)))}`,
+    `max_lose_streak = ${Math.max(0, Math.round(tomlNum(risk.maxLoseStreak, 3)))}`,
     `streak_cooldown_minutes = ${Math.max(1, Math.round(tomlNum(risk.streakCooldownMinutes, 30)))}`,
     `flatten_on_circuit_breaker = ${Boolean(risk.flattenOnCircuitBreaker ?? true)}`,
     '',
@@ -1258,7 +1341,7 @@ async function bootstrapServer() {
   }
   app.use(express.json({ limit: '256kb' }));
 
-  function resolveClientIp(req: express.Request): string {
+  function resolveClientIp(req: http.IncomingMessage & { ip?: string }): string {
     const remoteAddr = String(req.socket.remoteAddress ?? '').trim();
     const isLoopbackPeer =
       remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
@@ -1538,6 +1621,13 @@ async function bootstrapServer() {
     const venue: ExchangeVenue = req.query.venue === 'Futures' ? 'Futures' : 'Spot';
     const env: BinanceEnv = req.query.environment === 'Production' ? 'Production' : 'Testnet';
     const limit = Math.min(500, Math.max(2, Number(req.query.limit ?? 3) || 3));
+    if (screenerHub.isRateBudgetConstrained(env, venue)) {
+      res.status(429).json({
+        ok: false,
+        error: `Binance ${venue} REST weight budget exceeds 70% threshold; deferring klines request for ${symbol}.`,
+      });
+      return;
+    }
     const baseUrl = getRestBaseUrl(env, venue);
     const klinesPath =
       venue === 'Futures'
@@ -1545,6 +1635,13 @@ async function bootstrapServer() {
         : `${baseUrl}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`;
     try {
       const resp = await fetch(klinesPath, { signal: AbortSignal.timeout(5000) });
+      screenerHub.reportRestHeaders(
+        env,
+        venue,
+        resp.status,
+        resp.headers.get('x-mbx-used-weight-1m'),
+        resp.headers.get('retry-after')
+      );
       if (!resp.ok) {
         res.status(resp.status).json({ error: `Binance klines HTTP ${resp.status}` });
         return;
@@ -1557,6 +1654,46 @@ async function bootstrapServer() {
         error: err instanceof Error ? err.message : 'Failed to fetch Binance klines',
       });
     }
+  }));
+
+  app.get('/api/market/screener', asyncRoute(async (req, res) => {
+    const venue: ExchangeVenue =
+      req.query.venue === 'Futures' ? 'Futures' : req.query.venue === 'Spot' ? 'Spot' : vault.venue;
+    const env: BinanceEnv =
+      req.query.environment === 'Production'
+        ? 'Production'
+        : req.query.environment === 'Testnet'
+          ? 'Testnet'
+          : vault.environment;
+    const catRaw = String(req.query.category ?? 'hot_volume');
+    const category: TrendingCategory =
+      catRaw === 'top_gainers' || catRaw === 'top_losers' || catRaw === 'volatility_leaders'
+        ? catRaw
+        : 'hot_volume';
+    const rsRaw = String(req.query.rankingSource ?? 'auto');
+    const rankingSource: TrendingRankingSource =
+      rsRaw === 'production' || rsRaw === 'environment' ? rsRaw : 'auto';
+    const activeWatchlist =
+      typeof req.query.watchlist === 'string' && req.query.watchlist.trim()
+        ? req.query.watchlist
+            .split(',')
+            .map((s) => sanitizeSymbol(s))
+            .filter(Boolean)
+        : undefined;
+
+    const payload = await screenerHub.getScreenerSnapshot({
+      venue,
+      environment: env,
+      rankingSource,
+      category,
+      quoteAsset: String(req.query.quoteAsset ?? 'USDT').toUpperCase(),
+      minQuoteVolumeUsdt: Math.max(0, Number(req.query.minQuoteVolumeUsdt ?? 0) || 0),
+      onlyTradable: req.query.onlyTradable !== 'false',
+      limit: Math.min(200, Math.max(1, Number(req.query.limit ?? 50) || 50)),
+      searchQuery: typeof req.query.q === 'string' ? req.query.q : undefined,
+      activeWatchlist,
+    });
+    res.json({ ok: true, ...payload });
   }));
 
   app.get('/api/market/ticker', asyncRoute(async (req, res) => {
@@ -1735,8 +1872,15 @@ async function bootstrapServer() {
     }
 
     try {
-      const accountPath = vault.venue === 'Futures' ? '/fapi/v2/account' : '/api/v3/account';
-      const result = await signedBinanceRequest('GET', accountPath, {}, vault.venue);
+      let result = await signedBinanceRequest(
+        'GET',
+        vault.venue === 'Futures' ? '/fapi/v3/account' : '/api/v3/account',
+        {},
+        vault.venue
+      );
+      if (!result.ok && vault.venue === 'Futures' && (result.status === 404 || result.status === 410)) {
+        result = await signedBinanceRequest('GET', '/fapi/v2/account', {}, 'Futures');
+      }
       vault.latencyMs = result.latencyMs;
 
       if (!result.ok) {
@@ -2133,6 +2277,14 @@ async function bootstrapServer() {
 
     const orderEndpoint = venue === 'Futures' ? '/fapi/v1/order' : '/api/v3/order';
     const testEndpoint = venue === 'Futures' ? '/fapi/v1/order/test' : '/api/v3/order/test';
+    const isExitOrder = Boolean(body.reduceOnly) || (venue === 'Spot' && side === 'SELL');
+    const loggedPositionSide: 'Long' | 'Short' = isExitOrder
+      ? side === 'SELL'
+        ? 'Long'
+        : 'Short'
+      : side === 'BUY'
+        ? 'Long'
+        : 'Short';
 
     try {
       let futuresPositionSide: 'BOTH' | 'LONG' | 'SHORT' = 'BOTH';
@@ -2156,37 +2308,6 @@ async function bootstrapServer() {
             orderParams.reduceOnly = 'true';
           }
         }
-
-        if (!preflightOnly && !body.reduceOnly) {
-          const marginRes = await signedBinanceRequest(
-            'POST',
-            '/fapi/v1/marginType',
-            { symbol, marginType: desiredMarginType },
-            'Futures',
-            authSnap
-          );
-          const marginCode = Number(marginRes.data.code);
-          if (!marginRes.ok && marginCode !== -4046 && marginCode !== -4048) {
-            res.status(400).json({
-              error: `Futures marginType error (${marginRes.data.code ?? marginRes.status}): ${String(marginRes.data.msg ?? 'Rejected')}`,
-            });
-            return;
-          }
-
-          const levRes = await signedBinanceRequest(
-            'POST',
-            '/fapi/v1/leverage',
-            { symbol, leverage: desiredLeverage },
-            'Futures',
-            authSnap
-          );
-          if (!levRes.ok) {
-            res.status(400).json({
-              error: `Futures leverage error (${levRes.data.code ?? levRes.status}): ${String(levRes.data.msg ?? 'Rejected')}`,
-            });
-            return;
-          }
-        }
       }
 
       if (preflightOnly || requirePreflight) {
@@ -2207,7 +2328,7 @@ async function bootstrapServer() {
               accountMode: 'Live',
               source: 'live_proxy',
               lifecycle: 'PREFLIGHT',
-              side: side === 'BUY' ? 'Long' : 'Short',
+              side: loggedPositionSide,
               binanceSide: side,
               orderType,
               timeInForce: tif,
@@ -2244,7 +2365,7 @@ async function bootstrapServer() {
               accountMode: 'Live',
               source: 'live_proxy',
               lifecycle: 'PREFLIGHT',
-              side: side === 'BUY' ? 'Long' : 'Short',
+              side: loggedPositionSide,
               binanceSide: side,
               orderType,
               timeInForce: tif,
@@ -2285,6 +2406,38 @@ async function bootstrapServer() {
         return;
       }
 
+      // Align Futures margin & leverage only after preflight passes and arming is verified (skip on reduceOnly exits to avoid -4048)
+      if (venue === 'Futures' && !body.reduceOnly) {
+        const marginRes = await signedBinanceRequest(
+          'POST',
+          '/fapi/v1/marginType',
+          { symbol, marginType: desiredMarginType },
+          'Futures',
+          authSnap
+        );
+        const marginCode = Number(marginRes.data.code);
+        if (!marginRes.ok && marginCode !== -4046 && marginCode !== -4048) {
+          res.status(400).json({
+            error: `Futures marginType error (${marginRes.data.code ?? marginRes.status}): ${String(marginRes.data.msg ?? 'Rejected')}`,
+          });
+          return;
+        }
+
+        const levRes = await signedBinanceRequest(
+          'POST',
+          '/fapi/v1/leverage',
+          { symbol, leverage: desiredLeverage },
+          'Futures',
+          authSnap
+        );
+        if (!levRes.ok) {
+          res.status(400).json({
+            error: `Futures leverage error (${levRes.data.code ?? levRes.status}): ${String(levRes.data.msg ?? 'Rejected')}`,
+          });
+          return;
+        }
+      }
+
       const liveRes = await signedBinanceRequest('POST', orderEndpoint, orderParams, venue, authSnap);
       if (!liveRes.ok) {
         const msg =
@@ -2301,8 +2454,8 @@ async function bootstrapServer() {
             environment: authSnap.environment,
             accountMode: 'Live',
             source: 'live_proxy',
-            lifecycle: body.reduceOnly ? 'EXIT' : 'ENTRY',
-            side: side === 'BUY' ? 'Long' : 'Short',
+            lifecycle: isExitOrder ? 'EXIT' : 'ENTRY',
+            side: loggedPositionSide,
             binanceSide: side,
             orderType,
             timeInForce: tif,
@@ -2367,6 +2520,10 @@ async function bootstrapServer() {
           const slNum = Number(slFmt);
           const belowNum = Number(belowLimitFmt);
           const exitQtyNum = Number(exitQtyFmt);
+          const directionInvalid = !(tpNum > avgPrice && avgPrice > slNum && slNum > 0);
+          const qtyInvalid =
+            (filters.minQty > 0 && exitQtyNum < filters.minQty) ||
+            (filters.maxQty > 0 && exitQtyNum > filters.maxQty);
           const minPriceViolated =
             filters.minPrice > 0 && (tpNum < filters.minPrice || slNum < filters.minPrice || belowNum < filters.minPrice);
           const maxPriceViolated =
@@ -2374,8 +2531,8 @@ async function bootstrapServer() {
           const minNotionalViolated =
             filters.minNotional > 0 &&
             (tpNum * exitQtyNum < filters.minNotional || belowNum * exitQtyNum < filters.minNotional);
-          if (minPriceViolated || maxPriceViolated || minNotionalViolated) {
-            ocoWarning = `Spot OCO leg skipped: TP (${tpFmt}) / SL (${slFmt}/${belowLimitFmt}) or exit notional fails Binance filters (minPrice=${filters.minPrice}, maxPrice=${filters.maxPrice}, minNotional=${filters.minNotional}).`;
+          if (directionInvalid || qtyInvalid || minPriceViolated || maxPriceViolated || minNotionalViolated) {
+            ocoWarning = `Spot OCO leg skipped: TP (${tpFmt}) / SL (${slFmt}/${belowLimitFmt}) or exit qty (${exitQtyFmt}) fails Binance bounds around fill ${avgPrice} (minQty=${filters.minQty}, minPrice=${filters.minPrice}, maxPrice=${filters.maxPrice}, minNotional=${filters.minNotional}).`;
             ocoNote = ocoWarning;
           } else {
             const ocoParams: Record<string, string | number> = {
@@ -2403,59 +2560,74 @@ async function bootstrapServer() {
             }
           }
         } else if (venue === 'Futures') {
-          const [tpRes, slRes] = await Promise.all([
-            signedBinanceRequest(
-              'POST',
-              '/fapi/v1/algoOrder',
-              {
-                algoType: 'CONDITIONAL',
-                symbol,
-                side: exitSide,
-                positionSide: futuresPositionSide,
-                type: 'TAKE_PROFIT_MARKET',
-                triggerPrice: tpFmt,
-                closePosition: 'true',
-                workingType,
-                priceProtect: 'true',
-              },
-              'Futures',
-              authSnap
-            ),
-            signedBinanceRequest(
-              'POST',
-              '/fapi/v1/algoOrder',
-              {
-                algoType: 'CONDITIONAL',
-                symbol,
-                side: exitSide,
-                positionSide: futuresPositionSide,
-                type: 'STOP_MARKET',
-                triggerPrice: slFmt,
-                closePosition: 'true',
-                workingType,
-                priceProtect: 'true',
-              },
-              'Futures',
-              authSnap
-            ),
-          ]);
-          ocoAttached = tpRes.ok && slRes.ok;
-          const ids: string[] = [];
-          if (tpRes.ok && tpRes.data.algoId != null) ids.push(String(tpRes.data.algoId));
-          if (slRes.ok && slRes.data.algoId != null) ids.push(String(slRes.data.algoId));
-
-          if (ocoAttached) {
-            if (ids.length > 0) algoOrderIds = ids;
-            ocoNote = `Attached Futures /fapi/v1/algoOrder TP @ ${tpFmt} + SL @ ${slFmt} (${workingType})`;
-          } else {
-            // Roll back any half-attached algo leg (DELETE /fapi/v1/algoOrder takes algoId only; symbol causes -1106)
-            for (const id of ids) {
-              await signedBinanceRequest('DELETE', '/fapi/v1/algoOrder', { algoId: id }, 'Futures', authSnap).catch(() => {});
-            }
-            const tpErr = tpRes.ok ? 'OK' : `${tpRes.data.code ?? tpRes.status}: ${String(tpRes.data.msg ?? 'Err')}`;
-            const slErr = slRes.ok ? 'OK' : `${slRes.data.code ?? slRes.status}: ${String(slRes.data.msg ?? 'Err')}`;
-            ocoWarning = `Futures conditional bracket warning — TP(${tpErr}) / SL(${slErr})`;
+          const tpNum = Number(tpFmt);
+          const slNum = Number(slFmt);
+          const isLongEntry = side === 'BUY';
+          const directionValid = isLongEntry
+            ? tpNum > avgPrice && avgPrice > slNum && slNum > 0
+            : slNum > avgPrice && avgPrice > tpNum && tpNum > 0;
+          const minPriceViolated =
+            filters.minPrice > 0 && (tpNum < filters.minPrice || slNum < filters.minPrice);
+          const maxPriceViolated =
+            filters.maxPrice > 0 && (tpNum > filters.maxPrice || slNum > filters.maxPrice);
+          if (!directionValid || minPriceViolated || maxPriceViolated) {
+            ocoWarning = `Futures conditional bracket skipped: TP (${tpFmt}) / SL (${slFmt}) fails direction or price bounds around fill ${avgPrice}.`;
             ocoNote = ocoWarning;
+          } else {
+            const [tpRes, slRes] = await Promise.all([
+              signedBinanceRequest(
+                'POST',
+                '/fapi/v1/algoOrder',
+                {
+                  algoType: 'CONDITIONAL',
+                  symbol,
+                  side: exitSide,
+                  positionSide: futuresPositionSide,
+                  type: 'TAKE_PROFIT_MARKET',
+                  triggerPrice: tpFmt,
+                  closePosition: 'true',
+                  workingType,
+                  priceProtect: 'true',
+                },
+                'Futures',
+                authSnap
+              ),
+              signedBinanceRequest(
+                'POST',
+                '/fapi/v1/algoOrder',
+                {
+                  algoType: 'CONDITIONAL',
+                  symbol,
+                  side: exitSide,
+                  positionSide: futuresPositionSide,
+                  type: 'STOP_MARKET',
+                  triggerPrice: slFmt,
+                  closePosition: 'true',
+                  workingType,
+                  priceProtect: 'true',
+                },
+                'Futures',
+                authSnap
+              ),
+            ]);
+            ocoAttached = tpRes.ok && slRes.ok;
+            const ids: string[] = [];
+            if (tpRes.ok && tpRes.data.algoId != null) ids.push(String(tpRes.data.algoId));
+            if (slRes.ok && slRes.data.algoId != null) ids.push(String(slRes.data.algoId));
+
+            if (ocoAttached) {
+              if (ids.length > 0) algoOrderIds = ids;
+              ocoNote = `Attached Futures /fapi/v1/algoOrder TP @ ${tpFmt} + SL @ ${slFmt} (${workingType})`;
+            } else {
+              // Roll back any half-attached algo leg (DELETE /fapi/v1/algoOrder takes algoId only; symbol causes -1106)
+              for (const id of ids) {
+                await signedBinanceRequest('DELETE', '/fapi/v1/algoOrder', { algoId: id }, 'Futures', authSnap).catch(() => {});
+              }
+              const tpErr = tpRes.ok ? 'OK' : `${tpRes.data.code ?? tpRes.status}: ${String(tpRes.data.msg ?? 'Err')}`;
+              const slErr = slRes.ok ? 'OK' : `${slRes.data.code ?? slRes.status}: ${String(slRes.data.msg ?? 'Err')}`;
+              ocoWarning = `Futures conditional bracket warning — TP(${tpErr}) / SL(${slErr})`;
+              ocoNote = ocoWarning;
+            }
           }
         }
       }
@@ -2469,9 +2641,16 @@ async function bootstrapServer() {
         resolvedStatusRaw === 'PARTIALLY_FILLED' ||
         resolvedStatusRaw === 'CANCELED' ||
         resolvedStatusRaw === 'REJECTED' ||
-        resolvedStatusRaw === 'EXPIRED'
+        resolvedStatusRaw === 'EXPIRED' ||
+        resolvedStatusRaw === 'EXPIRED_IN_MATCH'
           ? resolvedStatusRaw
-          : 'FILLED';
+          : resolvedStatusRaw === 'CANCELLED'
+            ? 'CANCELED'
+            : resolvedStatusRaw === 'FINISHED' || resolvedStatusRaw === 'TRIGGERED'
+              ? 'FILLED'
+              : executedQty > 0
+                ? 'FILLED'
+                : 'NEW';
 
       orderHistoryDb.upsertLogs([
         {
@@ -2488,8 +2667,8 @@ async function bootstrapServer() {
           environment: authSnap.environment,
           accountMode: 'Live',
           source: 'live_proxy',
-          lifecycle: body.reduceOnly || (venue === 'Spot' && side === 'SELL') ? 'EXIT' : 'ENTRY',
-          side: side === 'BUY' ? 'Long' : 'Short',
+          lifecycle: isExitOrder ? 'EXIT' : 'ENTRY',
+          side: loggedPositionSide,
           binanceSide: side,
           orderType,
           timeInForce:
@@ -2532,10 +2711,11 @@ async function bootstrapServer() {
         venue,
         latencyMs: liveRes.latencyMs,
         orderId: liveRes.data.orderId != null ? String(liveRes.data.orderId) : undefined,
-        orderStatus: typeof liveRes.data.status === 'string' ? liveRes.data.status : 'FILLED',
+        orderStatus: resolvedStatus,
         executedQty,
         avgPrice,
         commission: fillMetrics.commission,
+        baseCommission: fillMetrics.baseCommission,
         commissionAsset: fillMetrics.commissionAsset,
         ocoAttached,
         ocoOrderListId,
@@ -2622,16 +2802,33 @@ async function bootstrapServer() {
         });
         return;
       }
-      const executedQty = Number(queryRes.data.executedQty ?? 0) || 0;
+      const rawStatus = String(queryRes.data.algoStatus ?? queryRes.data.status ?? 'UNKNOWN').toUpperCase();
+      const normStatus =
+        rawStatus === 'FINISHED' || rawStatus === 'TRIGGERED'
+          ? 'FILLED'
+          : rawStatus === 'CANCELLED'
+            ? 'CANCELED'
+            : rawStatus;
+      const executedQty =
+        Number(queryRes.data.executedQty ?? queryRes.data.actualQty ?? 0) ||
+        (normStatus === 'FILLED' ? Number(queryRes.data.quantity ?? 0) || 0 : 0);
       const cumQuote = Number(queryRes.data.cummulativeQuoteQty ?? queryRes.data.cumQuote ?? 0) || 0;
-      const rawPrice = Number(queryRes.data.avgPrice ?? queryRes.data.price ?? queryRes.data.triggerPrice ?? 0) || 0;
+      const rawPrice =
+        Number(
+          queryRes.data.actualPrice ??
+            queryRes.data.avgPrice ??
+            queryRes.data.price ??
+            queryRes.data.triggerPrice ??
+            0
+        ) || 0;
       const avgPrice = executedQty > 0 && cumQuote > 0 ? cumQuote / executedQty : rawPrice;
       res.json({
         ok: true,
         venue,
         symbol,
         orderId: String(queryRes.data.orderId ?? queryRes.data.algoId ?? orderId),
-        status: String(queryRes.data.algoStatus ?? queryRes.data.status ?? 'UNKNOWN').toUpperCase(),
+        status: normStatus,
+        rawStatus,
         executedQty,
         avgPrice,
         order: queryRes.data,
@@ -2678,7 +2875,9 @@ async function bootstrapServer() {
             'Spot'
           );
           if (r.ok) cancelled += 1;
-          else errors.push(`OCO #${body.orderListId}: ${String(r.data.msg ?? r.status)}`);
+          else if (Number(r.data.code) !== -2011) {
+            errors.push(`OCO #${body.orderListId}: ${String(r.data.msg ?? r.status)}`);
+          }
         } else {
           const listRes = await signedBinanceRequest('GET', '/api/v3/openOrderList', {}, 'Spot');
           if (!listRes.ok) {
@@ -2693,7 +2892,9 @@ async function bootstrapServer() {
                   'Spot'
                 );
                 if (delRes.ok) cancelled += 1;
-                else errors.push(`OCO #${entry.orderListId}: ${String(delRes.data.msg ?? delRes.status)}`);
+                else if (Number(delRes.data.code) !== -2011) {
+                  errors.push(`OCO #${entry.orderListId}: ${String(delRes.data.msg ?? delRes.status)}`);
+                }
               }
             }
           }
@@ -2708,20 +2909,26 @@ async function bootstrapServer() {
               'Futures'
             );
             if (delRes.ok) cancelled += 1;
-            else errors.push(`algo #${algoId}: ${String(delRes.data.msg ?? delRes.status)}`);
+            else if (Number(delRes.data.code) !== -2011) {
+              errors.push(`algo #${algoId}: ${String(delRes.data.msg ?? delRes.status)}`);
+            }
           }
         } else {
           const openAlgoRes = await signedBinanceRequest('GET', '/fapi/v1/openAlgoOrders', { symbol }, 'Futures');
           const extractedAlgo = openAlgoRes.ok ? extractBinanceAlgoOrders(openAlgoRes.data) : [];
-          const openCount = extractedAlgo.length > 0 ? extractedAlgo.length : 1;
-          const delAll = await signedBinanceRequest(
-            'DELETE',
-            '/fapi/v1/algoOpenOrders',
-            { symbol },
-            'Futures'
-          );
-          if (delAll.ok) cancelled += Math.max(0, openCount);
-          else errors.push(`algoOpenOrders: ${String(delAll.data.msg ?? delAll.status)}`);
+          const openCount = openAlgoRes.ok ? extractedAlgo.length : 1;
+          if (!openAlgoRes.ok || extractedAlgo.length > 0) {
+            const delAll = await signedBinanceRequest(
+              'DELETE',
+              '/fapi/v1/algoOpenOrders',
+              { symbol },
+              'Futures'
+            );
+            if (delAll.ok) cancelled += Math.max(0, openCount);
+            else if (Number(delAll.data.code) !== -2011) {
+              errors.push(`algoOpenOrders: ${String(delAll.data.msg ?? delAll.status)}`);
+            }
+          }
         }
       }
       if (cancelled === 0 && errors.length > 0) {
@@ -2737,8 +2944,13 @@ async function bootstrapServer() {
     }
   }));
 
-  app.delete('/api/live/order', asyncRoute(async (req, res) => {
-    const body = (req.body ?? {}) as {
+  const handleCancelLiveOrder: express.RequestHandler = asyncRoute(async (req, res) => {
+    const queryFallback =
+      req.query && typeof req.query === 'object' ? (req.query as Record<string, unknown>) : {};
+    const body = {
+      ...queryFallback,
+      ...((req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>),
+    } as {
       symbol?: string;
       orderId?: string;
       orderListId?: string;
@@ -2746,6 +2958,7 @@ async function bootstrapServer() {
       side?: 'BUY' | 'SELL' | 'Long' | 'Short';
       orderType?: 'ORDER' | 'OCO' | 'ALGO';
       venue?: ExchangeVenue;
+      reason?: string;
     };
     if (!vault.apiKey || !vault.apiSecret) {
       res.status(400).json({ error: 'Live API credentials are not configured.' });
@@ -2769,80 +2982,271 @@ async function bootstrapServer() {
     try {
       let cancelPath = venue === 'Futures' ? '/fapi/v1/order' : '/api/v3/order';
       let cancelParams: Record<string, string | number> = { symbol, orderId };
+      let queryPath = venue === 'Futures' ? '/fapi/v1/order' : '/api/v3/order';
+      let queryParams: Record<string, string | number> = { symbol, orderId };
 
       if ((body.orderType === 'OCO' || orderListId) && venue === 'Spot') {
         cancelPath = '/api/v3/orderList';
         cancelParams = { symbol, orderListId: orderListId || orderId };
+        queryPath = '/api/v3/orderList';
+        queryParams = { orderListId: orderListId || orderId };
       } else if ((body.orderType === 'ALGO' || algoId) && venue === 'Futures') {
         cancelPath = '/fapi/v1/algoOrder';
         cancelParams = { algoId: algoId || orderId };
+        queryPath = '/fapi/v1/algoOrder';
+        queryParams = { algoId: algoId || orderId };
       }
 
-      const cancelRes = await signedBinanceRequest('DELETE', cancelPath, cancelParams, venue);
-      if (!cancelRes.ok) {
-        const msg =
-          typeof cancelRes.data.msg === 'string'
-            ? `Binance Cancel ${cancelRes.data.code ?? cancelRes.status}: ${cancelRes.data.msg}`
-            : `Cancel failed with HTTP ${cancelRes.status}`;
-        res.status(400).json({ error: msg });
-        return;
-      }
+      const targetOrdId = orderId || orderListId || algoId;
+      const reasonText =
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason.trim()
+          : `Canceled resting ${venue} order`;
       const fallbackSide: 'BUY' | 'SELL' =
         body.side === 'SELL' || body.side === 'Short'
           ? 'SELL'
           : venue === 'Spot' && (body.orderType === 'OCO' || orderListId)
             ? 'SELL'
             : 'BUY';
+
+      const cancelRes = await signedBinanceRequest('DELETE', cancelPath, cancelParams, venue);
+      if (!cancelRes.ok) {
+        const errCode = Number(cancelRes.data.code ?? 0);
+        // Handle race condition: order was already filled/closed before cancel arrived (-2011 Unknown order sent)
+        if (errCode === -2011) {
+          const checkRes = await signedBinanceRequest('GET', queryPath, queryParams, venue);
+          const checkStatus = String(
+            checkRes.data.status ?? checkRes.data.algoStatus ?? checkRes.data.listOrderStatus ?? ''
+          ).toUpperCase();
+          const fillQty = Number(checkRes.data.executedQty ?? checkRes.data.actualQty ?? 0) || 0;
+          const fillCumQuote = Number(checkRes.data.cummulativeQuoteQty ?? checkRes.data.cumQuote ?? 0) || 0;
+          const fillRawPx =
+            Number(
+              checkRes.data.actualPrice ??
+                checkRes.data.avgPrice ??
+                checkRes.data.price ??
+                checkRes.data.triggerPrice ??
+                0
+            ) || 0;
+          const fillAvgPx = fillQty > 0 && fillCumQuote > 0 ? fillCumQuote / fillQty : fillRawPx;
+          const isFullFillStatus =
+            checkStatus === 'FILLED' ||
+            checkStatus === 'FINISHED' ||
+            checkStatus === 'TRIGGERED' ||
+            checkStatus === 'ALL_DONE';
+          const isFilledRace = isFullFillStatus || checkStatus === 'PARTIALLY_FILLED' || fillQty > 0;
+          if (checkRes.ok && isFilledRace) {
+            const resolvedDbStatus: 'FILLED' | 'PARTIALLY_FILLED' = isFullFillStatus
+              ? 'FILLED'
+              : 'PARTIALLY_FILLED';
+            orderHistoryDb.markEntryFilledOrPartial({
+              symbol,
+              venue,
+              environment: vault.environment,
+              accountMode: 'Live',
+              orderId: targetOrdId,
+              status: resolvedDbStatus,
+              executedQty: fillQty,
+              avgPrice: fillAvgPx > 0 ? fillAvgPx : undefined,
+              quoteQty: fillCumQuote > 0 ? fillCumQuote : undefined,
+              rationale:
+                resolvedDbStatus === 'FILLED'
+                  ? `Order ${targetOrdId} filled on Binance before cancel arrived`
+                  : `Order ${targetOrdId} partially filled (${fillQty}) before ${checkStatus || 'cancel'} on Binance`,
+            });
+            res.json({
+              ok: true,
+              alreadyFilled: true,
+              partiallyFilled: resolvedDbStatus === 'PARTIALLY_FILLED',
+              status: resolvedDbStatus,
+              executedQty: fillQty > 0 ? fillQty : undefined,
+              avgPrice: fillAvgPx > 0 ? fillAvgPx : undefined,
+              latencyMs: checkRes.latencyMs,
+              order: checkRes.data,
+            });
+            return;
+          }
+          if (
+            checkRes.ok &&
+            (checkStatus === 'CANCELED' ||
+              checkStatus === 'CANCELLED' ||
+              checkStatus === 'EXPIRED' ||
+              checkStatus === 'EXPIRED_IN_MATCH' ||
+              checkStatus === 'REJECTED')
+          ) {
+            const normTerminal =
+              checkStatus === 'CANCELLED'
+                ? 'CANCELED'
+                : checkStatus === 'EXPIRED_IN_MATCH'
+                  ? 'EXPIRED'
+                  : checkStatus;
+            orderHistoryDb.markEntryCanceled({
+              symbol,
+              venue,
+              environment: vault.environment,
+              accountMode: 'Live',
+              orderId: targetOrdId,
+              rationale: body.reason || `Order ${targetOrdId} already ${normTerminal} on Binance`,
+            });
+            res.json({
+              ok: true,
+              alreadyCanceled: true,
+              status: normTerminal,
+              latencyMs: checkRes.latencyMs,
+              data: checkRes.data,
+            });
+            return;
+          }
+        }
+        const msg =
+          typeof cancelRes.data.msg === 'string'
+            ? `Binance Cancel ${cancelRes.data.code ?? cancelRes.status}: ${cancelRes.data.msg}`
+            : `Cancel failed with HTTP ${cancelRes.status}`;
+        res.status(400).json({ error: msg, code: errCode || undefined });
+        return;
+      }
+
       const canceledBinanceSide: 'BUY' | 'SELL' =
         cancelRes.data.side !== undefined
           ? String(cancelRes.data.side).toUpperCase() === 'SELL'
             ? 'SELL'
             : 'BUY'
           : fallbackSide;
-      orderHistoryDb.upsertLogs([
-        {
-          id: `live-cancel-${symbol}-${orderId || orderListId || algoId}-${Date.now()}`,
-          orderId: orderId || orderListId || algoId,
-          clientOrderId: `cancel_${symbol.toLowerCase()}`,
+      const canceledExecQty = Number(cancelRes.data.executedQty ?? cancelRes.data.actualQty ?? 0) || 0;
+      const canceledCumQuote =
+        Number(cancelRes.data.cummulativeQuoteQty ?? cancelRes.data.cumQuote ?? 0) || 0;
+      const canceledRawPx = Number(cancelRes.data.avgPrice ?? cancelRes.data.price ?? 0) || 0;
+      const canceledAvgPx =
+        canceledExecQty > 0 && canceledCumQuote > 0 ? canceledCumQuote / canceledExecQty : canceledRawPx;
+
+      if (canceledExecQty > 0) {
+        const updatedPartial = orderHistoryDb.markEntryFilledOrPartial({
           symbol,
           venue,
           environment: vault.environment,
           accountMode: 'Live',
-          source: 'live_proxy',
-          lifecycle: 'CANCEL',
-          side:
-            venue === 'Spot' && canceledBinanceSide === 'SELL'
-              ? 'Long'
-              : canceledBinanceSide === 'BUY'
-                ? 'Long'
-                : 'Short',
-          binanceSide: canceledBinanceSide,
-          orderType: body.orderType ?? 'ORDER',
-          timeInForce: 'GTC',
-          status: 'CANCELED',
-          price: Number(cancelRes.data.price ?? 0) || 0,
-          executedQty: Number(cancelRes.data.executedQty ?? 0) || 0,
-          origQty: Number(cancelRes.data.origQty ?? 0) || 0,
-          quoteQty: 0,
-          commission: 0,
-          commissionAsset: 'USDT',
-          isMaker: false,
-          realizedPnlUsdt: null,
-          rMultiple: null,
-          exitReason: 'Canceled',
+          orderId: targetOrdId,
+          status: 'PARTIALLY_FILLED',
+          executedQty: canceledExecQty,
+          avgPrice: canceledAvgPx > 0 ? canceledAvgPx : undefined,
+          quoteQty: canceledCumQuote > 0 ? canceledCumQuote : undefined,
+          rationale: `${reasonText} (partially filled ${canceledExecQty} before cancel)`,
+        });
+        if (!updatedPartial) {
+          orderHistoryDb.upsertLogs([
+            {
+              id: `live-order-${symbol}-${targetOrdId}`,
+              orderId: targetOrdId,
+              clientOrderId:
+                typeof cancelRes.data.clientOrderId === 'string'
+                  ? cancelRes.data.clientOrderId
+                  : `cancel_${symbol.toLowerCase()}`,
+              symbol,
+              venue,
+              environment: vault.environment,
+              accountMode: 'Live',
+              source: 'live_proxy',
+              lifecycle: 'ENTRY',
+              side:
+                venue === 'Spot' && canceledBinanceSide === 'SELL'
+                  ? 'Long'
+                  : canceledBinanceSide === 'BUY'
+                    ? 'Long'
+                    : 'Short',
+              binanceSide: canceledBinanceSide,
+              orderType: body.orderType ?? 'LIMIT',
+              timeInForce: 'GTC',
+              status: 'PARTIALLY_FILLED',
+              price: canceledAvgPx > 0 ? canceledAvgPx : canceledRawPx,
+              avgPrice: canceledAvgPx > 0 ? canceledAvgPx : canceledRawPx,
+              executedQty: canceledExecQty,
+              origQty: Number(cancelRes.data.origQty ?? canceledExecQty) || canceledExecQty,
+              quoteQty: canceledCumQuote > 0 ? canceledCumQuote : canceledExecQty * canceledAvgPx,
+              commission: 0,
+              commissionAsset: 'USDT',
+              isMaker: true,
+              realizedPnlUsdt: null,
+              rMultiple: null,
+              exitReason: null,
+              latencyMs: cancelRes.latencyMs,
+              endpoint: `DELETE ${cancelPath}`,
+              rationale: `${reasonText} (partially filled ${canceledExecQty} before cancel)`,
+              timestampMs: Date.now(),
+            },
+          ]);
+        }
+        res.json({
+          ok: true,
+          alreadyFilled: true,
+          partiallyFilled: true,
+          status: 'PARTIALLY_FILLED',
+          executedQty: canceledExecQty,
+          avgPrice: canceledAvgPx > 0 ? canceledAvgPx : undefined,
           latencyMs: cancelRes.latencyMs,
-          endpoint: `DELETE ${cancelPath}`,
-          rationale: `Canceled resting ${venue} order`,
-          timestampMs: Date.now(),
-        },
-      ]);
-      res.json({ ok: true, latencyMs: cancelRes.latencyMs, data: cancelRes.data });
+          data: cancelRes.data,
+        });
+        return;
+      }
+
+      const updatedEntry = orderHistoryDb.markEntryCanceled({
+        symbol,
+        venue,
+        environment: vault.environment,
+        accountMode: 'Live',
+        orderId: targetOrdId,
+        rationale: reasonText,
+        exitReason: 'Canceled',
+      });
+
+      if (!updatedEntry) {
+        orderHistoryDb.upsertLogs([
+          {
+            id: `live-cancel-${symbol}-${targetOrdId}-${Date.now()}`,
+            orderId: targetOrdId,
+            clientOrderId: `cancel_${symbol.toLowerCase()}`,
+            symbol,
+            venue,
+            environment: vault.environment,
+            accountMode: 'Live',
+            source: 'live_proxy',
+            lifecycle: 'CANCEL',
+            side:
+              venue === 'Spot' && canceledBinanceSide === 'SELL'
+                ? 'Long'
+                : canceledBinanceSide === 'BUY'
+                  ? 'Long'
+                  : 'Short',
+            binanceSide: canceledBinanceSide,
+            orderType: body.orderType ?? 'ORDER',
+            timeInForce: 'GTC',
+            status: 'CANCELED',
+            price: Number(cancelRes.data.price ?? 0) || 0,
+            executedQty: 0,
+            origQty: Number(cancelRes.data.origQty ?? 0) || 0,
+            quoteQty: 0,
+            commission: 0,
+            commissionAsset: 'USDT',
+            isMaker: false,
+            realizedPnlUsdt: null,
+            rMultiple: null,
+            exitReason: 'Canceled',
+            latencyMs: cancelRes.latencyMs,
+            endpoint: `DELETE ${cancelPath}`,
+            rationale: reasonText,
+            timestampMs: Date.now(),
+          },
+        ]);
+      }
+      res.json({ ok: true, alreadyFilled: false, latencyMs: cancelRes.latencyMs, data: cancelRes.data });
     } catch (err) {
       res.status(502).json({
         error: err instanceof Error ? err.message : 'Failed to reach Binance cancel endpoint',
       });
     }
-  }));
+  });
+
+  app.delete('/api/live/order', handleCancelLiveOrder);
+  app.post('/api/live/cancel-order', handleCancelLiveOrder);
 
   app.get('/api/live/trades', asyncRoute(async (req, res) => {
     const symbolParam = sanitizeSymbol(req.query.symbol, 'BTCUSDT');
@@ -3030,7 +3434,20 @@ async function bootstrapServer() {
     const endpoint = targetVenue === 'Futures' ? '/fapi/v1/allOrders' : '/api/v3/allOrders';
     const tradesEndpoint = targetVenue === 'Futures' ? '/fapi/v1/userTrades' : '/api/v3/myTrades';
     const nowMs = Date.now();
-    const windowStartMs = Math.max(0, nowMs - lookbackPresetToMs(lookback));
+    const requestedStartMs = Math.max(0, nowMs - lookbackPresetToMs(lookback));
+    // Honor SQLite sync_watermarks so repeat syncs don't re-pull already-synced days
+    const wmKey = `${targetVenue}:${authSnap.environment}:${sym}`;
+    const existingWm = orderHistoryDb.getSummary().watermarks.find((w) => w.key === wmKey);
+    const windowStartMs =
+      existingWm &&
+      existingWm.oldestSyncedStartMs > 0 &&
+      existingWm.oldestSyncedStartMs <= requestedStartMs &&
+      existingWm.lastSyncedAtMs > requestedStartMs
+        ? Math.max(requestedStartMs, existingWm.lastSyncedAtMs - 120_000)
+        : requestedStartMs;
+    const incrementalDays = Math.max(1, Math.ceil((nowMs - windowStartMs) / 86_400_000));
+    const effectiveLookback: SyncLookbackPreset =
+      incrementalDays <= 1 ? '1d' : incrementalDays <= 3 ? '3d' : incrementalDays <= 7 ? '7d' : lookback;
     let lastLatencyMs: number | undefined;
     const collectedRawOrders = new Map<string, Record<string, unknown>>();
     const collectedAlgoOrders = new Map<string, Record<string, unknown>>();
@@ -3067,7 +3484,7 @@ async function bootstrapServer() {
       }
       // Only if all 1000 returned orders are still newer than windowStartMs, paginate <24h slices within [windowStartMs, oldestMs - 1]
       if (list.length >= 1000 && Number.isFinite(oldestMs) && oldestMs > windowStartMs) {
-        const slices = buildBinanceSyncTimeWindows('Spot', lookback, oldestMs - 1)
+        const slices = buildBinanceSyncTimeWindows('Spot', effectiveLookback, oldestMs - 1)
           .filter((win) => win.endTime > windowStartMs)
           .map((win) => ({
             startTime: Math.max(windowStartMs, win.startTime),
@@ -3091,7 +3508,7 @@ async function bootstrapServer() {
     } else {
       // Official Binance USD-M Futures rule: startTime..endTime cannot exceed 7 days,
       // and omitting timestamps returns only the last 7 days. Slice into <= 7d windows.
-      const windows = buildBinanceSyncTimeWindows('Futures', lookback, nowMs);
+      const windows = buildBinanceSyncTimeWindows('Futures', effectiveLookback, nowMs);
       let anyOk = false;
       let firstErr: string | undefined;
       for (const win of windows) {
@@ -3195,7 +3612,7 @@ async function bootstrapServer() {
         const filledTimes = rawOrders
           .filter((r) => Number(r.executedQty ?? 0) > 0)
           .map((r) => Number(r.updateTime ?? r.time ?? nowMs));
-        const windows = buildBinanceSyncTimeWindows('Futures', lookback, nowMs).filter((win) =>
+        const windows = buildBinanceSyncTimeWindows('Futures', effectiveLookback, nowMs).filter((win) =>
           filledTimes.some((ts) => ts >= win.startTime - 60_000 && ts <= win.endTime + 60_000)
         );
         const allTrades: Array<Record<string, unknown>> = [];
@@ -3364,7 +3781,7 @@ async function bootstrapServer() {
           String(raw.side ?? 'SELL').toUpperCase() === 'BUY' ? 'BUY' : 'SELL';
         const algoStatusRaw = String(raw.algoStatus ?? raw.status ?? 'NEW').toUpperCase();
         const normStatus: BackendOrderExecutionLog['status'] =
-          algoStatusRaw === 'FILLED' || algoStatusRaw === 'TRIGGERED'
+          algoStatusRaw === 'FILLED' || algoStatusRaw === 'TRIGGERED' || algoStatusRaw === 'FINISHED'
             ? 'FILLED'
             : algoStatusRaw === 'CANCELED' || algoStatusRaw === 'CANCELLED'
               ? 'CANCELED'
@@ -3375,7 +3792,10 @@ async function bootstrapServer() {
                   : 'NEW';
         const triggerPrice = Number(raw.triggerPrice ?? raw.stopPrice ?? 0) || 0;
         const limitPrice = Number(raw.price ?? 0) || 0;
+        const actualPrice = Number(raw.actualPrice ?? 0) || 0;
         const origQty = Number(raw.quantity ?? raw.origQty ?? 0) || 0;
+        const actualQty = Number(raw.actualQty ?? 0) || (normStatus === 'FILLED' ? origQty : 0);
+        const effPrice = actualPrice > 0 ? actualPrice : limitPrice > 0 ? limitPrice : triggerPrice;
         const createTime = Number(raw.createTime ?? raw.time ?? raw.updateTime ?? nowMs);
         const updateTime = Number(raw.updateTime ?? createTime);
         const posSideRaw = String(raw.positionSide ?? 'BOTH').toUpperCase();
@@ -3416,13 +3836,13 @@ async function bootstrapServer() {
           timeInForce: String(raw.timeInForce ?? 'GTC').toUpperCase(),
           status: normStatus,
           price: limitPrice > 0 ? limitPrice : triggerPrice,
-          avgPrice: limitPrice > 0 ? limitPrice : triggerPrice,
+          avgPrice: effPrice,
           stopPrice: triggerPrice,
           activatePrice: raw.activatePrice !== undefined ? Number(raw.activatePrice) || null : null,
           priceRate: raw.priceRate !== undefined ? Number(raw.priceRate) || null : null,
-          executedQty: 0,
+          executedQty: actualQty,
           origQty,
-          quoteQty: origQty * (limitPrice > 0 ? limitPrice : triggerPrice),
+          quoteQty: (actualQty > 0 ? actualQty : origQty) * effPrice,
           commission: 0,
           commissionAsset: 'USDT',
           isMaker: false,
@@ -3456,7 +3876,7 @@ async function bootstrapServer() {
       venue: targetVenue,
       environment: authSnap.environment,
       lookback,
-      windowStartMs,
+      windowStartMs: requestedStartMs,
       syncedCount: combinedMapped.length,
       nowMs,
     });
@@ -3502,7 +3922,10 @@ async function bootstrapServer() {
         if (algoRes.ok) {
           exchangeAlgoOrders = extractBinanceAlgoOrders(algoRes.data);
         }
-        const posRes = await signedBinanceRequest('GET', '/fapi/v2/positionRisk', {}, 'Futures');
+        let posRes = await signedBinanceRequest('GET', '/fapi/v3/positionRisk', {}, 'Futures');
+        if (!posRes.ok && (posRes.status === 404 || posRes.status === 410)) {
+          posRes = await signedBinanceRequest('GET', '/fapi/v2/positionRisk', {}, 'Futures');
+        }
         if (posRes.ok && Array.isArray(posRes.data)) {
           exchangePositions = posRes.data as Array<Record<string, unknown>>;
         }
@@ -3588,11 +4011,16 @@ async function bootstrapServer() {
                 .map((s) => sanitizeSymbol(s))
                 .filter(Boolean)
             : null;
+        const dbSummary = orderHistoryDb.getSummary();
+        const seededDefaults = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'AVAXUSDT'];
         const baseSymbols = symbolParam
           ? [symbolParam]
-          : symbolsQuery && symbolsQuery.length > 0
-            ? symbolsQuery
-            : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'AVAXUSDT'];
+          : Array.from(
+              new Set([
+                ...(symbolsQuery && symbolsQuery.length > 0 ? symbolsQuery : seededDefaults),
+                ...dbSummary.distinctSymbols,
+              ])
+            );
         const targetSet = new Set<string>(baseSymbols);
         let orphanCount = 0;
 
@@ -3897,17 +4325,37 @@ async function bootstrapServer() {
         }
         if (qRes.ok) {
           const statusRaw = String(qRes.data.algoStatus ?? qRes.data.status ?? stale.status).toUpperCase();
-          const executedQty = Number(qRes.data.executedQty ?? stale.executedQty) || 0;
+          const normStatus: BackendOrderExecutionLog['status'] =
+            statusRaw === 'FILLED' || statusRaw === 'FINISHED' || statusRaw === 'TRIGGERED'
+              ? 'FILLED'
+              : statusRaw === 'PARTIALLY_FILLED'
+                ? 'PARTIALLY_FILLED'
+                : statusRaw === 'CANCELED' || statusRaw === 'CANCELLED'
+                  ? 'CANCELED'
+                  : statusRaw === 'EXPIRED' || statusRaw === 'EXPIRED_IN_MATCH'
+                    ? 'EXPIRED'
+                    : statusRaw === 'REJECTED'
+                      ? 'REJECTED'
+                      : 'NEW';
+          const executedQty =
+            Number(qRes.data.executedQty ?? qRes.data.actualQty ?? stale.executedQty) ||
+            (normStatus === 'FILLED' ? Number(qRes.data.quantity ?? stale.origQty) || stale.executedQty : 0);
           const quoteQty = Number(qRes.data.cummulativeQuoteQty ?? qRes.data.cumQuote ?? stale.quoteQty) || 0;
           const avgPrice =
             executedQty > 0 && quoteQty > 0
               ? quoteQty / executedQty
-              : Number(qRes.data.avgPrice ?? qRes.data.price ?? qRes.data.triggerPrice ?? stale.price) || stale.price;
+              : Number(
+                  qRes.data.actualPrice ??
+                    qRes.data.avgPrice ??
+                    qRes.data.price ??
+                    qRes.data.triggerPrice ??
+                    stale.price
+                ) || stale.price;
           updatedEntries.push({
             ...stale,
-            status: (statusRaw as BackendOrderExecutionLog['status']) || 'CANCELED',
+            status: normStatus,
             executedQty,
-            quoteQty,
+            quoteQty: quoteQty > 0 ? quoteQty : executedQty * avgPrice,
             avgPrice,
             updateTimeMs: Number(qRes.data.updateTime ?? Date.now()),
             timestampMs: Number(qRes.data.updateTime ?? Date.now()),
@@ -4316,11 +4764,83 @@ async function bootstrapServer() {
     process.exit(1);
   }
 
-  app.listen(port, host, () => {
+  const httpServer = http.createServer(app);
+  const cleanupWsRelay = attachWebSocketRelay(httpServer, {
+    screenerHub,
+    getDefaultVenue: () => vault.venue,
+    getDefaultEnv: () => vault.environment,
+    getEngineBaseUrl,
+    getEngineAuthToken,
+    authorizeUpgrade: (req, tokenFromQuery) => {
+      const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
+      const allowedOrigins = parseAllowedOrigins(process.env.APEXRUST_ALLOWED_ORIGINS);
+      const hostHeader = typeof req.headers.host === 'string' ? req.headers.host.trim().toLowerCase() : '';
+      const isSelfOrigin =
+        Boolean(origin) &&
+        Boolean(hostHeader) &&
+        (origin.toLowerCase() === `http://${hostHeader}` ||
+          origin.toLowerCase() === `https://${hostHeader}`);
+      if (origin && !isSelfOrigin && !isOriginAllowed(origin, allowedOrigins)) {
+        return { ok: false, status: 403, reason: 'WebSocket origin blocked' };
+      }
+      if (!configuredToken) {
+        return { ok: true };
+      }
+      const clientIp = resolveClientIp(req);
+      if (authFailureLimiter.isLocked(clientIp)) {
+        return { ok: false, status: 429, reason: 'Too many failed token attempts' };
+      }
+      const headerToken = String(req.headers['x-apexrust-token'] ?? '').trim();
+      const authHeader = String(req.headers.authorization ?? '').trim();
+      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+      if (
+        safeTokenMatch(tokenFromQuery, configuredToken) ||
+        safeTokenMatch(headerToken, configuredToken) ||
+        safeTokenMatch(bearerToken, configuredToken)
+      ) {
+        authFailureLimiter.recordSuccess(clientIp);
+        return { ok: true };
+      }
+      authFailureLimiter.recordFailure(clientIp);
+      return { ok: false, status: 401, reason: 'Unauthorized WebSocket token' };
+    },
+  });
+
+  let shuttingDown = false;
+  const handleShutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    cleanupWsRelay();
+    screenerHub.shutdown();
+    const forceExit = setTimeout(() => {
+      try {
+        orderHistoryDb.close();
+      } catch {
+        // Ignore close error on forced exit
+      }
+      process.exit(0);
+    }, 5000);
+    if (typeof forceExit.unref === 'function') {
+      forceExit.unref();
+    }
+    httpServer.close(() => {
+      clearTimeout(forceExit);
+      try {
+        orderHistoryDb.close();
+      } catch {
+        // Ignore close error
+      }
+      process.exit(0);
+    });
+  };
+  process.once('SIGINT', handleShutdown);
+  process.once('SIGTERM', handleShutdown);
+
+  httpServer.listen(port, host, () => {
     console.log(
       `ApexRust server listening on http://${host}:${port} (authority=${getEngineAuthority()}, tokenAuth=${
         configuredToken ? 'enabled' : 'mesh-trusted'
-      })`
+      }, wsRelay=/ws/screener,/ws/telemetry)`
     );
   });
 }

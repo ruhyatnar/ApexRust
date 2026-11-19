@@ -15,7 +15,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bot_core::{EngineSnapshot, ExchangeVenue, OrderExecutionMethod, Side};
+use bot_core::{
+    normalize_symbol_list, EngineSnapshot, ExchangeVenue, OrderExecutionMethod, PairSelectionMode,
+    Side, TrendingCategory,
+};
 use bot_engine::{EngineCommand, TradingEngine};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -94,29 +97,37 @@ fn percent_decode(input: &str) -> String {
 }
 
 fn client_rate_key(req: &Request) -> String {
-    if let Some(cf) = req
-        .headers()
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-    {
-        let trimmed = cf.trim();
-        if !trimmed.is_empty() {
-            return format!("cf:{trimmed}");
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    // Only trust proxy forwarding headers when the direct TCP peer is loopback (e.g., server.ts or cloudflared).
+    let trust_forwarded = peer_ip.is_none_or(|ip| ip.is_loopback());
+    if trust_forwarded {
+        if let Some(cf) = req
+            .headers()
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+        {
+            let trimmed = cf.trim();
+            if !trimmed.is_empty() {
+                return format!("cf:{trimmed}");
+            }
+        }
+        if let Some(xff) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+        {
+            let trimmed = xff.trim();
+            if !trimmed.is_empty() {
+                return format!("xff:{trimmed}");
+            }
         }
     }
-    if let Some(ci) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return format!("ip:{}", ci.0.ip());
-    }
-    if let Some(xff) = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-    {
-        let trimmed = xff.trim();
-        if !trimmed.is_empty() {
-            return format!("xff:{trimmed}");
-        }
+    if let Some(ip) = peer_ip {
+        return format!("ip:{ip}");
     }
     "default-client".to_string()
 }
@@ -226,7 +237,7 @@ async fn require_auth_middleware(
         }
 
         // Also allow ?token=<tok> (including percent-encoded values) for WebSocket upgrade handshakes
-        if !authorized && req.uri().path() == "/ws/telemetry" {
+        if !authorized && matches!(req.uri().path(), "/ws/telemetry" | "/ws/screener") {
             if let Some(query) = req.uri().query() {
                 for pair in query.split('&') {
                     if let Some(tok) = pair.strip_prefix("token=") {
@@ -305,6 +316,8 @@ pub fn router(state: WebState) -> Router {
     let protected = Router::new()
         .route("/api/config", get(config_handler))
         .route("/api/snapshot", get(snapshot_handler))
+        .route("/api/market/screener", get(screener_handler))
+        .route("/api/watchlist", post(watchlist_handler))
         .route(
             "/api/orders/history",
             get(orders_history_handler).delete(delete_orders_history_handler),
@@ -312,6 +325,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/orders/orphans", get(orders_orphans_handler))
         .route("/api/control", post(control_handler))
         .route("/ws/telemetry", get(ws_handler))
+        .route("/ws/screener", get(ws_screener_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_auth_middleware,
@@ -476,11 +490,18 @@ async fn orders_orphans_handler(State(state): State<WebState>) -> Json<serde_jso
         bot_core::ExchangeEnvironment::Testnet => "Testnet",
         bot_core::ExchangeEnvironment::Production => "Production",
     };
+    let snap = state.engine.latest_snapshot_handle().read().await.clone();
+    let mut active_pairs = cfg.trading.pairs.clone();
+    for p in &snap.pairs {
+        if !active_pairs.iter().any(|s| s.eq_ignore_ascii_case(&p.symbol)) {
+            active_pairs.push(p.symbol.clone());
+        }
+    }
     let engine = Arc::clone(&state.engine);
     let (orphans, summary) = tokio::task::spawn_blocking(move || {
         let orp = engine
             .order_store()
-            .detect_local_orphans(&cfg.trading.pairs, cfg.exchange.venue, env_str)
+            .detect_local_orphans(&active_pairs, cfg.exchange.venue, env_str)
             .unwrap_or_default();
         let sum = engine.order_store().summary().ok();
         (orp, sum)
@@ -517,6 +538,120 @@ async fn health_handler(State(state): State<WebState>) -> Json<serde_json::Value
 async fn snapshot_handler(State(state): State<WebState>) -> Json<EngineSnapshot> {
     let snap = state.engine.latest_snapshot_handle().read().await.clone();
     Json(snap)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreenerQueryParams {
+    category: Option<String>,
+    #[serde(default, alias = "quote_asset")]
+    quote_asset: Option<String>,
+    #[serde(default, alias = "min_quote_volume_usdt")]
+    min_quote_volume_usdt: Option<f64>,
+    #[serde(default, alias = "only_tradable")]
+    only_tradable: Option<bool>,
+    limit: Option<usize>,
+    q: Option<String>,
+}
+
+fn parse_trending_category(raw: Option<&str>) -> TrendingCategory {
+    match raw.unwrap_or("hot_volume").trim().to_lowercase().as_str() {
+        "top_gainers" => TrendingCategory::TopGainers,
+        "top_losers" => TrendingCategory::TopLosers,
+        "volatility_leaders" => TrendingCategory::VolatilityLeaders,
+        _ => TrendingCategory::HotVolume,
+    }
+}
+
+async fn screener_handler(
+    State(state): State<WebState>,
+    Query(query): Query<ScreenerQueryParams>,
+) -> Json<serde_json::Value> {
+    let cfg_t = &state.engine.config().trading;
+    let cat = if query.category.is_some() {
+        parse_trending_category(query.category.as_deref())
+    } else {
+        cfg_t.trending_category
+    };
+    let quote = query
+        .quote_asset
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_uppercase())
+        .unwrap_or_else(|| cfg_t.quote_asset.clone());
+    let min_vol = query
+        .min_quote_volume_usdt
+        .unwrap_or(cfg_t.trending_min_quote_volume_usdt)
+        .max(0.0);
+    let only_trad = query.only_tradable.unwrap_or(true);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let snap = state
+        .engine
+        .query_screener(cat, &quote, min_vol, only_trad, limit, query.q.as_deref())
+        .await;
+    let mut val = serde_json::to_value(&snap).unwrap_or_default();
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("ok".into(), serde_json::json!(true));
+    }
+    Json(val)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchlistUpdateRequest {
+    #[serde(default, alias = "pair_selection_mode")]
+    pair_selection_mode: Option<PairSelectionMode>,
+    #[serde(default, alias = "pinned_pairs", alias = "pairs")]
+    pinned_pairs: Option<Vec<String>>,
+    #[serde(default, alias = "trending_category")]
+    trending_category: Option<TrendingCategory>,
+    #[serde(default, alias = "quote_asset")]
+    quote_asset: Option<String>,
+    #[serde(default, alias = "max_watchlist_pairs")]
+    max_watchlist_pairs: Option<usize>,
+    #[serde(default, alias = "trending_top_n")]
+    trending_top_n: Option<usize>,
+}
+
+async fn watchlist_handler(
+    State(state): State<WebState>,
+    Json(req): Json<WatchlistUpdateRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let pinned = req
+        .pinned_pairs
+        .map(|list| normalize_symbol_list(&list, &[]));
+    let cmd = EngineCommand::UpdateWatchlist {
+        pair_selection_mode: req.pair_selection_mode,
+        pinned_pairs: pinned,
+        trending_category: req.trending_category,
+        quote_asset: req.quote_asset,
+        max_watchlist_pairs: req.max_watchlist_pairs,
+        trending_top_n: req.trending_top_n,
+        reply: Some(reply_tx),
+    };
+    if state.cmd_tx.send(cmd).await.is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "Engine command channel closed" })),
+        );
+    }
+    match tokio::time::timeout(Duration::from_secs(15), reply_rx).await {
+        Ok(Ok(Ok(val))) => (StatusCode::OK, Json(val)),
+        Ok(Ok(Err(err))) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": err })),
+        ),
+        Ok(Err(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "Engine dropped reply" })),
+        ),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "ok": false, "error": "Watchlist update timed out" })),
+        ),
+    }
 }
 
 async fn control_handler(
@@ -763,6 +898,43 @@ async fn handle_ws(mut socket: WebSocket, state: WebState) {
     }
 }
 
+async fn ws_screener_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<WebState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_ws_screener(socket, state))
+}
+
+async fn handle_ws_screener(mut socket: WebSocket, state: WebState) {
+    let mut rx = state.engine.subscribe_screener();
+    let initial = state.engine.latest_screener_handle().read().await.clone();
+    if let Ok(json) = serde_json::to_string(&serde_json::json!({
+        "type": "screener_snapshot",
+        "data": initial,
+    })) {
+        if socket.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    loop {
+        match rx.recv().await {
+            Ok(snap) => {
+                if let Ok(json) = serde_json::to_string(&serde_json::json!({
+                    "type": "screener_snapshot",
+                    "data": snap,
+                })) {
+                    if socket.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +1120,129 @@ mod tests {
         assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 
         server.abort();
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+
+    #[test]
+    fn control_request_accepts_lowercase_side_and_rate_key_ignores_spoofed_non_loopback_headers() {
+        let req_long: ControlRequest = serde_json::from_str(
+            r#"{"action":"manual_order","symbol":"BTCUSDT","side":"long","notional_usdt":100}"#,
+        )
+        .unwrap();
+        assert_eq!(req_long.side, Some(Side::Long));
+
+        let req_short: ControlRequest = serde_json::from_str(
+            r#"{"action":"manual_order","symbol":"ETHUSDT","side":"SHORT","notional_usdt":50}"#,
+        )
+        .unwrap();
+        assert_eq!(req_short.side, Some(Side::Short));
+
+        // Non-loopback peer cannot spoof cf-connecting-ip / x-forwarded-for
+        let mut spoofed_req = axum::http::Request::builder()
+            .uri("/api/snapshot")
+            .header("cf-connecting-ip", "1.2.3.4")
+            .header("x-forwarded-for", "5.6.7.8")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        spoofed_req
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from(([203, 0, 113, 5], 5000))));
+        assert_eq!(client_rate_key(&spoofed_req), "ip:203.0.113.5");
+
+        // Loopback reverse proxy peer IS trusted to forward cf-connecting-ip
+        let mut proxied_req = axum::http::Request::builder()
+            .uri("/api/snapshot")
+            .header("cf-connecting-ip", "198.51.100.9")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        proxied_req
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5000))));
+        assert_eq!(client_rate_key(&proxied_req), "cf:198.51.100.9");
+    }
+
+    #[tokio::test]
+    async fn orders_orphans_includes_dynamic_watchlist_pairs() {
+        let tmp_db = std::env::temp_dir().join("apexrust-web-orphans-dynamic-test.sqlite");
+        let _ = std::fs::remove_file(&tmp_db);
+        std::env::set_var("APEXRUST_ORDER_DB_PATH", &tmp_db);
+        let cfg = BotConfig::from_toml_file("../../config/bot.example.toml").unwrap();
+        let engine = Arc::new(TradingEngine::new(cfg).unwrap());
+        let now_ms: i64 = 1_763_280_000_000;
+
+        let make_log = |id: &str, oid: &str, sym: &str, price: f64, qty: f64| -> bot_core::OrderExecutionLog {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "orderId": oid,
+                "clientOrderId": format!("c-{oid}"),
+                "symbol": sym,
+                "venue": "Spot",
+                "environment": "Testnet",
+                "accountMode": "Live",
+                "source": "live_proxy",
+                "lifecycle": "ENTRY",
+                "side": "Long",
+                "binanceSide": "BUY",
+                "orderType": "MARKET",
+                "timeInForce": "GTC",
+                "status": "FILLED",
+                "price": price,
+                "executedQty": qty,
+                "origQty": qty,
+                "quoteQty": price * qty,
+                "realizedPnlUsdt": null,
+                "rMultiple": null,
+                "exitReason": null,
+                "latencyMs": 5,
+                "endpoint": "paper",
+                "rationale": "unit test entry",
+                "timestampMs": now_ms,
+            }))
+            .unwrap()
+        };
+
+        // Insert a DB log for a dynamically added trending pair (PEPEUSDT) and a truly orphaned pair (GHOSTUSDT)
+        engine
+            .order_store()
+            .upsert_logs(&[
+                make_log("dyn-pepe-1", "101", "PEPEUSDT", 0.000012, 1_000_000.0),
+                make_log("ghost-1", "102", "GHOSTUSDT", 1.0, 20.0),
+            ])
+            .unwrap();
+
+        // Simulate PEPEUSDT currently active in the live dynamic watchlist snapshot
+        {
+            let snap_handle = engine.latest_snapshot_handle();
+            let mut snap = snap_handle.write().await;
+            snap.pairs.push(bot_core::PairSnapshot {
+                symbol: "PEPEUSDT".into(),
+                last_price: 0.000012,
+                daily_pnl_usdt: 0.0,
+                daily_pnl_pct: 0.0,
+                indicators: bot_core::IndicatorSnapshot::default(),
+                open_position: None,
+                source_tag: Some(bot_core::PairSourceTag::Trending),
+                tradable_on_active_venue: Some(true),
+                quote_volume_24h_usdt: Some(100_000_000.0),
+                best_bid: None,
+                best_ask: None,
+                spread_bps: None,
+                bars_warmed_up: Some(220),
+            });
+        }
+
+        let (tx, _rx) = mpsc::channel(8);
+        let state = WebState::new(engine, tx, None);
+        let Json(resp) = orders_orphans_handler(State(state)).await;
+        let orphans = resp["orphans"].as_array().unwrap();
+        assert!(
+            !orphans.iter().any(|o| o["symbol"] == "PEPEUSDT"),
+            "Active dynamic watchlist pair PEPEUSDT must not be flagged as orphan: {resp}"
+        );
+        assert!(
+            orphans.iter().any(|o| o["symbol"] == "GHOSTUSDT"),
+            "Truly inactive GHOSTUSDT must still be flagged as orphan: {resp}"
+        );
         let _ = std::fs::remove_file(&tmp_db);
     }
 }

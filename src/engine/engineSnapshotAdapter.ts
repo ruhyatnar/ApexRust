@@ -6,6 +6,9 @@ import type {
   ExitReason,
   FeatureToggles,
   PairRuntimeState,
+  PairSelectionMode,
+  PairSourceTag,
+  PendingOrder,
   Position,
   Side,
   TransportMode,
@@ -38,12 +41,28 @@ interface RemoteVpsPairSnapshot {
   dailyPnlUsdt: number;
   dailyPnlPct: number;
   emaFast: number | null;
+  emaMid: number | null;
   emaSlow: number | null;
+  emaMacro: number | null;
+  prevEmaMid: number | null;
   rsi: number | null;
+  prevRsi: number | null;
   atr: number | null;
   adx: number | null;
+  prevAdx: number | null;
+  plusDi: number | null;
+  minusDi: number | null;
   vwap: number | null;
+  volumeRatio: number | null;
+  hasBarGap?: boolean;
   openPosition: RemoteVpsPosition | null;
+  sourceTag?: PairSourceTag;
+  tradableOnActiveVenue?: boolean;
+  quoteVolume24hUsdt?: number;
+  bestBid?: number | null;
+  bestAsk?: number | null;
+  spreadBps?: number | null;
+  barsWarmupCount?: number;
 }
 
 interface RemoteVpsClosedTrade {
@@ -79,6 +98,8 @@ export interface RemoteVpsEngineSnapshot {
   lastWsAgeMs: number;
   risk: RemoteVpsRiskStatus;
   pairs: RemoteVpsPairSnapshot[];
+  pendingOrders: PendingOrder[];
+  pairSelectionMode?: PairSelectionMode;
   recentTrades: RemoteVpsClosedTrade[];
   recentVolatilityAlerts: VolatilitySpikeAlert[];
   updatedAtIso: string;
@@ -151,20 +172,88 @@ export function mapRustEngineSnapshot(raw: unknown): RemoteVpsEngineSnapshot {
         openedAtIso: String(posRaw.opened_at ?? new Date().toISOString()),
       };
     }
+    const srcRaw = String(p.source_tag ?? '').toLowerCase();
+    const sourceTag: PairSourceTag | undefined =
+      srcRaw === 'protected_position'
+        ? 'protected_position'
+        : srcRaw === 'trending'
+          ? 'trending'
+          : srcRaw === 'pinned'
+            ? 'pinned'
+            : undefined;
+    const warmup = toOptNum(p.bars_warmed_up ?? ind.warmup_bars_count);
     return {
       symbol: String(p.symbol ?? 'BTCUSDT'),
       lastPrice: toNum(p.last_price),
       dailyPnlUsdt: toNum(p.daily_pnl_usdt),
       dailyPnlPct: toNum(p.daily_pnl_pct),
       emaFast: toOptNum(ind.ema_fast),
+      emaMid: toOptNum(ind.ema_mid),
       emaSlow: toOptNum(ind.ema_slow),
+      emaMacro: toOptNum(ind.ema_macro),
+      prevEmaMid: toOptNum(ind.prev_ema_mid),
       rsi: toOptNum(ind.rsi),
+      prevRsi: toOptNum(ind.prev_rsi),
       atr: toOptNum(ind.atr),
       adx: toOptNum(ind.adx),
+      prevAdx: toOptNum(ind.prev_adx),
+      plusDi: toOptNum(ind.plus_di),
+      minusDi: toOptNum(ind.minus_di),
       vwap: toOptNum(ind.vwap),
+      volumeRatio: toOptNum(ind.volume_ratio),
+      hasBarGap: typeof ind.has_bar_gap === 'boolean' ? ind.has_bar_gap : undefined,
       openPosition,
+      sourceTag,
+      tradableOnActiveVenue:
+        typeof p.tradable_on_active_venue === 'boolean' ? p.tradable_on_active_venue : undefined,
+      quoteVolume24hUsdt: toOptNum(p.quote_volume_24h_usdt) ?? undefined,
+      bestBid: toOptNum(p.best_bid),
+      bestAsk: toOptNum(p.best_ask),
+      spreadBps: toOptNum(p.spread_bps),
+      barsWarmupCount: warmup !== null ? Math.round(warmup) : undefined,
     };
   });
+
+  const pendingRaw = Array.isArray(obj.pending_orders)
+    ? (obj.pending_orders as Array<Record<string, unknown>>)
+    : [];
+  const pendingOrders: PendingOrder[] = pendingRaw.map((po) => {
+    const sideStr = String(po.side ?? 'long').toLowerCase();
+    const methodRaw = String(po.order_method ?? 'LIMIT').toUpperCase();
+    const orderMethod =
+      methodRaw === 'LIMITMAKER' || methodRaw === 'LIMIT_MAKER' ? 'LIMIT_MAKER' : 'LIMIT';
+    const limPx = toNum(po.limit_price);
+    const qty = toNum(po.quantity);
+    const createdMs = Date.parse(String(po.created_at ?? ''));
+    const rationaleStr = typeof po.rationale === 'string' && po.rationale.trim() ? po.rationale.trim() : undefined;
+    return {
+      id: String(po.order_id ?? ''),
+      symbol: String(po.symbol ?? 'BTCUSDT'),
+      venue,
+      side: sideStr === 'short' ? 'Short' : 'Long',
+      orderType: orderMethod === 'LIMIT_MAKER' ? 'LIMIT MAKER' : 'LIMIT',
+      orderMethod,
+      usdtAmount: limPx * qty,
+      limitPrice: limPx,
+      timeInForce: 'GTC',
+      stopLossMode: 'ATR',
+      stopLossPct: 1.5,
+      useBreakEven: true,
+      useTrailingStop: true,
+      targets: [],
+      createdAtMs: Number.isFinite(createdMs) ? createdMs : Date.now(),
+      exchangeOrderId: String(po.order_id ?? ''),
+      source: po.is_manual ? 'manual' : 'auto',
+      createdBarIndex: toNum(po.created_bar_idx),
+      ageBars: po.age_bars !== undefined && po.age_bars !== null ? Math.max(0, Math.round(toNum(po.age_bars))) : undefined,
+      dynamicStatusNote: rationaleStr,
+    };
+  });
+  const modeRaw = String(obj.pair_selection_mode ?? '').toLowerCase();
+  const pairSelectionMode: PairSelectionMode | undefined =
+    modeRaw === 'static' || modeRaw === 'dynamic' || modeRaw === 'hybrid'
+      ? modeRaw
+      : undefined;
 
   const tradesRaw = Array.isArray(obj.recent_trades)
     ? (obj.recent_trades as Array<Record<string, unknown>>)
@@ -233,6 +322,8 @@ export function mapRustEngineSnapshot(raw: unknown): RemoteVpsEngineSnapshot {
         : [],
     },
     pairs,
+    pendingOrders,
+    pairSelectionMode,
     recentTrades,
     recentVolatilityAlerts,
     updatedAtIso: String(obj.updated_at ?? new Date().toISOString()),
@@ -261,7 +352,7 @@ export function mapRustFeatureToggles(rawConfig: unknown): FeatureToggles | null
     adxStrengthFilter: bool('adxStrengthFilter', 'adx_strength_filter'),
     rsiMomentumFilter: bool('rsiMomentumFilter', 'rsi_momentum_filter'),
     vwapBiasFilter: bool('vwapBiasFilter', 'vwap_bias_filter'),
-    volumeConfirmationFilter: bool('volumeConfirmationFilter', 'volume_confirmation_filter'),
+    volumeConfirmationFilter: bool('volumeConfirmationFilter', 'volume_confirmation_filter', false),
     sessionWindowFilter: bool('sessionWindowFilter', 'session_window_filter', false),
     atrDynamicExits: bool('atrDynamicExits', 'atr_dynamic_exits'),
     takeProfitLadder: bool('takeProfitLadder', 'take_profit_ladder'),
@@ -270,7 +361,7 @@ export function mapRustFeatureToggles(rawConfig: unknown): FeatureToggles | null
     circuitBreaker: bool('circuitBreaker', 'circuit_breaker'),
     wsPrimaryFeed: bool('wsPrimaryFeed', 'ws_primary_feed'),
     restFallback: bool('restFallback', 'rest_fallback'),
-    gitAutoBackup: bool('gitAutoBackup', 'git_auto_backup'),
+    gitAutoBackup: bool('gitAutoBackup', 'git_auto_backup', false),
   };
 }
 
@@ -327,7 +418,10 @@ export function mergeRemoteVpsSnapshot(
     };
   };
 
-  const pairs: PairRuntimeState[] = base.pairs.map((pair) => {
+  const existingPairs = remote.pairs.length > 0
+    ? base.pairs.filter((pair) => remotePairsBySymbol.has(pair.symbol))
+    : base.pairs;
+  const pairs: PairRuntimeState[] = existingPairs.map((pair) => {
     const rp = remotePairsBySymbol.get(pair.symbol);
     if (!rp) return pair;
     return {
@@ -335,14 +429,31 @@ export function mergeRemoteVpsSnapshot(
       lastPrice: rp.lastPrice > 0 ? rp.lastPrice : pair.lastPrice,
       dailyPnlUsdt: rp.dailyPnlUsdt,
       dailyPnlPct: rp.dailyPnlPct,
+      sourceTag: rp.sourceTag ?? pair.sourceTag,
+      tradableOnActiveVenue: rp.tradableOnActiveVenue ?? pair.tradableOnActiveVenue,
+      quoteVolume24hUsdt: rp.quoteVolume24hUsdt ?? pair.quoteVolume24hUsdt,
+      bestBid: rp.bestBid ?? pair.bestBid,
+      bestAsk: rp.bestAsk ?? pair.bestAsk,
+      spreadBps: rp.spreadBps ?? pair.spreadBps,
+      barsWarmedUp: rp.barsWarmupCount ?? pair.barsWarmedUp,
       indicators: {
         ...pair.indicators,
         emaFast: rp.emaFast ?? pair.indicators.emaFast,
+        emaMid: rp.emaMid ?? pair.indicators.emaMid,
         emaSlow: rp.emaSlow ?? pair.indicators.emaSlow,
+        emaMacro: rp.emaMacro ?? pair.indicators.emaMacro,
+        prevEmaMid: rp.prevEmaMid ?? pair.indicators.prevEmaMid,
         rsi: rp.rsi ?? pair.indicators.rsi,
+        prevRsi: rp.prevRsi ?? pair.indicators.prevRsi,
         atr: rp.atr ?? pair.indicators.atr,
         adx: rp.adx ?? pair.indicators.adx,
+        prevAdx: rp.prevAdx ?? pair.indicators.prevAdx,
+        plusDi: rp.plusDi ?? pair.indicators.plusDi,
+        minusDi: rp.minusDi ?? pair.indicators.minusDi,
         vwap: rp.vwap ?? pair.indicators.vwap,
+        volumeRatio: rp.volumeRatio ?? pair.indicators.volumeRatio,
+        warmupBarsCount: rp.barsWarmupCount ?? pair.indicators.warmupBarsCount,
+        hasBarGap: rp.hasBarGap ?? pair.indicators.hasBarGap,
       },
       openPosition: mapRemotePos(rp.openPosition),
     };
@@ -358,18 +469,30 @@ export function mergeRemoteVpsSnapshot(
       change24hPct: 0,
       dailyPnlUsdt: rp.dailyPnlUsdt,
       dailyPnlPct: rp.dailyPnlPct,
+      sourceTag: rp.sourceTag,
+      tradableOnActiveVenue: rp.tradableOnActiveVenue,
+      quoteVolume24hUsdt: rp.quoteVolume24hUsdt,
+      bestBid: rp.bestBid ?? undefined,
+      bestAsk: rp.bestAsk ?? undefined,
+      spreadBps: rp.spreadBps ?? undefined,
+      barsWarmedUp: rp.barsWarmupCount,
       indicators: {
         emaFast: rp.emaFast,
-        emaMid: null,
+        emaMid: rp.emaMid,
         emaSlow: rp.emaSlow,
-        emaMacro: null,
+        emaMacro: rp.emaMacro,
+        prevEmaMid: rp.prevEmaMid,
         rsi: rp.rsi,
-        prevRsi: null,
+        prevRsi: rp.prevRsi,
         adx: rp.adx,
-        plusDi: null,
-        minusDi: null,
+        prevAdx: rp.prevAdx,
+        plusDi: rp.plusDi,
+        minusDi: rp.minusDi,
         atr: rp.atr,
         vwap: rp.vwap,
+        volumeRatio: rp.volumeRatio,
+        warmupBarsCount: rp.barsWarmupCount,
+        hasBarGap: rp.hasBarGap,
       },
       openPosition: mapRemotePos(rp.openPosition),
       lastSignalNote: null,
@@ -380,10 +503,7 @@ export function mergeRemoteVpsSnapshot(
     (sum, p) => sum + (p.openPosition?.lockedMarginUsdt ?? 0),
     0
   );
-  const availableBalanceUsdt =
-    base.availableBalanceUsdt > 0
-      ? base.availableBalanceUsdt
-      : Math.max(0, remote.risk.currentEquity - lockedBalanceUsdt);
+  const availableBalanceUsdt = Math.max(0, remote.risk.currentEquity - lockedBalanceUsdt);
 
   const recentTrades: ClosedTrade[] = remote.recentTrades.map((t) => {
     const closedMs = Date.parse(t.closedAtIso);
@@ -426,6 +546,7 @@ export function mergeRemoteVpsSnapshot(
     lockedBalanceUsdt,
     availableBalanceUsdt,
     pairs,
+    pendingOrders: remote.pendingOrders,
     recentTrades,
     volatilityAlerts:
       remote.recentVolatilityAlerts.length > 0

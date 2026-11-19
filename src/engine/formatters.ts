@@ -15,13 +15,17 @@ export function fmtUsdMagnitude(val: number): string {
   });
 }
 
-export function fmtSignedUsd(val: number): string {
-  const safe = Number.isFinite(val) ? val : 0;
-  return `${safe >= 0 ? '+' : '-'}$${fmtUsdMagnitude(safe)}`;
+export function pricePrecisionDecimals(px: number): number {
+  const abs = Math.abs(px);
+  if (!Number.isFinite(abs) || abs === 0) return 4;
+  if (abs >= 100) return 2;
+  if (abs >= 1) return 4;
+  if (abs >= 0.01) return 6;
+  return 8;
 }
 
 export function fmtPx(px: number, digits?: number): string {
   if (!Number.isFinite(px)) return '0.00';
   if (digits !== undefined) return px.toFixed(digits);
-  return px >= 100 ? px.toFixed(2) : px >= 1 ? px.toFixed(4) : px.toFixed(6);
+  return px.toFixed(pricePrecisionDecimals(px));
 }

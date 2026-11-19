@@ -128,6 +128,8 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
   includeOrphansRef.current = includeOrphansOnSync;
   const hasLogsRef = useRef(false);
   hasLogsRef.current = logs.length > 0;
+  const allSymbolsRef = useRef<string[]>(symbols);
+  allSymbolsRef.current = Array.from(new Set([...symbols, ...(dbSummary?.distinctSymbols ?? [])])).sort();
 
   useEffect(() => {
     setModeFilter(accountMode);
@@ -184,6 +186,8 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
           const curVenue = venueFilterRef.current;
           if (curSym !== 'ALL') {
             params.set('symbol', curSym);
+          } else if (allSymbolsRef.current.length > 0) {
+            params.set('symbols', allSymbolsRef.current.join(','));
           } else if (symbols.length > 0) {
             params.set('symbols', symbols.join(','));
           } else {
@@ -1403,11 +1407,17 @@ export const OrderHistoryView: React.FC<OrderHistoryViewProps> = ({
                   const fillPct =
                     log.origQty > 0 ? Math.min(100, (log.executedQty / log.origQty) * 100) : 0;
                   const stopPx = log.stopPrice ?? 0;
+                  const isTakeProfitType = log.orderType.startsWith('TAKE_PROFIT');
+                  const triggerOp = isTakeProfitType
+                    ? log.binanceSide === 'SELL'
+                      ? '>='
+                      : '<='
+                    : log.binanceSide === 'SELL'
+                      ? '<='
+                      : '>=';
                   const triggerLabel =
                     stopPx > 0
-                      ? `${log.workingType === 'CONTRACT_PRICE' ? 'Last' : 'Mark'} ${
-                          log.binanceSide === 'SELL' ? '<=' : '>='
-                        } $${fmtPx(stopPx)}`
+                      ? `${log.workingType === 'CONTRACT_PRICE' ? 'Last' : 'Mark'} ${triggerOp} $${fmtPx(stopPx)}`
                       : log.activatePrice && log.activatePrice > 0
                         ? `Act $${fmtPx(log.activatePrice)}${log.priceRate ? ` (${log.priceRate}%)` : ''}`
                         : '—';

@@ -1,4 +1,5 @@
 import type {
+  AutomationConfig,
   Candle,
   DirectionPolicy,
   EntrySignal,
@@ -8,6 +9,7 @@ import type {
   FeatureToggles,
   IndicatorConfig,
   IndicatorSnapshot,
+  PendingOrder,
   Position,
   Side,
   StrategyProfile,
@@ -19,6 +21,167 @@ interface StrategyEvalOptions {
   directionPolicy?: DirectionPolicy;
   recentCandles?: Candle[];
   features?: Partial<FeatureToggles>;
+  spreadBps?: number | null;
+  enforceVenueLongOnly?: boolean;
+}
+
+function resolveEffectiveDirectionPolicy(
+  policy: DirectionPolicy | undefined,
+  venue: TradingConfig['venue'],
+  enforceVenueLongOnly = false
+): DirectionPolicy {
+  if (enforceVenueLongOnly && venue === 'Spot') {
+    return 'long_only';
+  }
+  return policy ?? 'both';
+}
+
+interface SignalQualityEvaluation {
+  allOk: boolean;
+  warmupOk: boolean;
+  gapOk: boolean;
+  spreadOk: boolean;
+  macroOk: boolean;
+  extensionOk: boolean;
+  vwapCeilingOk: boolean;
+  candleStrengthOk: boolean;
+  bodyRatioOk: boolean;
+  adxSlopeOk: boolean;
+  diSpreadOk: boolean;
+  emaSlopeOk: boolean;
+}
+
+function computeCandleStrengthMetrics(candle: Candle, side: Side): {
+  closeStrength: number;
+  bodyRatio: number;
+} {
+  const range = candle.high - candle.low;
+  if (!Number.isFinite(range) || range <= 1e-12) {
+    return { closeStrength: 1, bodyRatio: 1 };
+  }
+  const closeStrength =
+    side === 'Long' ? (candle.close - candle.low) / range : (candle.high - candle.close) / range;
+  const bodyRatio = Math.abs(candle.close - candle.open) / range;
+  return { closeStrength, bodyRatio };
+}
+
+function evaluateSignalQualityMitigation(
+  side: Side,
+  candle: Candle,
+  ind: IndicatorSnapshot,
+  tradingCfg: TradingConfig,
+  indCfg: IndicatorConfig,
+  options?: StrategyEvalOptions
+): SignalQualityEvaluation {
+  const profile: StrategyProfile = options?.strategyProfile ?? 'trend_pullback';
+  const useEma = options?.features?.emaTrendFilter !== false;
+  const useAdx = options?.features?.adxStrengthFilter !== false;
+  const useVwap = options?.features?.vwapBiasFilter !== false;
+
+  const minWarmup = Math.max(20, indCfg.minWarmupBars ?? 50);
+  const warmupOk =
+    ind.warmupBarsCount === undefined || ind.warmupBarsCount === null || ind.warmupBarsCount >= minWarmup;
+  const gapOk = ind.hasBarGap !== true;
+
+  const maxSpread = indCfg.maxSpreadBps ?? 20.0;
+  const spreadOk =
+    options?.spreadBps === undefined ||
+    options.spreadBps === null ||
+    maxSpread <= 0 ||
+    options.spreadBps <= maxSpread;
+
+  const requireMacro =
+    ind.emaMacro !== null &&
+    useEma &&
+    (tradingCfg.mode === 'intraday' || indCfg.requireMacroEmaInScalping !== false);
+  const macroOk =
+    profile === 'vwap_reversion' ||
+    !requireMacro ||
+    (side === 'Long' ? candle.close > ind.emaMacro! : candle.close < ind.emaMacro!);
+
+  const atr = ind.atr ?? 0;
+  const maxEmaExt = indCfg.maxEmaMidExtensionAtr ?? 2.2;
+  const maxVwapExt = indCfg.maxVwapExtensionAtr ?? 2.8;
+  const extensionOk =
+    profile === 'vwap_reversion' ||
+    atr <= 0 ||
+    ind.emaMid === null ||
+    maxEmaExt <= 0 ||
+    (side === 'Long'
+      ? candle.close - ind.emaMid <= maxEmaExt * atr
+      : ind.emaMid - candle.close <= maxEmaExt * atr);
+  const vwapCeilingOk =
+    profile === 'vwap_reversion' ||
+    !useVwap ||
+    atr <= 0 ||
+    ind.vwap === null ||
+    maxVwapExt <= 0 ||
+    (side === 'Long'
+      ? candle.close - ind.vwap <= maxVwapExt * atr
+      : ind.vwap - candle.close <= maxVwapExt * atr);
+
+  const { closeStrength, bodyRatio } = computeCandleStrengthMetrics(candle, side);
+  const minStrength = indCfg.minCloseStrengthRatio ?? 0.55;
+  const minBody = indCfg.minCandleBodyRatio ?? 0.30;
+  const candleStrengthOk =
+    profile === 'vwap_reversion' || minStrength <= 0 || closeStrength >= minStrength;
+  const bodyRatioOk =
+    profile === 'vwap_reversion' || minBody <= 0 || bodyRatio >= minBody;
+
+  const adxSlopeOk =
+    profile === 'vwap_reversion' ||
+    !useAdx ||
+    indCfg.requireRisingAdx === false ||
+    ind.adx === null ||
+    ind.prevAdx === undefined ||
+    ind.prevAdx === null ||
+    ind.adx >= indCfg.adxMinTrend + 6 ||
+    ind.adx >= ind.prevAdx;
+
+  const minDiSpread = indCfg.minDiSpread ?? 3.0;
+  const diSpreadOk =
+    profile === 'vwap_reversion' ||
+    !useAdx ||
+    minDiSpread <= 0 ||
+    ind.plusDi === null ||
+    ind.minusDi === null ||
+    Math.abs(ind.plusDi - ind.minusDi) >= minDiSpread;
+
+  const emaSlopeOk =
+    profile === 'vwap_reversion' ||
+    !useEma ||
+    ind.emaMid === null ||
+    ind.prevEmaMid === undefined ||
+    ind.prevEmaMid === null ||
+    (side === 'Long' ? ind.emaMid >= ind.prevEmaMid : ind.emaMid <= ind.prevEmaMid);
+
+  const allOk =
+    warmupOk &&
+    gapOk &&
+    spreadOk &&
+    macroOk &&
+    extensionOk &&
+    vwapCeilingOk &&
+    candleStrengthOk &&
+    bodyRatioOk &&
+    adxSlopeOk &&
+    diSpreadOk &&
+    emaSlopeOk;
+
+  return {
+    allOk,
+    warmupOk,
+    gapOk,
+    spreadOk,
+    macroOk,
+    extensionOk,
+    vwapCeilingOk,
+    candleStrengthOk,
+    bodyRatioOk,
+    adxSlopeOk,
+    diSpreadOk,
+    emaSlopeOk,
+  };
 }
 
 export function evaluateEntrySignal(
@@ -53,7 +216,13 @@ export function evaluateEntrySignal(
   }
 
   const profile: StrategyProfile = options?.strategyProfile ?? 'trend_pullback';
-  const allowShort = (options?.directionPolicy ?? 'both') === 'both';
+  const effectivePolicy = resolveEffectiveDirectionPolicy(
+    options?.directionPolicy,
+    tradingCfg.venue,
+    Boolean(options?.enforceVenueLongOnly)
+  );
+  const allowLong = effectivePolicy === 'long_only' || effectivePolicy === 'both';
+  const allowShort = effectivePolicy === 'short_only' || effectivePolicy === 'both';
   const useEma = options?.features?.emaTrendFilter !== false;
   const useRsi = options?.features?.rsiMomentumFilter !== false;
   const useAdx = options?.features?.adxStrengthFilter !== false;
@@ -77,7 +246,12 @@ export function evaluateEntrySignal(
     const stretch = Math.abs(candle.close - refAnchor);
     const minStretch = ind.atr * 1.1;
 
+    const qualLong = evaluateSignalQualityMitigation('Long', candle, ind, tradingCfg, indCfg, options);
     if (
+      allowLong &&
+      qualLong.warmupOk &&
+      qualLong.gapOk &&
+      qualLong.spreadOk &&
       candle.close <= refAnchor - minStretch &&
       (!useRsi || (ind.rsi <= 38 && ind.rsi > ind.prevRsi))
     ) {
@@ -93,8 +267,12 @@ export function evaluateEntrySignal(
       };
     }
 
+    const qualShort = evaluateSignalQualityMitigation('Short', candle, ind, tradingCfg, indCfg, options);
     if (
       allowShort &&
+      qualShort.warmupOk &&
+      qualShort.gapOk &&
+      qualShort.spreadOk &&
       candle.close >= refAnchor + minStretch &&
       (!useRsi || (ind.rsi >= 62 && ind.rsi < ind.prevRsi))
     ) {
@@ -117,21 +295,13 @@ export function evaluateEntrySignal(
     return null;
   }
 
-  const macroLongOk =
-    !useEma ||
-    (tradingCfg.mode === 'intraday' && ind.emaMacro !== null
-      ? candle.close > ind.emaMacro
-      : true);
-  const macroShortOk =
-    !useEma ||
-    (tradingCfg.mode === 'intraday' && ind.emaMacro !== null
-      ? candle.close < ind.emaMacro
-      : true);
-
   const vwapLongOk =
     !useVwap || !indCfg.requireVwapAlignment || ind.vwap === null || candle.close >= ind.vwap;
   const vwapShortOk =
     !useVwap || !indCfg.requireVwapAlignment || ind.vwap === null || candle.close <= ind.vwap;
+
+  const qualLong = evaluateSignalQualityMitigation('Long', candle, ind, tradingCfg, indCfg, options);
+  const qualShort = evaluateSignalQualityMitigation('Short', candle, ind, tradingCfg, indCfg, options);
 
   if (profile === 'ema_breakout') {
     const rawHistory = options?.recentCandles ?? [];
@@ -156,9 +326,10 @@ export function evaluateEntrySignal(
     const rsiShortOk = !useRsi || (ind.rsi <= 50 && ind.rsi >= 26);
 
     if (
+      allowLong &&
       candle.close > priorHigh &&
       emaLongOk &&
-      macroLongOk &&
+      qualLong.allOk &&
       adxLongOk &&
       rsiLongOk &&
       volSurgeOk &&
@@ -180,7 +351,7 @@ export function evaluateEntrySignal(
       allowShort &&
       candle.close < priorLow &&
       emaShortOk &&
-      macroShortOk &&
+      qualShort.allOk &&
       adxShortOk &&
       rsiShortOk &&
       volSurgeOk &&
@@ -219,7 +390,7 @@ export function evaluateEntrySignal(
       ind.rsi <= indCfg.rsiShortPullbackMax &&
       ind.rsi < ind.prevRsi);
 
-  if (emaPullLongOk && macroLongOk && diLongOk && rsiPullLongOk && vwapLongOk) {
+  if (allowLong && emaPullLongOk && qualLong.allOk && diLongOk && rsiPullLongOk && vwapLongOk) {
     return {
       symbol,
       side: 'Long',
@@ -232,7 +403,7 @@ export function evaluateEntrySignal(
     };
   }
 
-  if (allowShort && emaPullShortOk && macroShortOk && diShortOk && rsiPullShortOk && vwapShortOk) {
+  if (allowShort && emaPullShortOk && qualShort.allOk && diShortOk && rsiPullShortOk && vwapShortOk) {
     return {
       symbol,
       side: 'Short',
@@ -275,7 +446,13 @@ export function evaluateSignalDiagnostics(
   };
   const price = latestCandle.close;
   const profile: StrategyProfile = options?.strategyProfile ?? 'trend_pullback';
-  const longOnly = (options?.directionPolicy ?? 'both') === 'long_only';
+  const effectivePolicy = resolveEffectiveDirectionPolicy(
+    options?.directionPolicy,
+    tradingCfg.venue,
+    Boolean(options?.enforceVenueLongOnly)
+  );
+  const allowLong = effectivePolicy === 'long_only' || effectivePolicy === 'both';
+  const allowShort = effectivePolicy === 'short_only' || effectivePolicy === 'both';
   const useEma = options?.features?.emaTrendFilter !== false;
   const useRsi = options?.features?.rsiMomentumFilter !== false;
   const useAdx = options?.features?.adxStrengthFilter !== false;
@@ -311,13 +488,17 @@ export function evaluateSignalDiagnostics(
     ind.emaMid < ind.emaSlow;
 
   const preferredSide: Side =
-    profile === 'vwap_reversion'
-      ? !longOnly && ind.vwap !== null && price > ind.vwap
-        ? 'Short'
-        : 'Long'
-      : emaBear && !longOnly
-        ? 'Short'
-        : 'Long';
+    !allowLong && allowShort
+      ? 'Short'
+      : allowLong && !allowShort
+        ? 'Long'
+        : profile === 'vwap_reversion'
+          ? ind.vwap !== null && price > ind.vwap
+            ? 'Short'
+            : 'Long'
+          : emaBear
+            ? 'Short'
+            : 'Long';
 
   const bias =
     profile === 'vwap_reversion'
@@ -325,10 +506,14 @@ export function evaluateSignalDiagnostics(
         ? 'Overextended Above VWAP (Short Setup)'
         : 'Stretched Below VWAP (Long Setup)'
       : emaBull || emaStackBull
-        ? 'Bullish Trend'
+        ? !allowLong
+          ? 'Bullish (Short-Only Filtered)'
+          : 'Bullish Trend'
         : emaBear || emaStackBear
-          ? longOnly
-            ? 'Bearish (Spot Long-Only Filtered)'
+          ? !allowShort
+            ? tradingCfg.venue === 'Spot'
+              ? 'Bearish (Spot Long-Only Filtered)'
+              : 'Bearish (Long-Only Filtered)'
             : 'Bearish Trend'
           : 'Neutral / Transition';
 
@@ -350,36 +535,41 @@ export function evaluateSignalDiagnostics(
       recent.length > 0 ? recent.reduce((sum, c) => sum + c.volume, 0) / recent.length : latestCandle.volume;
     const reqVolMult = useVolConfirm ? Math.max(1.1, minVolMult) : 1.1;
     const volSurgeOk = avgVol > 0 ? latestCandle.volume >= avgVol * reqVolMult : false;
-    const breakoutLong = price > priorHigh;
-    const breakoutShort = !longOnly && price < priorLow;
+    const breakoutLong = allowLong && price > priorHigh;
+    const breakoutShort = allowShort && price < priorLow;
     const breakoutOk = breakoutLong || breakoutShort;
+    const preferShortBreakout = preferredSide === 'Short' || (breakoutShort && !breakoutLong);
     const macroLongOk =
       !useEma || (tradingCfg.mode === 'intraday' && ind.emaMacro !== null ? price > ind.emaMacro : true);
     const macroShortOk =
       !useEma || (tradingCfg.mode === 'intraday' && ind.emaMacro !== null ? price < ind.emaMacro : true);
-    const macroOk = breakoutShort && !breakoutLong ? macroShortOk : macroLongOk;
+    const macroOk = preferShortBreakout ? macroShortOk : macroLongOk;
     const diOk =
       !useAdx ||
       (ind.plusDi !== null &&
         ind.minusDi !== null &&
-        (ind.plusDi > ind.minusDi || (!longOnly && ind.minusDi > ind.plusDi)));
+        ((allowLong && ind.plusDi > ind.minusDi) || (allowShort && ind.minusDi > ind.plusDi)));
     const vwapAlignOk =
       !useVwap ||
       !indCfg.requireVwapAlignment ||
       ind.vwap === null ||
-      (breakoutShort && !breakoutLong ? price <= ind.vwap : price >= ind.vwap);
+      (preferShortBreakout ? price <= ind.vwap : price >= ind.vwap);
     const rsiOk =
       !useRsi ||
       (ind.rsi !== null &&
-        ((ind.rsi >= 50 && ind.rsi <= 74) || (!longOnly && ind.rsi <= 50 && ind.rsi >= 26)));
+        ((allowLong && ind.rsi >= 50 && ind.rsi <= 74) || (allowShort && ind.rsi <= 50 && ind.rsi >= 26)));
+    const qualDiag = evaluateSignalQualityMitigation(preferredSide, latestCandle, ind, tradingCfg, indCfg, options);
 
     checks = [
       { label: '10-Bar Donchian Breakout', ok: breakoutOk },
-      { label: 'EMA Stack (9 > 21 > 50)', ok: !useEma || emaStackBull || (!longOnly && emaStackBear) },
-      { label: 'Macro EMA Alignment (200)', ok: macroOk },
-      { label: `ADX ≥ ${indCfg.adxMinTrend} & +DI/-DI (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk && diOk },
+      { label: 'EMA Stack (9 > 21 > 50)', ok: !useEma || (allowLong && emaStackBull) || (allowShort && emaStackBear) },
+      { label: 'Macro EMA Alignment (200)', ok: qualDiag.macroOk && macroOk },
+      { label: `ADX ≥ ${indCfg.adxMinTrend} & +DI/-DI (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk && diOk && qualDiag.adxSlopeOk && qualDiag.diSpreadOk },
       { label: `RSI Momentum Band (${ind.rsi?.toFixed(1) ?? '—'})`, ok: rsiOk },
-      { label: 'Session VWAP Alignment', ok: vwapAlignOk },
+      { label: 'Session VWAP Alignment', ok: vwapAlignOk && qualDiag.vwapCeilingOk },
+      { label: `Anti-Chase Clamp (≤ ${(indCfg.maxEmaMidExtensionAtr ?? 2.2).toFixed(1)}× ATR)`, ok: qualDiag.extensionOk },
+      { label: 'Candle Strength & Close Quality', ok: qualDiag.candleStrengthOk && qualDiag.bodyRatioOk },
+      { label: `Warmup & Spread Gate (≤ ${(indCfg.maxSpreadBps ?? 20).toFixed(0)} bps)`, ok: qualDiag.warmupOk && qualDiag.gapOk && qualDiag.spreadOk },
       {
         label: `Volume ≥ ${reqVolMult.toFixed(1)}× Avg (${(latestCandle.volume / Math.max(avgVol, 1e-9)).toFixed(2)}×)`,
         ok: volSurgeOk,
@@ -393,19 +583,21 @@ export function evaluateSignalDiagnostics(
       !useRsi ||
       (ind.rsi !== null &&
         ind.prevRsi !== null &&
-        ((ind.rsi <= 38 && ind.rsi > ind.prevRsi) ||
-          (!longOnly && ind.rsi >= 62 && ind.rsi < ind.prevRsi)));
+        ((allowLong && ind.rsi <= 38 && ind.rsi > ind.prevRsi) ||
+          (allowShort && ind.rsi >= 62 && ind.rsi < ind.prevRsi)));
     const adxMax = Math.max(38, indCfg.adxMinTrend + 12);
     const boundedAdx = !useAdx || (ind.adx !== null && ind.adx <= adxMax);
     const revertSideOk =
       refAnchor !== null &&
-      (price <= refAnchor - atr * 1.1 || (!longOnly && price >= refAnchor + atr * 1.1));
+      ((allowLong && price <= refAnchor - atr * 1.1) || (allowShort && price >= refAnchor + atr * 1.1));
+    const qualDiag = evaluateSignalQualityMitigation(preferredSide, latestCandle, ind, tradingCfg, indCfg, options);
 
     checks = [
       { label: `Anchor Stretch ≥ 1.1× ATR (${stretchRatio.toFixed(2)}×)`, ok: stretchRatio >= 1.1 },
       { label: `RSI Extreme Curl (${ind.rsi?.toFixed(1) ?? '—'})`, ok: rsiExtremeCurl },
       { label: `Bounded ADX ≤ ${adxMax} (${ind.adx?.toFixed(1) ?? '—'})`, ok: boundedAdx },
       { label: 'Reversion Side Alignment', ok: revertSideOk },
+      { label: `Warmup & Spread Gate (≤ ${(indCfg.maxSpreadBps ?? 20).toFixed(0)} bps)`, ok: qualDiag.warmupOk && qualDiag.gapOk && qualDiag.spreadOk },
     ];
     if (useVolConfirm) {
       checks.push({
@@ -415,43 +607,49 @@ export function evaluateSignalDiagnostics(
     }
   } else {
     const rsiPullLongOk =
+      allowLong &&
       ind.rsi !== null &&
       ind.prevRsi !== null &&
       ind.rsi >= indCfg.rsiLongPullbackMin &&
       ind.rsi <= indCfg.rsiLongPullbackMax &&
       ind.rsi > ind.prevRsi;
     const rsiPullShortOk =
-      !longOnly &&
+      allowShort &&
       ind.rsi !== null &&
       ind.prevRsi !== null &&
       ind.rsi >= indCfg.rsiShortPullbackMin &&
       ind.rsi <= indCfg.rsiShortPullbackMax &&
       ind.rsi < ind.prevRsi;
+    const preferShortPull = preferredSide === 'Short';
     const vwapAlign =
       !useVwap ||
       !indCfg.requireVwapAlignment ||
       ind.vwap === null ||
-      (emaBear && !longOnly ? price <= ind.vwap : price >= ind.vwap);
+      (preferShortPull ? price <= ind.vwap : price >= ind.vwap);
 
     const macroPullOk =
       !useEma ||
-      tradingCfg.mode !== 'intraday' ||
+      (tradingCfg.mode !== 'intraday' && indCfg.requireMacroEmaInScalping === false) ||
       ind.emaMacro === null ||
-      (emaBear && !longOnly ? price < ind.emaMacro : price > ind.emaMacro);
+      (preferShortPull ? price < ind.emaMacro : price > ind.emaMacro);
     const diPullOk =
       !useAdx ||
       (ind.plusDi !== null &&
         ind.minusDi !== null &&
-        (emaBear && !longOnly ? ind.minusDi > ind.plusDi : ind.plusDi > ind.minusDi));
+        (preferShortPull ? ind.minusDi > ind.plusDi : ind.plusDi > ind.minusDi));
+    const qualDiag = evaluateSignalQualityMitigation(preferredSide, latestCandle, ind, tradingCfg, indCfg, options);
 
     checks = [
-      { label: 'EMA Stack & Pullback', ok: (!useEma || emaBull || (!longOnly && emaBear)) && macroPullOk },
-      { label: `ADX ≥ ${indCfg.adxMinTrend} & +DI/-DI (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk && diPullOk },
+      { label: 'EMA Stack, Slope & Macro (200)', ok: (!useEma || (allowLong && emaBull) || (allowShort && emaBear)) && macroPullOk && qualDiag.emaSlopeOk },
+      { label: `ADX ≥ ${indCfg.adxMinTrend}, Slope & DI (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk && diPullOk && qualDiag.adxSlopeOk && qualDiag.diSpreadOk },
       {
         label: `RSI Curl Band (${ind.prevRsi?.toFixed(1) ?? '—'} → ${ind.rsi?.toFixed(1) ?? '—'})`,
         ok: !useRsi || rsiPullLongOk || rsiPullShortOk,
       },
-      { label: 'Session VWAP Alignment', ok: vwapAlign },
+      { label: 'Session VWAP Alignment', ok: vwapAlign && qualDiag.vwapCeilingOk },
+      { label: `Anti-Chase Clamp (≤ ${(indCfg.maxEmaMidExtensionAtr ?? 2.2).toFixed(1)}× ATR)`, ok: qualDiag.extensionOk },
+      { label: 'Candle Strength & Body Ratio', ok: qualDiag.candleStrengthOk && qualDiag.bodyRatioOk },
+      { label: `Warmup & Spread Gate (≤ ${(indCfg.maxSpreadBps ?? 20).toFixed(0)} bps)`, ok: qualDiag.warmupOk && qualDiag.gapOk && qualDiag.spreadOk },
     ];
     if (useVolConfirm || volRatio > 0) {
       checks.push({
@@ -489,9 +687,9 @@ export function buildExitPlan(
       takeProfit2: entryPrice + tp2Dist,
       tp1Hit: false,
       breakEvenArmed: false,
-      breakEvenEnabled: features?.breakEvenStop !== false,
+      breakEvenEnabled: atrEnabled && features?.breakEvenStop !== false,
       trailingActive: false,
-      trailingEnabled: features?.trailingStop !== false,
+      trailingEnabled: atrEnabled && features?.trailingStop !== false,
       riskDistanceR: slDist,
     };
   }
@@ -503,9 +701,9 @@ export function buildExitPlan(
     takeProfit2: entryPrice - tp2Dist,
     tp1Hit: false,
     breakEvenArmed: false,
-    breakEvenEnabled: features?.breakEvenStop !== false,
+    breakEvenEnabled: atrEnabled && features?.breakEvenStop !== false,
     trailingActive: false,
-    trailingEnabled: features?.trailingStop !== false,
+    trailingEnabled: atrEnabled && features?.trailingStop !== false,
     riskDistanceR: slDist,
   };
 }
@@ -520,10 +718,15 @@ export function managePositionTick(
   markPrice: number,
   currentAtr: number,
   cfg: ExitConfig,
-  features?: Partial<FeatureToggles>
+  features?: Partial<FeatureToggles>,
+  effectiveTrailingMultOverride?: number
 ): PositionTickAction {
   const r = Math.max(pos.exitPlan.riskDistanceR, 1e-9);
   const feeBuffer = pos.entryPrice * (cfg.breakEvenFeeBufferBps / 10_000);
+  const trailMult =
+    effectiveTrailingMultOverride !== undefined && effectiveTrailingMultOverride > 0
+      ? Math.min(cfg.atrTrailingMultiplier, effectiveTrailingMultOverride)
+      : cfg.atrTrailingMultiplier;
   const atrEnabled = features?.atrDynamicExits !== false;
   const tpEnabled = features?.takeProfitLadder !== false;
   const beEnabled =
@@ -554,7 +757,7 @@ export function managePositionTick(
 
     if (trailEnabled && rGain >= cfg.trailingActivationR && currentAtr > 0) {
       pos.exitPlan.trailingActive = true;
-      const trailSl = pos.highestFavorablePrice - currentAtr * cfg.atrTrailingMultiplier;
+      const trailSl = pos.highestFavorablePrice - currentAtr * trailMult;
       if (trailSl > pos.exitPlan.activeStopLoss) {
         pos.exitPlan.activeStopLoss = trailSl;
       }
@@ -630,7 +833,7 @@ export function managePositionTick(
 
   if (trailEnabled && rGain >= cfg.trailingActivationR && currentAtr > 0) {
     pos.exitPlan.trailingActive = true;
-    const trailSl = pos.highestFavorablePrice + currentAtr * cfg.atrTrailingMultiplier;
+    const trailSl = pos.highestFavorablePrice + currentAtr * trailMult;
     if (trailSl < pos.exitPlan.activeStopLoss) {
       pos.exitPlan.activeStopLoss = trailSl;
     }
@@ -677,6 +880,186 @@ export function managePositionTick(
           reason: 'TakeProfit1',
         };
       }
+    }
+  }
+
+  return { type: 'Hold' };
+}
+
+export type PendingCancelReason =
+  | 'SignalReversed'
+  | 'MomentumExhaustion'
+  | 'PriceRunaway'
+  | 'ExpiredBars';
+
+export type PendingOrderDynamicAction =
+  | { type: 'Keep' }
+  | { type: 'Cancel'; reason: PendingCancelReason; rationale: string };
+
+/**
+ * Evaluates whether a resting LIMIT / LIMIT_MAKER order should be dynamically cancelled
+ * when signal direction reverses, RSI hits exhaustion, price runs away, or TTL expires.
+ */
+export function evaluatePendingOrderDynamicAction(params: {
+  pending: PendingOrder;
+  candle: Candle;
+  ind: IndicatorSnapshot;
+  automationCfg: AutomationConfig;
+  currentBarIndex: number;
+  opposingSignal?: EntrySignal | null;
+}): PendingOrderDynamicAction {
+  const { pending, candle, ind, automationCfg, currentBarIndex, opposingSignal } = params;
+  if (
+    pending.source === 'manual' &&
+    automationCfg.applyDynamicCancelToManualOrders !== true
+  ) {
+    return { type: 'Keep' };
+  }
+
+  const cancelReversal = automationCfg.cancelPendingOnSignalReversal !== false;
+  const cancelExhaustion = automationCfg.cancelPendingOnExhaustion !== false;
+  const maxBars = Math.max(0, automationCfg.maxPendingOrderBars ?? 6);
+  const maxRunawayAtr = Math.max(0, automationCfg.maxPendingRunawayAtr ?? 1.8);
+  const rsiHigh = automationCfg.exhaustionRsiHigh ?? 76;
+  const rsiLow = automationCfg.exhaustionRsiLow ?? 24;
+
+  // 1. Signal reversal check (either explicit opposite EntrySignal or confirmed EMA/DI structural flip)
+  if (cancelReversal) {
+    if (opposingSignal && opposingSignal.side !== pending.side) {
+      return {
+        type: 'Cancel',
+        reason: 'SignalReversed',
+        rationale: `Auto-canceled pending ${pending.side} limit: confirmed opposing ${opposingSignal.side} signal (${opposingSignal.rationale})`,
+      };
+    }
+    const structuralBearFlip =
+      pending.side === 'Long' &&
+      ind.emaFast !== null &&
+      ind.emaMid !== null &&
+      ind.emaSlow !== null &&
+      ind.plusDi !== null &&
+      ind.minusDi !== null &&
+      ind.emaFast < ind.emaMid &&
+      ind.emaMid < ind.emaSlow &&
+      ind.minusDi > ind.plusDi &&
+      candle.close < ind.emaMid;
+    const structuralBullFlip =
+      pending.side === 'Short' &&
+      ind.emaFast !== null &&
+      ind.emaMid !== null &&
+      ind.emaSlow !== null &&
+      ind.plusDi !== null &&
+      ind.minusDi !== null &&
+      ind.emaFast > ind.emaMid &&
+      ind.emaMid > ind.emaSlow &&
+      ind.plusDi > ind.minusDi &&
+      candle.close > ind.emaMid;
+    if (structuralBearFlip || structuralBullFlip) {
+      return {
+        type: 'Cancel',
+        reason: 'SignalReversed',
+        rationale: `Auto-canceled pending ${pending.side} limit: EMA stack & DI trend flipped opposite`,
+      };
+    }
+  }
+
+  // 2. Momentum exhaustion / saturation ("pair sudah jenuh")
+  if (cancelExhaustion && ind.rsi !== null && ind.prevRsi !== null) {
+    if (pending.side === 'Long' && ind.rsi >= rsiHigh && ind.rsi < ind.prevRsi) {
+      return {
+        type: 'Cancel',
+        reason: 'MomentumExhaustion',
+        rationale: `Auto-canceled pending Long limit: RSI exhausted (${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)} ≥ ${rsiHigh})`,
+      };
+    }
+    if (pending.side === 'Short' && ind.rsi <= rsiLow && ind.rsi > ind.prevRsi) {
+      return {
+        type: 'Cancel',
+        reason: 'MomentumExhaustion',
+        rationale: `Auto-canceled pending Short limit: RSI exhausted (${ind.prevRsi.toFixed(1)} → ${ind.rsi.toFixed(1)} ≤ ${rsiLow})`,
+      };
+    }
+  }
+
+  // 3. Price runaway away from resting limit price
+  if (maxRunawayAtr > 0 && ind.atr !== null && ind.atr > 0) {
+    const runawayDist =
+      pending.side === 'Long'
+        ? candle.close - pending.limitPrice
+        : pending.limitPrice - candle.close;
+    if (runawayDist > maxRunawayAtr * ind.atr) {
+      return {
+        type: 'Cancel',
+        reason: 'PriceRunaway',
+        rationale: `Auto-canceled pending ${pending.side} limit: price ran away ${(runawayDist / ind.atr).toFixed(2)}×ATR from limit $${pending.limitPrice.toFixed(4)}`,
+      };
+    }
+  }
+
+  // 4. Bar-count TTL expiry to free concurrency slot
+  if (maxBars > 0 && typeof pending.createdBarIndex === 'number') {
+    const elapsedBars = currentBarIndex - pending.createdBarIndex;
+    if (elapsedBars >= maxBars) {
+      return {
+        type: 'Cancel',
+        reason: 'ExpiredBars',
+        rationale: `Auto-canceled pending ${pending.side} limit: TTL expired after ${elapsedBars} closed bars`,
+      };
+    }
+  }
+
+  return { type: 'Keep' };
+}
+
+export type OpenPositionDynamicAction =
+  | { type: 'Hold' }
+  | { type: 'TightenTrailing'; factor: number; rationale: string }
+  | { type: 'EarlyReversalExit'; reason: 'SignalReversal'; opposingSignal: EntrySignal; rationale: string };
+
+/**
+ * Evaluates active open positions on closed bars for confirmed opposite-direction signal reversal
+ * or profitable momentum exhaustion ("jenuh") trailing tightening.
+ */
+export function evaluateOpenPositionDynamicAction(params: {
+  pos: Position;
+  candle: Candle;
+  ind: IndicatorSnapshot;
+  automationCfg: AutomationConfig;
+  opposingSignal?: EntrySignal | null;
+}): OpenPositionDynamicAction {
+  const { pos, candle, ind, automationCfg, opposingSignal } = params;
+  if (automationCfg.exitPositionOnSignalReversal !== false && opposingSignal && opposingSignal.side !== pos.side) {
+    return {
+      type: 'EarlyReversalExit',
+      reason: 'SignalReversal',
+      opposingSignal,
+      rationale: `Closed ${pos.side} early on confirmed opposing ${opposingSignal.side} signal (${opposingSignal.rationale})`,
+    };
+  }
+
+  if (
+    automationCfg.tightenTrailingOnExhaustion !== false &&
+    ind.rsi !== null &&
+    ind.prevRsi !== null
+  ) {
+    const r = Math.max(pos.exitPlan.riskDistanceR, 1e-9);
+    const rGain =
+      pos.side === 'Long'
+        ? (candle.close - pos.entryPrice) / r
+        : (pos.entryPrice - candle.close) / r;
+    const minProfitR = automationCfg.exhaustionMinProfitR ?? 1.0;
+    const rsiHigh = automationCfg.exhaustionRsiHigh ?? 76;
+    const rsiLow = automationCfg.exhaustionRsiLow ?? 24;
+    const factor = Math.max(0.2, Math.min(0.95, automationCfg.exhaustionTrailFactor ?? 0.55));
+
+    const longExhausted = pos.side === 'Long' && ind.rsi >= rsiHigh && ind.rsi < ind.prevRsi;
+    const shortExhausted = pos.side === 'Short' && ind.rsi <= rsiLow && ind.rsi > ind.prevRsi;
+    if (rGain >= minProfitR && (longExhausted || shortExhausted)) {
+      return {
+        type: 'TightenTrailing',
+        factor,
+        rationale: `Tightened trailing stop (${(factor * 100).toFixed(0)}%) on RSI exhaustion at +${rGain.toFixed(2)}R`,
+      };
     }
   }
 

@@ -9,6 +9,10 @@ const rawRustModules = import.meta.glob(
     '!/rust-bot/Cargo.lock',
     '!/rust-bot/config/bot.toml',
     '!/rust-bot/config/bot.toml.bak',
+    '!/rust-bot/**/*.pem',
+    '!/rust-bot/**/*.key',
+    '!/rust-bot/**/.env*',
+    '!/rust-bot/**/*.sqlite*',
   ],
   {
     query: '?raw',
@@ -111,8 +115,8 @@ export const RustCodebaseView: React.FC = () => {
               <p className="text-xs text-slate-400">
                 Built on official <code className="font-mono text-slate-200">binance-sdk</code> (
                 <code className="font-mono text-slate-200">SpotRestApi</code>,{' '}
-                <code className="font-mono text-slate-200">SpotWsApi</code>,{' '}
-                <code className="font-mono text-slate-200">SpotWsStreams</code>) with 8 modular crates.
+                <code className="font-mono text-slate-200">DerivativesTradingUsdsFuturesRestApi</code>) &amp;{' '}
+                <code className="font-mono text-slate-200">tokio-tungstenite</code> across 8 modular crates.
               </p>
             </div>
           </div>

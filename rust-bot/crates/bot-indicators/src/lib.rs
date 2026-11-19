@@ -117,7 +117,7 @@ impl WilderRsi {
 
     fn compute_rsi(avg_gain: f64, avg_loss: f64) -> f64 {
         if avg_loss <= f64::EPSILON {
-            return 100.0;
+            return if avg_gain <= f64::EPSILON { 50.0 } else { 100.0 };
         }
         let rs = avg_gain / avg_loss;
         100.0 - (100.0 / (1.0 + rs))
@@ -188,6 +188,7 @@ pub struct Adx {
     dx_count: usize,
     dx_acc: f64,
     adx: Option<f64>,
+    prev_adx: Option<f64>,
     plus_di: Option<f64>,
     minus_di: Option<f64>,
 }
@@ -207,15 +208,16 @@ impl Adx {
             dx_count: 0,
             dx_acc: 0.0,
             adx: None,
+            prev_adx: None,
             plus_di: None,
             minus_di: None,
         }
     }
 
-    pub fn next(&mut self, candle: &Candle) -> (Option<f64>, Option<f64>, Option<f64>) {
+    pub fn next(&mut self, candle: &Candle) -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
         let Some(prev) = self.prev_candle else {
             self.prev_candle = Some(*candle);
-            return (None, None, None);
+            return (None, None, None, None);
         };
         self.prev_candle = Some(*candle);
 
@@ -245,7 +247,7 @@ impl Adx {
                 self.plus_dm_acc += plus_dm;
                 self.minus_dm_acc += minus_dm;
                 if self.dm_count < self.period {
-                    return (None, None, None);
+                    return (None, None, None, None);
                 }
                 self.smoothed_tr = Some(self.tr_acc);
                 self.smoothed_plus_dm = Some(self.plus_dm_acc);
@@ -255,7 +257,7 @@ impl Adx {
         };
 
         if str_v <= f64::EPSILON {
-            return (self.adx, self.plus_di, self.minus_di);
+            return (self.adx, self.prev_adx, self.plus_di, self.minus_di);
         }
 
         let pdi = 100.0 * (sp_v / str_v);
@@ -270,6 +272,7 @@ impl Adx {
             0.0
         };
 
+        self.prev_adx = self.adx;
         if let Some(prev_adx) = self.adx {
             self.adx = Some(((prev_adx * (p - 1.0)) + dx) / p);
         } else {
@@ -280,7 +283,7 @@ impl Adx {
             }
         }
 
-        (self.adx, self.plus_di, self.minus_di)
+        (self.adx, self.prev_adx, self.plus_di, self.minus_di)
     }
 }
 
@@ -368,6 +371,7 @@ pub struct IndicatorPipeline {
     adx: Adx,
     vwap: SessionVwap,
     volume_sma_20: RollingVolumeSma,
+    warmup_bars_count: usize,
     latest: IndicatorSnapshot,
 }
 
@@ -383,30 +387,39 @@ impl IndicatorPipeline {
             adx: Adx::new(cfg.adx_period),
             vwap: SessionVwap::default(),
             volume_sma_20: RollingVolumeSma::new(20),
+            warmup_bars_count: 0,
             latest: IndicatorSnapshot::default(),
         }
     }
 
     pub fn update(&mut self, candle: &Candle) -> IndicatorSnapshot {
+        self.update_with_gap(candle, false)
+    }
+
+    pub fn update_with_gap(&mut self, candle: &Candle, has_bar_gap: bool) -> IndicatorSnapshot {
         let prev_atr = self.latest.atr;
+        let prev_ema_mid = self.latest.ema_mid;
         let ema_fast = self.ema_fast.next(candle.close);
         let ema_mid = self.ema_mid.next(candle.close);
         let ema_slow = self.ema_slow.next(candle.close);
         let ema_macro = self.ema_macro.next(candle.close);
         let rsi = self.rsi.next(candle.close);
         let atr = self.atr.next(candle);
-        let (adx, plus_di, minus_di) = self.adx.next(candle);
+        let (adx, prev_adx, plus_di, minus_di) = self.adx.next(candle);
         let vwap = self.vwap.next(candle);
         let (avg_volume_20, volume_ratio) = self.volume_sma_20.next(candle.volume);
+        self.warmup_bars_count += 1;
 
         self.latest = IndicatorSnapshot {
             ema_fast,
             ema_mid,
             ema_slow,
             ema_macro,
+            prev_ema_mid,
             rsi,
             prev_rsi: self.rsi.previous,
             adx,
+            prev_adx,
             plus_di,
             minus_di,
             atr,
@@ -414,6 +427,8 @@ impl IndicatorPipeline {
             vwap,
             avg_volume_20,
             volume_ratio,
+            warmup_bars_count: self.warmup_bars_count,
+            has_bar_gap,
         };
         self.latest
     }
@@ -453,5 +468,15 @@ mod tests {
             });
         }
         assert!(last.unwrap() >= 4.0);
+    }
+
+    #[test]
+    fn flat_price_wilder_rsi_returns_neutral_fifty() {
+        let mut rsi = WilderRsi::new(14);
+        let mut val = None;
+        for _ in 0..20 {
+            val = rsi.next(100.0);
+        }
+        assert_eq!(val, Some(50.0));
     }
 }

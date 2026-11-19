@@ -125,10 +125,21 @@ export function isPrivateOrLoopbackHost(rawHost) {
   let host = String(rawHost ?? '').trim().toLowerCase();
   if (host.startsWith('[') && host.includes(']')) {
     host = host.slice(1, host.indexOf(']'));
+  } else if (host.includes(':') && host.indexOf(':') === host.lastIndexOf(':')) {
+    host = host.slice(0, host.lastIndexOf(':'));
+  }
+  const zoneIdx = host.indexOf('%');
+  if (zoneIdx > 0) {
+    host = host.slice(0, zoneIdx);
+  }
+  if (host.startsWith('::ffff:')) {
+    host = host.slice('::ffff:'.length);
   }
   if (!host || host === '0.0.0.0' || host === '::') return false;
   if (host === 'localhost' || host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
-  if (host.startsWith('fc') || host.startsWith('fd') || host.startsWith('fe80:')) return true;
+  if (host.includes(':') && (/^f[cd][0-9a-f]{2}:/.test(host) || /^fe[89ab][0-9a-f]:/.test(host))) {
+    return true;
+  }
   if (
     host.endsWith('.local') ||
     host.endsWith('.internal') ||

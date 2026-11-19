@@ -38,9 +38,13 @@ pub struct IndicatorSnapshot {
     pub ema_mid: Option<f64>,
     pub ema_slow: Option<f64>,
     pub ema_macro: Option<f64>,
+    #[serde(default)]
+    pub prev_ema_mid: Option<f64>,
     pub rsi: Option<f64>,
     pub prev_rsi: Option<f64>,
     pub adx: Option<f64>,
+    #[serde(default)]
+    pub prev_adx: Option<f64>,
     pub plus_di: Option<f64>,
     pub minus_di: Option<f64>,
     pub atr: Option<f64>,
@@ -49,11 +53,17 @@ pub struct IndicatorSnapshot {
     pub avg_volume_20: Option<f64>,
     #[serde(default)]
     pub volume_ratio: Option<f64>,
+    #[serde(default)]
+    pub warmup_bars_count: usize,
+    #[serde(default)]
+    pub has_bar_gap: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {
+    #[serde(alias = "long", alias = "LONG")]
     Long,
+    #[serde(alias = "short", alias = "SHORT")]
     Short,
 }
 
@@ -114,6 +124,8 @@ pub enum ExitReason {
     TrailingStop,
     TakeProfit1,
     TakeProfit2,
+    SignalReversal,
+    MomentumExhaustion,
     CircuitBreakerFlatten,
     ManualClose,
 }
@@ -153,6 +165,15 @@ pub struct RiskStatus {
     pub quarantined_pairs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PairSourceTag {
+    #[default]
+    Pinned,
+    Trending,
+    ProtectedPosition,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PairSnapshot {
     pub symbol: String,
@@ -161,6 +182,73 @@ pub struct PairSnapshot {
     pub daily_pnl_pct: f64,
     pub indicators: IndicatorSnapshot,
     pub open_position: Option<Position>,
+    #[serde(default)]
+    pub source_tag: Option<PairSourceTag>,
+    #[serde(default)]
+    pub tradable_on_active_venue: Option<bool>,
+    #[serde(default)]
+    pub quote_volume_24h_usdt: Option<f64>,
+    #[serde(default)]
+    pub best_bid: Option<f64>,
+    #[serde(default)]
+    pub best_ask: Option<f64>,
+    #[serde(default)]
+    pub spread_bps: Option<f64>,
+    #[serde(default)]
+    pub bars_warmed_up: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingOrderSnapshot {
+    pub order_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub order_method: crate::OrderExecutionMethod,
+    pub quantity: f64,
+    pub limit_price: f64,
+    pub is_live: bool,
+    pub is_manual: bool,
+    pub created_bar_idx: u64,
+    pub age_bars: u64,
+    pub rationale: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketTicker24h {
+    pub symbol: String,
+    #[serde(with = "serde_exchange_venue")]
+    pub venue: crate::ExchangeVenue,
+    pub last_price: f64,
+    pub open_price_24h: f64,
+    pub high_price_24h: f64,
+    pub low_price_24h: f64,
+    pub price_change_percent: f64,
+    pub base_volume: f64,
+    pub quote_volume: f64,
+    pub range_pct_24h: f64,
+    pub tradable_on_active_env: bool,
+    #[serde(default)]
+    pub in_watchlist: bool,
+    #[serde(default)]
+    pub source_tag: Option<PairSourceTag>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenerSnapshotPayload {
+    #[serde(with = "serde_exchange_venue")]
+    pub venue: crate::ExchangeVenue,
+    pub environment: String,
+    pub ranking_source_used: String,
+    pub stream_connected: bool,
+    pub total_tradable_symbols: usize,
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub rate_weight_used_1m: Option<u64>,
+    pub tickers: Vec<MarketTicker24h>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +273,10 @@ pub struct EngineSnapshot {
     pub last_ws_age_ms: u64,
     pub risk: RiskStatus,
     pub pairs: Vec<PairSnapshot>,
+    #[serde(default)]
+    pub pending_orders: Vec<PendingOrderSnapshot>,
+    #[serde(default)]
+    pub pair_selection_mode: crate::PairSelectionMode,
     pub recent_trades: Vec<ClosedTrade>,
     #[serde(default)]
     pub recent_volatility_alerts: Vec<VolatilitySpikeAlert>,
@@ -205,24 +297,6 @@ pub enum SyncLookbackPreset {
 }
 
 impl SyncLookbackPreset {
-    pub fn from_str_param(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "1d" => Self::D1,
-            "3d" => Self::D3,
-            "30d" | "1m" | "1month" => Self::D30,
-            _ => Self::D7,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::D1 => "1d",
-            Self::D3 => "3d",
-            Self::D7 => "7d",
-            Self::D30 => "30d",
-        }
-    }
-
     pub fn duration_ms(&self) -> i64 {
         match self {
             Self::D1 => 86_400_000,
@@ -613,32 +687,30 @@ impl OrderHistoryStore {
             symbols.insert(l.symbol.clone());
         }
         let mut watermarks = Vec::new();
-        if let Ok(conn) = self.open_conn() {
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT key, symbol, venue, environment, last_synced_at_ms, oldest_synced_start_ms, last_lookback, last_synced_count
-                 FROM sync_watermarks ORDER BY last_synced_at_ms DESC",
-            ) {
-                if let Ok(rows) = stmt.query_map([], |r| {
-                    let venue_raw: String = r.get(2)?;
-                    let lb_raw: String = r.get(6)?;
-                    Ok(SymbolSyncWatermark {
-                        key: r.get(0)?,
-                        symbol: r.get(1)?,
-                        venue: if venue_raw == "Futures" {
-                            crate::ExchangeVenue::Futures
-                        } else {
-                            crate::ExchangeVenue::Spot
-                        },
-                        environment: r.get(3)?,
-                        last_synced_at_ms: r.get(4)?,
-                        oldest_synced_start_ms: r.get(5)?,
-                        last_lookback: lb_raw,
-                        last_synced_count: r.get::<_, i64>(7)?.max(0) as usize,
-                    })
-                }) {
-                    for wm in rows.flatten() {
-                        watermarks.push(wm);
-                    }
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT key, symbol, venue, environment, last_synced_at_ms, oldest_synced_start_ms, last_lookback, last_synced_count
+             FROM sync_watermarks ORDER BY last_synced_at_ms DESC",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                let venue_raw: String = r.get(2)?;
+                let lb_raw: String = r.get(6)?;
+                Ok(SymbolSyncWatermark {
+                    key: r.get(0)?,
+                    symbol: r.get(1)?,
+                    venue: if venue_raw == "Futures" {
+                        crate::ExchangeVenue::Futures
+                    } else {
+                        crate::ExchangeVenue::Spot
+                    },
+                    environment: r.get(3)?,
+                    last_synced_at_ms: r.get(4)?,
+                    oldest_synced_start_ms: r.get(5)?,
+                    last_lookback: lb_raw,
+                    last_synced_count: r.get::<_, i64>(7)?.max(0) as usize,
+                })
+            }) {
+                for wm in rows.flatten() {
+                    watermarks.push(wm);
                 }
             }
         }
@@ -659,6 +731,57 @@ impl OrderHistoryStore {
             watermarks,
             last_updated_at_ms: Utc::now().timestamp_millis(),
         })
+    }
+
+    /// Transitions an existing `ENTRY` order row (`NEW` / `PARTIALLY_FILLED`) to `CANCELED`
+    /// in place on the matching `composite_key`, preventing duplicate or ghost `NEW` records.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_entry_canceled(
+        &self,
+        account_mode: &str,
+        venue: crate::ExchangeVenue,
+        environment: &str,
+        symbol: &str,
+        order_id: &str,
+        update_time_ms: i64,
+        rationale: &str,
+    ) -> crate::Result<bool> {
+        let venue_str = match venue {
+            crate::ExchangeVenue::Spot => "Spot",
+            crate::ExchangeVenue::Futures => "Futures",
+        };
+        let key = format!(
+            "{}:{}:{}:{}:{}:ENTRY",
+            account_mode.trim(),
+            environment.trim(),
+            venue_str,
+            symbol.trim().to_ascii_uppercase(),
+            order_id.trim()
+        );
+        let conn = self.open_conn()?;
+        let existing_json: Option<String> = conn
+            .prepare("SELECT payload_json FROM order_history WHERE composite_key = ?1 LIMIT 1")
+            .and_then(|mut s| s.query_row(rusqlite::params![key], |r| r.get(0)))
+            .ok();
+        let Some(raw) = existing_json else {
+            return Ok(false);
+        };
+        let Ok(mut log) = serde_json::from_str::<OrderExecutionLog>(&raw) else {
+            return Ok(false);
+        };
+        log.status = "CANCELED".into();
+        log.update_time_ms = update_time_ms.max(log.update_time_ms);
+        log.timestamp_ms = update_time_ms.max(log.timestamp_ms);
+        if !rationale.trim().is_empty() {
+            log.rationale = rationale.to_string();
+        }
+        let updated_json = serde_json::to_string(&log)?;
+        conn.execute(
+            "UPDATE order_history SET status = 'CANCELED', timestamp_ms = ?1, payload_json = ?2 WHERE composite_key = ?3",
+            rusqlite::params![log.timestamp_ms, updated_json, key],
+        )
+        .map_err(|e| crate::BotError::Config(format!("SQLite cancel update error: {e}")))?;
+        Ok(true)
     }
 
     pub fn delete_logs(
@@ -876,5 +999,17 @@ mod tests {
         let _ = std::fs::remove_file(&tmp_path);
         let _ = std::fs::remove_file(format!("{}-wal", tmp_path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp_path.display()));
+    }
+
+    #[test]
+    fn side_deserializes_case_variants() {
+        for raw in ["\"Long\"", "\"long\"", "\"LONG\""] {
+            let parsed: Side = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed, Side::Long);
+        }
+        for raw in ["\"Short\"", "\"short\"", "\"SHORT\""] {
+            let parsed: Side = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed, Side::Short);
+        }
     }
 }

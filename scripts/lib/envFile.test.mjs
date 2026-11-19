@@ -121,6 +121,12 @@ test('access token helpers generate, validate, mask, and check private bind host
   assert.equal(isPrivateOrLoopbackHost('127.0.0.1'), true);
   assert.equal(isPrivateOrLoopbackHost('100.96.0.2'), true);
   assert.equal(isPrivateOrLoopbackHost('192.168.1.50'), true);
+  assert.equal(isPrivateOrLoopbackHost('fc00::1'), true);
+  assert.equal(isPrivateOrLoopbackHost('fd12::1'), true);
+  assert.equal(isPrivateOrLoopbackHost('fe80::1%eth0'), true);
+  assert.equal(isPrivateOrLoopbackHost('0:0:0:0:0:0:0:1'), true);
+  assert.equal(isPrivateOrLoopbackHost('fc-public.example.com'), false);
+  assert.equal(isPrivateOrLoopbackHost('fd-api.example.com'), false);
   assert.equal(isPrivateOrLoopbackHost('0.0.0.0'), false);
   assert.equal(isPrivateOrLoopbackHost('::'), false);
 });

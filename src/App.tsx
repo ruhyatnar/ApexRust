@@ -29,6 +29,7 @@ import { TradingDeskView } from './components/TradingDeskView';
 import {
   type ConnectionProfile,
   apiFetch,
+  buildWebSocketUrl,
   loadConnectionProfile,
   setActiveConnectionProfile,
   setLocalAccessToken,
@@ -46,6 +47,7 @@ import {
   savePersistedWorkspaceUiState,
   type PersistedWorkspaceUiState,
 } from './engine/configStorage';
+import { fmtPx } from './engine/formatters';
 import {
   collectNewLiveFillNotifications,
   dispatchDesktopLiveFillNotifications,
@@ -60,12 +62,16 @@ import type {
   EngineSnapshot,
   ExchangeVenue,
   ExecutionAccountMode,
+  ExitReason,
   LiveCredentialStatus,
   ManualOrderInput,
   MarginType,
   OrderExecutionLog,
+  PairSelectionMode,
+  ScreenerSnapshotPayload,
   Timeframe,
   TransportMode,
+  TrendingCategory,
   VolatilitySpikeAlert,
 } from './engine/types';
 
@@ -258,13 +264,32 @@ export default function App() {
   activeLeverageRef.current = config.trading.leverage;
   const configRef = useRef<BotConfig>(config);
   configRef.current = config;
+  const selectedSymbolRef = useRef<string>(selectedSymbol);
+  selectedSymbolRef.current = selectedSymbol;
+  const [screenerSnapshot, setScreenerSnapshot] = useState<ScreenerSnapshotPayload | null>(null);
+  const [screenerCategory, setScreenerCategory] = useState<TrendingCategory>(
+    () => initialConfig.trading.trendingCategory ?? 'hot_volume'
+  );
+  const screenerSnapshotRef = useRef<ScreenerSnapshotPayload | null>(null);
+  screenerSnapshotRef.current = screenerSnapshot;
   const gitBackupTimerRef = useRef<number | null>(null);
+  const watchlistSyncTimerRef = useRef<number | null>(null);
   const pendingLiveDrainRef = useRef<boolean>(false);
+  const binanceWsRef = useRef<WebSocket | null>(null);
+  const subscribedBinanceStreamsRef = useRef<Set<string>>(new Set());
+  const bookTickerUpdatedAtRef = useRef<Record<string, number>>({});
+  const lastBookUiSyncRef = useRef<number>(0);
+  const warmedKeysRef = useRef<Set<string>>(new Set());
+  const warmingInProgressRef = useRef<boolean>(false);
+  const lastAutoRotateMsRef = useRef<number>(0);
 
   useEffect(() => {
     return () => {
       if (gitBackupTimerRef.current !== null) {
         window.clearTimeout(gitBackupTimerRef.current);
+      }
+      if (watchlistSyncTimerRef.current !== null) {
+        window.clearTimeout(watchlistSyncTimerRef.current);
       }
     };
   }, []);
@@ -279,6 +304,14 @@ export default function App() {
     const intents = rt.consumeLiveIntents();
     if (intents.length === 0) return;
 
+    if (connectionHealthRef.current?.engineAuthority === 'daemon') {
+      rt.reportLiveAutoRejected(
+        '☁️ 24/7 Auto-Trading runs on your Remote VPS Daemon — browser Live auto intents skipped to prevent duplicate orders.'
+      );
+      syncSnapshots();
+      return;
+    }
+
     const status = liveStatusRef.current;
     if (!status.configured || !status.armedForLiveOrders) {
       rt.reportLiveAutoRejected(
@@ -292,10 +325,183 @@ export default function App() {
     const leverage = activeLeverageRef.current;
     const cfg = configRef.current;
 
+    const dispatchLiveEntryOrder = async (entry: {
+      symbol: string;
+      binanceSide: 'BUY' | 'SELL';
+      orderMethod: 'MARKET' | 'LIMIT' | 'LIMIT_MAKER' | 'OCO';
+      usdtAmount: number;
+      limitPrice?: number;
+      timeInForce: 'GTC' | 'IOC' | 'FOK';
+      input?: ManualOrderInput;
+    }) => {
+      if (venue === 'Spot' && entry.binanceSide === 'SELL') {
+        rt.reportLiveAutoRejected(
+          `Skipped Spot Short ${entry.symbol} (switch to USD-M Futures or Spot Long)`
+        );
+        return;
+      }
+      const binanceType =
+        entry.orderMethod === 'OCO'
+          ? 'OCO'
+          : entry.orderMethod === 'LIMIT_MAKER'
+            ? 'LIMIT_MAKER'
+            : entry.orderMethod === 'LIMIT'
+              ? 'LIMIT'
+              : 'MARKET';
+      const pair = rt.snapshot.pairs.find((p) => p.symbol === entry.symbol);
+      const refPx =
+        entry.limitPrice && entry.limitPrice > 0 ? entry.limitPrice : pair?.lastPrice ?? 0;
+      const isLong = entry.binanceSide === 'BUY';
+      const autoTargets = entry.input?.targets ?? [];
+      const bracketTarget =
+        venue === 'Futures' && autoTargets.length > 1
+          ? autoTargets[autoTargets.length - 1]
+          : autoTargets[0];
+      const tpPct = bracketTarget?.pctOffset ?? 2.5;
+      const atrVal = pair?.indicators.atr ?? refPx * 0.01;
+      const slDist =
+        entry.input?.stopLossMode === 'ATR' && cfg.features.atrDynamicExits
+          ? atrVal * cfg.exits.atrSlMultiplier
+          : refPx * ((entry.input?.stopLossPct ?? 1.5) / 100);
+      const tpAllowed = Boolean(cfg.features.takeProfitLadder);
+      const tpPx =
+        binanceType === 'OCO' && refPx > 0 && tpAllowed
+          ? refPx * (1 + (isLong ? 1 : -1) * (tpPct / 100))
+          : undefined;
+      const slPx =
+        binanceType === 'OCO' && refPx > 0
+          ? isLong
+            ? refPx - slDist
+            : refPx + slDist
+          : undefined;
+
+      const resp = await apiFetch('/api/live/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: entry.symbol,
+          venue,
+          leverage,
+          side: entry.binanceSide,
+          type: binanceType,
+          quoteOrderQty: entry.usdtAmount,
+          price: entry.limitPrice,
+          timeInForce: entry.timeInForce,
+          takeProfitPrice: tpPx,
+          stopLossPrice: slPx,
+          workingType: entry.input?.workingType ?? 'MARK_PRICE',
+          preflightOnly: false,
+        }),
+      });
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        orderId?: string;
+        orderStatus?: string;
+        executedQty?: number;
+        avgPrice?: number;
+        commission?: number;
+        baseCommission?: number;
+        commissionAsset?: string;
+        ocoOrderListId?: number;
+        algoOrderIds?: string[];
+        ocoWarning?: string;
+        ocoNote?: string;
+        latencyMs?: number;
+        error?: string;
+      };
+      if (resp.ok && data.ok && entry.input) {
+        const statusUpper = String(data.orderStatus ?? '').toUpperCase();
+        const execQtyNum = Number(data.executedQty ?? 0) || 0;
+        const isTerminalUnfilled =
+          (statusUpper === 'EXPIRED' ||
+            statusUpper === 'EXPIRED_IN_MATCH' ||
+            statusUpper === 'CANCELED' ||
+            statusUpper === 'REJECTED') &&
+          execQtyNum <= 0;
+        if (isTerminalUnfilled) {
+          rt.reportLiveAutoRejected(
+            `Live AUTO ${entry.symbol} ${binanceType} ended ${statusUpper} with 0 fill (${data.latencyMs ?? 0}ms)`
+          );
+        } else if (statusUpper === 'NEW' && entry.limitPrice) {
+          const summary = `[AUTO LIVE ${venue}] Resting ${binanceType} ${entry.symbol} @ $${fmtPx(entry.limitPrice)} (${data.latencyMs ?? 0}ms)`;
+          rt.recordExternalLivePendingOrder(
+            entry.input,
+            entry.limitPrice,
+            data.orderId,
+            summary,
+            Date.now(),
+            'auto'
+          );
+          rt.confirmLiveAutoDispatch(summary);
+        } else {
+          const summary = `[AUTO LIVE ${venue}] Filled ${binanceType} ${entry.symbol} $${entry.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`;
+          rt.recordExternalLiveOrder(entry.input, summary, Date.now(), {
+            executedQty: data.executedQty,
+            avgPrice: data.avgPrice,
+            commission: data.commission,
+            baseCommission: data.baseCommission,
+            commissionAsset: data.commissionAsset,
+            orderId: data.orderId,
+            ocoOrderListId: data.ocoOrderListId,
+            algoOrderIds: data.algoOrderIds,
+          });
+          rt.confirmLiveAutoDispatch(summary);
+        }
+      } else {
+        rt.reportLiveAutoRejected(`Live AUTO ${entry.symbol} rejected: ${data.error ?? 'Error'}`);
+      }
+    };
+
     inflightLiveIntentsRef.current = true;
     try {
       for (const intent of intents) {
-        if (intent.kind === 'EXIT') {
+        if (intent.kind === 'CANCEL_PENDING') {
+          const pending = intent.pendingOrderId
+            ? rt.snapshot.pendingOrders.find((p) => p.id === intent.pendingOrderId)
+            : undefined;
+          if (!intent.exchangeOrderId) {
+            if (pending) {
+              rt.confirmLivePendingCanceled(pending.id, intent.reason, Date.now());
+            }
+            continue;
+          }
+          const cancelResp = await apiFetch('/api/live/cancel-order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              symbol: intent.symbol,
+              venue,
+              orderId: intent.exchangeOrderId,
+              side: intent.binanceSide,
+              reason: intent.reason,
+            }),
+          });
+          const cancelData = (await cancelResp.json()) as {
+            ok?: boolean;
+            alreadyFilled?: boolean;
+            executedQty?: number;
+            avgPrice?: number;
+            error?: string;
+          };
+          if (cancelResp.ok && cancelData.ok && cancelData.alreadyFilled) {
+            if (pending) {
+              rt.promoteExternalLivePendingOrder(
+                pending.id,
+                cancelData.avgPrice,
+                cancelData.executedQty,
+                Date.now()
+              );
+            }
+          } else if (cancelResp.ok && cancelData.ok) {
+            if (pending) {
+              rt.confirmLivePendingCanceled(pending.id, intent.reason, Date.now());
+            }
+          } else {
+            rt.reportLiveAutoRejected(
+              `Live cancel failed (${intent.symbol}): ${cancelData.error ?? `HTTP ${cancelResp.status}`}`
+            );
+          }
+        } else if (intent.kind === 'EXIT') {
           if (venue === 'Spot' && intent.binanceSide !== 'SELL') {
             continue;
           }
@@ -335,7 +541,7 @@ export default function App() {
               side: intent.binanceSide,
               type: 'MARKET',
               quantity: intent.quantity,
-              reduceOnly: venue === 'Futures' ? true : undefined,
+              reduceOnly: true,
               preflightOnly: false,
             }),
           });
@@ -361,131 +567,42 @@ export default function App() {
               intent.symbol,
               ratio,
               exitPx,
-              intent.reason as
-                | 'StopLoss'
-                | 'BreakEvenStop'
-                | 'TrailingStop'
-                | 'TakeProfit1'
-                | 'TakeProfit2'
-                | 'CircuitBreakerFlatten'
-                | 'ManualClose',
+              intent.reason as ExitReason,
               `[AUTO LIVE EXIT ${venue}] ${intent.symbol} ${intent.reason} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
               Date.now(),
               data.orderId,
               data.executedQty
             );
+            if (
+              intent.flipAfterExit &&
+              venue === 'Futures' &&
+              cfg.automation.autoFlipOnReversal &&
+              cfg.features.automatedTrading
+            ) {
+              const flipInput = intent.flipAfterExit.input;
+              const flipOrderMethod =
+                flipInput.orderType === 'MARKET'
+                  ? 'MARKET'
+                  : flipInput.orderType === 'LIMIT'
+                    ? 'LIMIT'
+                    : flipInput.orderType === 'LIMIT MAKER'
+                      ? 'LIMIT_MAKER'
+                      : cfg.automation.orderMethod;
+              await dispatchLiveEntryOrder({
+                symbol: flipInput.symbol,
+                binanceSide: flipInput.side === 'Long' ? 'BUY' : 'SELL',
+                orderMethod: flipOrderMethod,
+                usdtAmount: flipInput.usdtAmount,
+                limitPrice: flipInput.limitPrice,
+                timeInForce: flipInput.timeInForce ?? cfg.automation.timeInForce,
+                input: flipInput,
+              });
+            }
           } else {
             rt.reportLiveAutoRejected(`Live EXIT failed (${intent.symbol}): ${data.error ?? 'Rejected'}`);
           }
         } else {
-          // Automated ENTRY
-          if (connectionHealthRef.current?.engineAuthority === 'daemon') {
-            rt.reportLiveAutoRejected(
-              '☁️ 24/7 Auto-Trading runs on your Remote VPS Daemon — browser Live auto-entry skipped to prevent duplicate orders.'
-            );
-            continue;
-          }
-          if (venue === 'Spot' && intent.binanceSide === 'SELL') {
-            // Binance Spot API cannot open unhedged Short positions via spot SELL without inventory
-            rt.reportLiveAutoRejected(
-              `Skipped Spot Short ${intent.symbol} (switch to USD-M Futures or Spot Long)`
-            );
-            continue;
-          }
-          const binanceType =
-            intent.orderMethod === 'OCO'
-              ? 'OCO'
-              : intent.orderMethod === 'LIMIT_MAKER'
-                ? 'LIMIT_MAKER'
-                : intent.orderMethod === 'LIMIT'
-                  ? 'LIMIT'
-                  : 'MARKET';
-          const pair = rt.snapshot.pairs.find((p) => p.symbol === intent.symbol);
-          const refPx =
-            intent.limitPrice && intent.limitPrice > 0 ? intent.limitPrice : pair?.lastPrice ?? 0;
-          const isLong = intent.binanceSide === 'BUY';
-          const autoTargets = intent.input?.targets ?? [];
-          const bracketTarget =
-            venue === 'Futures' && autoTargets.length > 1
-              ? autoTargets[autoTargets.length - 1]
-              : autoTargets[0];
-          const tpPct = bracketTarget?.pctOffset ?? 2.5;
-          const atrVal = pair?.indicators.atr ?? refPx * 0.01;
-          const slDist =
-            intent.input?.stopLossMode === 'ATR' && cfg.features.atrDynamicExits
-              ? atrVal * cfg.exits.atrSlMultiplier
-              : refPx * ((intent.input?.stopLossPct ?? 1.5) / 100);
-          const tpAllowed = Boolean(cfg.features.takeProfitLadder);
-          const tpPx =
-            binanceType === 'OCO' && refPx > 0 && tpAllowed
-              ? refPx * (1 + (isLong ? 1 : -1) * (tpPct / 100))
-              : undefined;
-          const slPx =
-            binanceType === 'OCO' && refPx > 0
-              ? isLong
-                ? refPx - slDist
-                : refPx + slDist
-              : undefined;
-
-          const resp = await apiFetch('/api/live/order', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              symbol: intent.symbol,
-              venue,
-              leverage,
-              side: intent.binanceSide,
-              type: binanceType,
-              quoteOrderQty: intent.usdtAmount,
-              price: intent.limitPrice,
-              timeInForce: intent.timeInForce,
-              takeProfitPrice: tpPx,
-              stopLossPrice: slPx,
-              workingType: intent.input?.workingType ?? 'MARK_PRICE',
-              preflightOnly: false,
-            }),
-          });
-          const data = (await resp.json()) as {
-            ok?: boolean;
-            orderId?: string;
-            orderStatus?: string;
-            executedQty?: number;
-            avgPrice?: number;
-            commission?: number;
-            commissionAsset?: string;
-            ocoOrderListId?: number;
-            algoOrderIds?: string[];
-            ocoWarning?: string;
-            ocoNote?: string;
-            latencyMs?: number;
-            error?: string;
-          };
-          if (resp.ok && data.ok && intent.input) {
-            if (data.orderStatus === 'NEW' && intent.limitPrice) {
-              const summary = `[AUTO LIVE ${venue}] Resting ${binanceType} ${intent.symbol} @ $${intent.limitPrice.toFixed(intent.limitPrice >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`;
-              rt.recordExternalLivePendingOrder(
-                intent.input,
-                intent.limitPrice,
-                data.orderId,
-                summary
-              );
-              rt.confirmLiveAutoDispatch(summary);
-            } else {
-              const summary = `[AUTO LIVE ${venue}] Filled ${binanceType} ${intent.symbol} $${intent.usdtAmount.toFixed(2)}${data.ocoNote ? ` · ${data.ocoNote}` : ''} (${data.latencyMs ?? 0}ms)`;
-              rt.recordExternalLiveOrder(intent.input, summary, Date.now(), {
-                executedQty: data.executedQty,
-                avgPrice: data.avgPrice,
-                commission: data.commission,
-                commissionAsset: data.commissionAsset,
-                orderId: data.orderId,
-                ocoOrderListId: data.ocoOrderListId,
-                algoOrderIds: data.algoOrderIds,
-              });
-              rt.confirmLiveAutoDispatch(summary);
-            }
-          } else {
-            rt.reportLiveAutoRejected(`Live AUTO ${intent.symbol} rejected: ${data.error ?? 'Error'}`);
-          }
+          await dispatchLiveEntryOrder(intent);
         }
       }
       syncSnapshots();
@@ -747,40 +864,311 @@ export default function App() {
     try {
       const resp = await apiFetch('/api/engine/snapshot');
       if (!resp.ok) return;
-      const data = (await resp.json()) as { ok?: boolean; snapshot?: unknown };
-      if (data.ok && data.snapshot) {
-        setRemoteVpsSnapshot(mapRustEngineSnapshot(data.snapshot));
+      const data = (await resp.json()) as { ok?: boolean; snapshot?: unknown; pairs?: unknown };
+      const rawSnap =
+        data && typeof data === 'object' && 'snapshot' in data && data.snapshot
+          ? data.snapshot
+          : data;
+      if (rawSnap && typeof rawSnap === 'object' && Array.isArray((rawSnap as { pairs?: unknown }).pairs)) {
+        setRemoteVpsSnapshot(mapRustEngineSnapshot(rawSnap));
       }
     } catch {
       // Transient VPS snapshot fetch error handled by health pill
     }
   }, [accountMode, isRemoteVpsDaemon]);
 
+  const [binanceWsEpoch, setBinanceWsEpoch] = useState(0);
+  const [binanceWsOpenSeq, setBinanceWsOpenSeq] = useState(0);
+
+  // Remote VPS 24/7 Daemon real-time WebSocket (/ws/telemetry) + 5s HTTP fallback while disconnected
   useEffect(() => {
     if (accountMode !== 'Live' || !isRemoteVpsDaemon) {
       setRemoteVpsSnapshot(null);
       return;
     }
     let cancelled = false;
-    const poll = async () => {
+    let ws: WebSocket | null = null;
+    let wsConnected = false;
+    let reconnectTimer: number | null = null;
+    let fallbackTimer: number | null = null;
+    let attempt = 0;
+
+    const pollHttpFallback = async () => {
+      if (cancelled || wsConnected) return;
       try {
         const resp = await apiFetch('/api/engine/snapshot');
         if (!resp.ok || cancelled) return;
-        const data = (await resp.json()) as { ok?: boolean; snapshot?: unknown };
-        if (data.ok && data.snapshot && !cancelled) {
-          setRemoteVpsSnapshot(mapRustEngineSnapshot(data.snapshot));
+        const data = (await resp.json()) as { ok?: boolean; snapshot?: unknown; pairs?: unknown };
+        const rawSnap =
+          data && typeof data === 'object' && 'snapshot' in data && data.snapshot
+            ? data.snapshot
+            : data;
+        if (
+          !cancelled &&
+          rawSnap &&
+          typeof rawSnap === 'object' &&
+          Array.isArray((rawSnap as { pairs?: unknown }).pairs)
+        ) {
+          setRemoteVpsSnapshot(mapRustEngineSnapshot(rawSnap));
         }
       } catch {
-        // Ignore transient offline error; retry on next poll
+        // Ignore transient offline error; retry on next fallback tick
       }
     };
-    void poll();
-    const timer = window.setInterval(poll, 2000);
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnectTimer !== null) return;
+      const delayMs = Math.min(15_000, Math.round(1500 * Math.pow(1.6, attempt)));
+      attempt = Math.min(attempt + 1, 8);
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (!cancelled) connectTelemetryWs();
+      }, delayMs);
+    };
+
+    const connectTelemetryWs = () => {
+      if (cancelled) return;
+      try {
+        const wsUrl = buildWebSocketUrl('/ws/telemetry', connectionProfile);
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+          if (cancelled) {
+            ws?.close();
+            return;
+          }
+          wsConnected = true;
+          attempt = 0;
+        };
+        ws.onmessage = (event) => {
+          if (cancelled) return;
+          try {
+            const parsed = JSON.parse(String(event.data));
+            const rawSnap = parsed?.snapshot ?? parsed;
+            if (rawSnap && typeof rawSnap === 'object') {
+              setRemoteVpsSnapshot(mapRustEngineSnapshot(rawSnap));
+            }
+          } catch {
+            // Ignore malformed telemetry frame
+          }
+        };
+        ws.onerror = () => {
+          wsConnected = false;
+        };
+        ws.onclose = () => {
+          wsConnected = false;
+          ws = null;
+          scheduleReconnect();
+        };
+      } catch {
+        wsConnected = false;
+        scheduleReconnect();
+      }
+    };
+
+    void pollHttpFallback();
+    connectTelemetryWs();
+    fallbackTimer = window.setInterval(() => {
+      if (!wsConnected) {
+        void pollHttpFallback();
+      }
+    }, 5000);
+
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (fallbackTimer !== null) window.clearInterval(fallbackTimer);
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
     };
   }, [accountMode, isRemoteVpsDaemon, connectionProfile]);
+
+  // Real-time Binance Screener WebSocket (/ws/screener) & dynamic watchlist rotation sync
+  const screenerWsRef = useRef<WebSocket | null>(null);
+  const activeSymbolsCsv = useMemo(
+    () => config.trading.pairs.map((s) => s.trim().toUpperCase()).filter(Boolean).join(','),
+    [config.trading.pairs]
+  );
+
+  const applyScreenerToLocalRuntime = useCallback(
+    (snap: ScreenerSnapshotPayload, forceImmediate = false) => {
+      setScreenerSnapshot(snap);
+      if (accountMode === 'Live' && isRemoteVpsDaemon && connectionHealthRef.current?.engineReachable) {
+        return;
+      }
+      const rt = activeRuntimeRef.current;
+      if (!rt) return;
+      const now = Date.now();
+      if (!forceImmediate && now - lastAutoRotateMsRef.current < 15_000 && rt.snapshot.pairs.length > 0) {
+        return;
+      }
+      lastAutoRotateMsRef.current = now;
+      const tradableTickers = snap.tickers.filter((t) => t.tradableOnActiveEnv !== false);
+      const res = rt.syncWatchlistPairs(tradableTickers, [], now);
+      if (res.addedSymbols.length > 0 || res.removedSymbols.length > 0 || forceImmediate) {
+        syncSnapshots();
+      }
+    },
+    [accountMode, isRemoteVpsDaemon, activeRuntimeRef, syncSnapshots]
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    let ws: WebSocket | null = null;
+    let wsConnected = false;
+    let reconnectTimer: number | null = null;
+    let fallbackTimer: number | null = null;
+    let attempt = 0;
+
+    const buildQueryString = () => {
+      const cfgT = configRef.current.trading;
+      const params = new URLSearchParams({
+        venue: cfgT.venue,
+        environment: snapshot.transport.environment,
+        category: screenerCategory,
+        rankingSource: cfgT.rankingSource ?? 'auto',
+        quoteAsset: cfgT.quoteAsset ?? 'USDT',
+        minQuoteVolumeUsdt: String(cfgT.trendingMinQuoteVolumeUsdt ?? 10_000_000),
+        onlyTradable: 'true',
+        limit: '100',
+      });
+      return `/ws/screener?${params.toString()}`;
+    };
+
+    const pollHttpScreener = async (force = false) => {
+      if (cancelled || (wsConnected && !force)) return;
+      try {
+        const cfgT = configRef.current.trading;
+        const params = new URLSearchParams({
+          venue: cfgT.venue,
+          environment: snapshot.transport.environment,
+          category: screenerCategory,
+          rankingSource: cfgT.rankingSource ?? 'auto',
+          quoteAsset: cfgT.quoteAsset ?? 'USDT',
+          minQuoteVolumeUsdt: String(cfgT.trendingMinQuoteVolumeUsdt ?? 10_000_000),
+          onlyTradable: 'true',
+          limit: '100',
+        });
+        const resp = await apiFetch(`/api/market/screener?${params.toString()}`);
+        if (!resp.ok || cancelled) return;
+        const data = (await resp.json()) as ScreenerSnapshotPayload & { ok?: boolean };
+        if (Array.isArray(data.tickers) && !cancelled) {
+          applyScreenerToLocalRuntime(data, force);
+        }
+      } catch {
+        // Ignore transient screener poll error
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnectTimer !== null) return;
+      const delayMs = Math.min(20_000, Math.round(2000 * Math.pow(1.6, attempt)));
+      attempt = Math.min(attempt + 1, 6);
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (!cancelled) connectScreenerWs();
+      }, delayMs);
+    };
+
+    const connectScreenerWs = () => {
+      if (cancelled) return;
+      try {
+        const wsUrl = buildWebSocketUrl(buildQueryString(), connectionProfile);
+        ws = new WebSocket(wsUrl);
+        screenerWsRef.current = ws;
+        ws.onopen = () => {
+          if (cancelled) {
+            ws?.close();
+            return;
+          }
+          wsConnected = true;
+          attempt = 0;
+        };
+        ws.onmessage = (event) => {
+          if (cancelled) return;
+          try {
+            const msg = JSON.parse(String(event.data)) as {
+              type?: string;
+              data?: ScreenerSnapshotPayload;
+            } & Partial<ScreenerSnapshotPayload>;
+            const payload = msg.type === 'screener_snapshot' ? msg.data : (msg as ScreenerSnapshotPayload);
+            if (payload && Array.isArray(payload.tickers)) {
+              applyScreenerToLocalRuntime(payload, false);
+            }
+          } catch {
+            // Ignore malformed screener packet
+          }
+        };
+        ws.onerror = () => {
+          wsConnected = false;
+        };
+        ws.onclose = () => {
+          wsConnected = false;
+          if (screenerWsRef.current === ws) {
+            screenerWsRef.current = null;
+          }
+          ws = null;
+          scheduleReconnect();
+        };
+      } catch {
+        wsConnected = false;
+        scheduleReconnect();
+      }
+    };
+
+    void pollHttpScreener(true);
+    connectScreenerWs();
+    fallbackTimer = window.setInterval(() => {
+      if (!wsConnected) {
+        void pollHttpScreener(false);
+      }
+    }, 15_000);
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (fallbackTimer !== null) window.clearInterval(fallbackTimer);
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
+      if (screenerWsRef.current === ws) {
+        screenerWsRef.current = null;
+      }
+    };
+  }, [connectionProfile, snapshot.transport.environment, screenerCategory, applyScreenerToLocalRuntime]);
+
+  // Update open /ws/screener subscription in-place when venue/filter settings change
+  useEffect(() => {
+    const ws = screenerWsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      ws.send(
+        JSON.stringify({
+          venue: config.trading.venue,
+          environment: snapshot.transport.environment,
+          category: screenerCategory,
+          rankingSource: config.trading.rankingSource,
+          quoteAsset: config.trading.quoteAsset,
+          minQuoteVolumeUsdt: config.trading.trendingMinQuoteVolumeUsdt,
+          onlyTradable: true,
+          limit: 100,
+          activeWatchlist: activeSymbolsCsv ? activeSymbolsCsv.split(',') : [],
+        })
+      );
+    } catch {
+      // Ignore send on closing socket
+    }
+  }, [
+    config.trading.venue,
+    snapshot.transport.environment,
+    screenerCategory,
+    config.trading.rankingSource,
+    config.trading.quoteAsset,
+    config.trading.trendingMinQuoteVolumeUsdt,
+    activeSymbolsCsv,
+  ]);
 
   // Isolated Paper Simulation auto-tick loop
   useEffect(() => {
@@ -800,9 +1188,21 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [accountMode, paperSnapshot.running, paperSnapshot.transport.feedSource, syncSnapshots]);
 
-  // Live Binance Public WebSocket stream + REST fallback when active runtime selects BinanceLive
+  const activeWatchlistSymbolsKey = useMemo(
+    () =>
+      Array.from(
+        new Set([...snapshot.pairs.map((p) => p.symbol.toUpperCase()), selectedSymbol.toUpperCase()])
+      )
+        .filter(Boolean)
+        .sort()
+        .join(','),
+    [snapshot.pairs, selectedSymbol]
+  );
+
+  // Live Binance Public WebSocket combined stream (<sym>@kline_<tf> + <sym>@bookTicker) with <23h recycle + REST fallback
   useEffect(() => {
     if (snapshot.transport.feedSource !== 'BinanceLive') {
+      subscribedBinanceStreamsRef.current.clear();
       return;
     }
     const rt = activeRuntimeRef.current;
@@ -811,6 +1211,7 @@ export default function App() {
     let cancelled = false;
     let ws: WebSocket | null = null;
     let restTimer: number | null = null;
+    let recycleTimer: number | null = null;
     const isTestnet = snapshot.transport.environment === 'Testnet';
     const isFutures = config.trading.venue === 'Futures';
     const wsBase = isFutures
@@ -821,18 +1222,35 @@ export default function App() {
         ? 'wss://stream.testnet.binance.vision/stream'
         : 'wss://stream.binance.com:9443/stream';
 
-    const streams = config.trading.pairs
-      .map((p) => `${p.toLowerCase()}@kline_${config.trading.timeframe}`)
-      .join('/');
-    const wsUrl = `${wsBase}?streams=${streams}`;
+    const initialSymbols = Array.from(
+      new Set([
+        ...rt.snapshot.pairs.map((p) => p.symbol.trim().toUpperCase()),
+        selectedSymbolRef.current.trim().toUpperCase(),
+      ])
+    )
+      .filter(Boolean)
+      .slice(0, 60);
+
+    const initialStreams: string[] = [];
+    for (const sym of initialSymbols) {
+      const lower = sym.toLowerCase();
+      initialStreams.push(`${lower}@kline_${config.trading.timeframe}`);
+      initialStreams.push(`${lower}@bookTicker`);
+    }
+    const safeInitialStreams =
+      initialStreams.length > 0
+        ? initialStreams
+        : [`btcusdt@kline_${config.trading.timeframe}`, 'btcusdt@bookTicker'];
+    const wsUrl = `${wsBase}?streams=${safeInitialStreams.join('/')}`;
 
     const pollRestFallback = async () => {
-      if (!config.features.restFallback) return;
-      for (const symbol of config.trading.pairs) {
+      if (!configRef.current.features.restFallback) return;
+      const pollSymbols = rt.snapshot.pairs.map((p) => p.symbol).slice(0, 12);
+      for (const symbol of pollSymbols) {
         if (cancelled) return;
         try {
           const resp = await apiFetch(
-            `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(config.trading.timeframe)}&venue=${encodeURIComponent(config.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}&limit=3`
+            `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(configRef.current.trading.timeframe)}&venue=${encodeURIComponent(configRef.current.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}&limit=3`
           );
           if (!resp.ok) continue;
           const payload = (await resp.json()) as {
@@ -910,11 +1328,14 @@ export default function App() {
 
     try {
       ws = new WebSocket(wsUrl);
+      binanceWsRef.current = ws;
       ws.onopen = () => {
         if (!cancelled) {
+          subscribedBinanceStreamsRef.current = new Set(safeInitialStreams);
+          setBinanceWsOpenSeq((n) => n + 1);
           rt.setTransportMode(
             'WsPrimary',
-            `Connected to live Binance ${config.trading.venue} WebSocket stream`
+            `Connected to live Binance ${config.trading.venue} WebSocket stream (kline + bookTicker)`
           );
           syncSnapshots();
         }
@@ -923,9 +1344,10 @@ export default function App() {
         if (cancelled) return;
         try {
           const msg = JSON.parse(event.data as string);
-          const k = msg?.data?.k;
-          const sym = msg?.data?.s;
-          if (k && sym) {
+          const payload = msg?.data ?? msg;
+          if (!payload || typeof payload !== 'object') return;
+          if (payload.k && payload.s) {
+            const k = payload.k;
             const candle: Candle = {
               openTimeMs: Number(k.t),
               open: Number(k.o),
@@ -935,10 +1357,31 @@ export default function App() {
               volume: Number(k.v),
               isClosed: Boolean(k.x),
             };
-            rt.stepBar(Date.now(), { symbol: sym, candle });
+            rt.stepBar(Date.now(), { symbol: payload.s, candle });
             syncSnapshots();
             if (rt.snapshot.accountMode === 'Live') {
               void drainLiveIntents();
+            }
+          } else if (payload.b && payload.a && payload.s) {
+            const sym = String(payload.s).toUpperCase();
+            const bestBid = Number(payload.b);
+            const bestAsk = Number(payload.a);
+            if (bestBid > 0 && bestAsk > 0 && bestAsk >= bestBid) {
+              const now = Date.now();
+              bookTickerUpdatedAtRef.current[sym] = now;
+              rt.updatePairBookTicker(sym, bestBid, bestAsk);
+              if (now - lastBookUiSyncRef.current >= 250) {
+                lastBookUiSyncRef.current = now;
+                if (sym === selectedSymbolRef.current) {
+                  setLiveTicker({
+                    symbol: sym,
+                    bid: bestBid,
+                    ask: bestAsk,
+                    last: (bestBid + bestAsk) * 0.5,
+                  });
+                }
+                syncSnapshots();
+              }
             }
           }
         } catch {
@@ -946,7 +1389,7 @@ export default function App() {
         }
       };
       ws.onerror = () => {
-        if (!cancelled && config.features.restFallback) {
+        if (!cancelled && configRef.current.features.restFallback) {
           rt.setTransportMode('RestFallback', 'Binance WS unavailable — switching to REST fallback');
           syncSnapshots();
           if (restTimer === null) {
@@ -955,7 +1398,11 @@ export default function App() {
         }
       };
       ws.onclose = () => {
-        if (!cancelled && config.features.restFallback) {
+        if (binanceWsRef.current === ws) {
+          binanceWsRef.current = null;
+        }
+        subscribedBinanceStreamsRef.current.clear();
+        if (!cancelled && configRef.current.features.restFallback) {
           rt.setTransportMode('RestFallback', 'Binance WS closed — polling REST fallback');
           syncSnapshots();
           if (restTimer === null) {
@@ -963,6 +1410,12 @@ export default function App() {
           }
         }
       };
+      // Recycle before Binance's 24h connection expiry limit (22.5h)
+      recycleTimer = window.setTimeout(() => {
+        if (!cancelled) {
+          setBinanceWsEpoch((n) => n + 1);
+        }
+      }, 22.5 * 60 * 60 * 1000);
     } catch {
       if (config.features.restFallback) {
         rt.setTransportMode('RestFallback', 'WebSocket init failed — polling REST fallback');
@@ -973,7 +1426,15 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      if (ws) ws.close();
+      if (recycleTimer !== null) window.clearTimeout(recycleTimer);
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
+      if (binanceWsRef.current === ws) {
+        binanceWsRef.current = null;
+      }
+      subscribedBinanceStreamsRef.current.clear();
       if (restTimer !== null) window.clearInterval(restTimer);
     };
   }, [
@@ -982,15 +1443,171 @@ export default function App() {
     snapshot.transport.feedSource,
     snapshot.transport.environment,
     config.trading.venue,
-    config.trading.pairs,
     config.trading.timeframe,
     config.features.wsPrimaryFeed,
     config.features.restFallback,
     syncSnapshots,
     drainLiveIntents,
+    binanceWsEpoch,
   ]);
 
-  // Poll live Binance bookTicker when feedSource is BinanceLive
+  // Debounced in-place SUBSCRIBE / UNSUBSCRIBE diffs when watchlist rotates (< 5 msgs/sec Spot, < 10 msgs/sec Futures)
+  useEffect(() => {
+    if (snapshot.transport.feedSource !== 'BinanceLive') return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      const ws = binanceWsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const syms = activeWatchlistSymbolsKey.split(',').filter(Boolean).slice(0, 128);
+      const desired = new Set<string>();
+      for (const s of syms) {
+        const lower = s.toLowerCase();
+        desired.add(`${lower}@kline_${config.trading.timeframe}`);
+        desired.add(`${lower}@bookTicker`);
+      }
+
+      const current = subscribedBinanceStreamsRef.current;
+      const toSubscribe: string[] = [];
+      const toUnsubscribe: string[] = [];
+      for (const stream of desired) {
+        if (!current.has(stream) && current.size + toSubscribe.length < 1024) {
+          toSubscribe.push(stream);
+        }
+      }
+      for (const stream of current) {
+        if (!desired.has(stream)) {
+          toUnsubscribe.push(stream);
+        }
+      }
+      if (toSubscribe.length === 0 && toUnsubscribe.length === 0) return;
+
+      const paceMs = config.trading.venue === 'Spot' ? 260 : 140;
+      const sendBatches = async () => {
+        let reqId = Date.now();
+        for (let i = 0; i < toUnsubscribe.length; i += 10) {
+          if (cancelled || ws.readyState !== WebSocket.OPEN) return;
+          const batch = toUnsubscribe.slice(i, i + 10);
+          ws.send(JSON.stringify({ method: 'UNSUBSCRIBE', params: batch, id: reqId++ }));
+          for (const s of batch) current.delete(s);
+          await new Promise((r) => window.setTimeout(r, paceMs));
+        }
+        for (let i = 0; i < toSubscribe.length; i += 10) {
+          if (cancelled || ws.readyState !== WebSocket.OPEN) return;
+          const batch = toSubscribe.slice(i, i + 10);
+          ws.send(JSON.stringify({ method: 'SUBSCRIBE', params: batch, id: reqId++ }));
+          for (const s of batch) current.add(s);
+          await new Promise((r) => window.setTimeout(r, paceMs));
+        }
+      };
+      void sendBatches();
+    }, 400);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    snapshot.transport.feedSource,
+    activeWatchlistSymbolsKey,
+    config.trading.timeframe,
+    config.trading.venue,
+    binanceWsOpenSeq,
+  ]);
+
+  // Staggered 220-bar historical kline warmup for newly added or cold BinanceLive watchlist pairs
+  const warmupCheckKey = useMemo(
+    () =>
+      snapshot.pairs
+        .map((p) => `${p.symbol}:${p.candles.length}:${p.barsWarmedUp ?? 0}`)
+        .join('|'),
+    [snapshot.pairs]
+  );
+
+  useEffect(() => {
+    if (snapshot.transport.feedSource !== 'BinanceLive') return;
+    if (warmingInProgressRef.current) return;
+    const rt = activeRuntimeRef.current;
+    if (!rt) return;
+
+    const env = snapshot.transport.environment;
+    const venue = config.trading.venue;
+    const tf = config.trading.timeframe;
+    const pendingWarm = rt.snapshot.pairs.filter((p) => {
+      const k = `${accountMode}:${venue}:${env}:${tf}:${p.symbol}`;
+      return (
+        !warmedKeysRef.current.has(k) &&
+        (p.candles.length < 220 || (p.barsWarmedUp ?? 0) < 50)
+      );
+    });
+    if (pendingWarm.length === 0) return;
+
+    let cancelled = false;
+    warmingInProgressRef.current = true;
+    const runWarmup = async () => {
+      try {
+        for (const p of pendingWarm) {
+          if (cancelled) break;
+          const k = `${accountMode}:${venue}:${env}:${tf}:${p.symbol}`;
+          try {
+            const resp = await apiFetch(
+              `/api/market/klines?symbol=${encodeURIComponent(p.symbol)}&interval=${encodeURIComponent(tf)}&venue=${encodeURIComponent(venue)}&environment=${encodeURIComponent(env)}&limit=220`
+            );
+            if (!resp.ok || cancelled) continue;
+            const payload = (await resp.json()) as {
+              ok?: boolean;
+              rows?: Array<Array<string | number>>;
+            };
+            const rows = Array.isArray(payload.rows) ? payload.rows : [];
+            if (rows.length > 0 && !cancelled) {
+              const nowTs = Date.now();
+              const candles: Candle[] = rows
+                .map((row) => {
+                  const closeMs = Number(row[6] ?? 0);
+                  return {
+                    openTimeMs: Number(row[0]),
+                    open: Number(row[1]),
+                    high: Number(row[2]),
+                    low: Number(row[3]),
+                    close: Number(row[4]),
+                    volume: Number(row[5]),
+                    isClosed: Number.isFinite(closeMs) && closeMs > 0 ? closeMs <= nowTs : true,
+                  };
+                })
+                .filter((c) => Number.isFinite(c.openTimeMs) && c.close > 0);
+              if (candles.length > 0) {
+                rt.hydrateSymbolCandles(p.symbol, candles);
+                warmedKeysRef.current.add(k);
+                syncSnapshots();
+              }
+            }
+          } catch {
+            // Retry next scan if endpoint temporarily unavailable
+          }
+          await new Promise((r) => window.setTimeout(r, 180));
+        }
+      } finally {
+        warmingInProgressRef.current = false;
+      }
+    };
+    void runWarmup();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    accountMode,
+    activeRuntimeRef,
+    snapshot.transport.feedSource,
+    snapshot.transport.environment,
+    config.trading.venue,
+    config.trading.timeframe,
+    warmupCheckKey,
+    syncSnapshots,
+  ]);
+
+  // Poll live Binance bookTicker via REST only as fallback when WS @bookTicker hasn't updated selectedSymbol recently
   useEffect(() => {
     if (snapshot.transport.feedSource !== 'BinanceLive') {
       setLiveTicker(null);
@@ -998,6 +1615,8 @@ export default function App() {
     }
     let cancelled = false;
     const fetchTicker = async () => {
+      const lastWsAt = bookTickerUpdatedAtRef.current[selectedSymbol] ?? 0;
+      if (Date.now() - lastWsAt < 6000) return;
       try {
         const resp = await apiFetch(
           `/api/market/ticker?symbol=${encodeURIComponent(selectedSymbol)}&venue=${encodeURIComponent(config.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}`
@@ -1029,7 +1648,7 @@ export default function App() {
       }
     };
     void fetchTicker();
-    const timer = window.setInterval(fetchTicker, 2500);
+    const timer = window.setInterval(fetchTicker, 4000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -1094,20 +1713,23 @@ export default function App() {
                 avgPrice?: number;
               };
               if (!statusData.ok) continue;
-              if (statusData.status === 'FILLED') {
+              const stUpper = String(statusData.status ?? '').toUpperCase();
+              const isTerminal =
+                stUpper === 'CANCELED' ||
+                stUpper === 'CANCELLED' ||
+                stUpper === 'REJECTED' ||
+                stUpper === 'EXPIRED' ||
+                stUpper === 'EXPIRED_IN_MATCH';
+              const filledQty = Number(statusData.executedQty ?? 0) || 0;
+              if (stUpper === 'FILLED' || (filledQty > 0 && isTerminal)) {
                 rt.promoteExternalLivePendingOrder(
                   pending.id,
                   statusData.avgPrice,
-                  statusData.executedQty,
+                  filledQty > 0 ? filledQty : undefined,
                   Date.now()
                 );
                 changed = true;
-              } else if (
-                statusData.status === 'CANCELED' ||
-                statusData.status === 'REJECTED' ||
-                statusData.status === 'EXPIRED' ||
-                statusData.status === 'EXPIRED_IN_MATCH'
-              ) {
+              } else if (isTerminal) {
                 rt.cancelPendingOrder(pending.id);
                 changed = true;
               }
@@ -1189,11 +1811,15 @@ export default function App() {
       exitReason: rec.exitReason,
       latencyMs: rec.accountMode === 'Paper' ? 14 : null,
       endpoint:
-        rec.venue === 'Futures'
-          ? 'POST /fapi/v1/order'
-          : rec.orderListId !== -1
-            ? 'POST /api/v3/orderList/oco'
-            : 'POST /api/v3/order',
+        rec.lifecycle === 'CANCEL'
+          ? rec.venue === 'Futures'
+            ? 'DELETE /fapi/v1/order'
+            : 'DELETE /api/v3/order'
+          : rec.venue === 'Futures'
+            ? 'POST /fapi/v1/order'
+            : rec.orderListId !== -1
+              ? 'POST /api/v3/orderList/oco'
+              : 'POST /api/v3/order',
       rationale: rec.strategyRationale,
       timestampMs: rec.transactTime,
     });
@@ -1257,18 +1883,51 @@ export default function App() {
   ]);
 
   const handleUpdateConfig = (next: BotConfig) => {
+    const isSpot = next.trading.venue === 'Spot';
     const normalized: BotConfig = {
       ...next,
       automation: {
         ...next.automation,
         enabled: next.features.automatedTrading,
+        directionPolicy: isSpot ? 'long_only' : next.automation.directionPolicy,
+        autoFlipOnReversal: isSpot ? false : next.automation.autoFlipOnReversal,
       },
     };
     setConfig(normalized);
+    setScreenerCategory(normalized.trading.trendingCategory ?? 'hot_volume');
     savePersistedBotConfig(normalized);
     paperRuntimeRef.current?.updateConfig(normalized);
     liveRuntimeRef.current?.updateConfig(normalized);
+    if (
+      screenerSnapshotRef.current &&
+      !(accountMode === 'Live' && isRemoteVpsDaemon && connectionHealthRef.current?.engineReachable)
+    ) {
+      const tradable = screenerSnapshotRef.current.tickers.filter(
+        (t) => t.tradableOnActiveEnv !== false
+      );
+      activeRuntimeRef.current?.syncWatchlistPairs(tradable, [], Date.now());
+    }
     syncSnapshots();
+
+    if (accountMode === 'Live' && isRemoteVpsDaemon && connectionHealthRef.current?.engineReachable) {
+      if (watchlistSyncTimerRef.current !== null) {
+        window.clearTimeout(watchlistSyncTimerRef.current);
+      }
+      watchlistSyncTimerRef.current = window.setTimeout(() => {
+        void apiFetch('/api/engine/watchlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pairSelectionMode: normalized.trading.pairSelectionMode,
+            pinnedPairs: normalized.trading.pairs,
+            trendingCategory: normalized.trading.trendingCategory,
+            quoteAsset: normalized.trading.quoteAsset,
+            maxWatchlistPairs: normalized.trading.maxWatchlistPairs,
+            trendingTopN: normalized.trading.trendingTopN,
+          }),
+        }).catch(() => undefined);
+      }, 500);
+    }
 
     if (normalized.features.gitAutoBackup) {
       if (gitBackupTimerRef.current !== null) {
@@ -1291,6 +1950,7 @@ export default function App() {
   const handleResetConfigDefaults = () => {
     const defaults = clearPersistedBotConfig();
     setConfig(defaults);
+    setScreenerCategory(defaults.trading.trendingCategory ?? 'hot_volume');
     paperRuntimeRef.current?.setVenue(defaults.trading.venue);
     liveRuntimeRef.current?.setVenue(defaults.trading.venue);
     paperRuntimeRef.current?.updateConfig(defaults);
@@ -1302,11 +1962,19 @@ export default function App() {
     if (venue === 'Spot' && !config.features.spotMarket) return;
     if (venue === 'Futures' && !config.features.futuresMarket) return;
     const nextDirection =
-      venue === 'Futures' ? 'both' : config.automation.directionPolicy;
+      venue === 'Spot'
+        ? 'long_only'
+        : config.automation.directionPolicy === 'long_only'
+          ? 'both'
+          : config.automation.directionPolicy;
     const nextConfig: BotConfig = {
       ...config,
       trading: { ...config.trading, venue },
-      automation: { ...config.automation, directionPolicy: nextDirection },
+      automation: {
+        ...config.automation,
+        directionPolicy: nextDirection,
+        autoFlipOnReversal: venue === 'Spot' ? false : config.automation.autoFlipOnReversal,
+      },
     };
     paperRuntimeRef.current?.setVenue(venue);
     liveRuntimeRef.current?.setVenue(venue);
@@ -1579,7 +2247,7 @@ export default function App() {
             body: JSON.stringify({
               action: 'manual_order',
               symbol: input.symbol,
-              side: isLong ? 'long' : 'short',
+              side: isLong ? 'Long' : 'Short',
               notional_usdt: input.usdtAmount,
               order_method: vpsMethod,
               limit_price: input.limitPrice,
@@ -1658,6 +2326,7 @@ export default function App() {
           executedQty?: number;
           avgPrice?: number;
           commission?: number;
+          baseCommission?: number;
           commissionAsset?: string;
           ocoOrderListId?: number;
           algoOrderIds?: string[];
@@ -1667,13 +2336,47 @@ export default function App() {
         if (!resp.ok || !data.ok) {
           return { ok: false, reason: data.error ?? 'Binance live order rejected' };
         }
-        if (data.orderStatus === 'NEW' && input.limitPrice) {
+        const statusUpper = String(data.orderStatus ?? '').toUpperCase();
+        const execQtyNum = Number(data.executedQty ?? 0) || 0;
+        const isTerminalUnfilled =
+          (statusUpper === 'EXPIRED' ||
+            statusUpper === 'EXPIRED_IN_MATCH' ||
+            statusUpper === 'CANCELED' ||
+            statusUpper === 'REJECTED') &&
+          execQtyNum <= 0;
+        if (isTerminalUnfilled) {
+          return {
+            ok: false,
+            reason: `Binance ${venue} ${binanceType} order ended ${statusUpper} with 0 fill (${data.latencyMs ?? 0}ms).`,
+          };
+        }
+        if (statusUpper === 'NEW' && input.limitPrice) {
           rt.recordExternalLivePendingOrder(
             input,
             input.limitPrice,
             data.orderId,
-            `Live ${liveStatus.environment} ${venue} resting ${binanceType} ${input.symbol} @ $${input.limitPrice.toFixed(input.limitPrice >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`
+            `Live ${liveStatus.environment} ${venue} resting ${binanceType} ${input.symbol} @ $${fmtPx(input.limitPrice)} (${data.latencyMs ?? 0}ms)`
           );
+        } else if (input.reduceOnly) {
+          const existingPos = rt.snapshot.pairs.find((p) => p.symbol === input.symbol)?.openPosition;
+          const exitPx = data.avgPrice && data.avgPrice > 0 ? data.avgPrice : refPx;
+          if (existingPos) {
+            const closeQty = execQtyNum > 0 ? execQtyNum : input.usdtAmount / Math.max(exitPx, 1e-8);
+            const ratio =
+              existingPos.remainingQuantity > 0
+                ? Math.min(1, closeQty / existingPos.remainingQuantity)
+                : 1;
+            rt.recordExternalLiveExit(
+              input.symbol,
+              ratio,
+              exitPx,
+              'ManualClose',
+              `Live ${liveStatus.environment} ${venue} Reduce-Only ${binanceType} ${input.symbol} @ $${fmtPx(exitPx)} (${data.latencyMs ?? 0}ms)`,
+              Date.now(),
+              data.orderId,
+              execQtyNum > 0 ? execQtyNum : undefined
+            );
+          }
         } else {
           rt.recordExternalLiveOrder(
             input,
@@ -1683,6 +2386,7 @@ export default function App() {
               executedQty: data.executedQty,
               avgPrice: data.avgPrice,
               commission: data.commission,
+              baseCommission: data.baseCommission,
               commissionAsset: data.commissionAsset,
               orderId: data.orderId,
               ocoOrderListId: data.ocoOrderListId,
@@ -1782,7 +2486,7 @@ export default function App() {
               side: closeSide,
               type: 'MARKET',
               quantity: pos.remainingQuantity,
-              reduceOnly: venue === 'Futures' ? true : undefined,
+              reduceOnly: true,
               preflightOnly: false,
             }),
           });
@@ -1801,7 +2505,7 @@ export default function App() {
               1,
               exitPx,
               'ManualClose',
-              `Live ${venue} ${closeSide} exit ${symbol} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
+              `Live ${venue} ${closeSide} exit ${symbol} @ $${fmtPx(exitPx)} (${data.latencyMs ?? 0}ms)`,
               Date.now(),
               data.orderId,
               data.executedQty
@@ -1847,6 +2551,49 @@ export default function App() {
         syncSnapshots();
         return;
       }
+      // 1. Cancel all resting Live pending orders first (promoting any alreadyFilled race so step 2 flattens it too)
+      const pendingCopy = [...rt.snapshot.pendingOrders];
+      for (const ord of pendingCopy) {
+        if (!ord.exchangeOrderId) {
+          rt.confirmLivePendingCanceled(ord.id, 'Emergency Flatten All canceled pending order', Date.now());
+          continue;
+        }
+        try {
+          const cResp = await apiFetch('/api/live/cancel-order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              symbol: ord.symbol,
+              venue: ord.venue ?? venue,
+              orderId: ord.exchangeOrderId,
+              side: ord.side === 'Long' ? 'BUY' : 'SELL',
+              reason: 'Emergency Flatten All canceled pending order',
+            }),
+          });
+          const cData = (await cResp.json().catch(() => ({}))) as {
+            ok?: boolean;
+            alreadyFilled?: boolean;
+            executedQty?: number;
+            avgPrice?: number;
+            error?: string;
+          };
+          if (cResp.ok && cData.ok && cData.alreadyFilled) {
+            rt.promoteExternalLivePendingOrder(ord.id, cData.avgPrice, cData.executedQty, Date.now());
+          } else if (cResp.ok && cData.ok) {
+            rt.confirmLivePendingCanceled(ord.id, 'Emergency Flatten All canceled pending order', Date.now());
+          } else {
+            rt.reportLiveAutoRejected(
+              `Live Flatten pending cancel failed (${ord.symbol}): ${cData.error ?? `HTTP ${cResp.status}`}`
+            );
+          }
+        } catch (err) {
+          rt.reportLiveAutoRejected(
+            `Live Flatten pending cancel error (${ord.symbol}): ${err instanceof Error ? err.message : 'Network error'}`
+          );
+        }
+      }
+
+      // 2. Cancel brackets and flatten all open positions (including any promoted above)
       const openPairs = rt.snapshot.pairs.filter(
         (p) => p.openPosition && (p.openPosition.side === 'Long' || venue === 'Futures')
       );
@@ -1882,7 +2629,7 @@ export default function App() {
               side: pos.side === 'Long' ? 'SELL' : 'BUY',
               type: 'MARKET',
               quantity: pos.remainingQuantity,
-              reduceOnly: venue === 'Futures' ? true : undefined,
+              reduceOnly: true,
               preflightOnly: false,
             }),
           });
@@ -1901,7 +2648,7 @@ export default function App() {
               1,
               exitPx,
               'CircuitBreakerFlatten',
-              `Live Flatten ${venue} ${p.symbol} @ $${exitPx.toFixed(exitPx >= 100 ? 2 : 4)} (${data.latencyMs ?? 0}ms)`,
+              `Live Flatten ${venue} ${p.symbol} @ $${fmtPx(exitPx)} (${data.latencyMs ?? 0}ms)`,
               Date.now(),
               data.orderId,
               data.executedQty
@@ -1928,11 +2675,16 @@ export default function App() {
   const handleCancelPendingOrder = async (orderId: string) => {
     const rt = activeRuntimeRef.current;
     if (!rt) return;
-    const ord = rt.snapshot.pendingOrders.find((o) => o.id === orderId);
-    if (accountMode === 'Live' && isRemoteVpsDaemon && ord) {
-      await dispatchVpsControl({ action: 'close_position', symbol: ord.symbol });
+    if (accountMode === 'Live' && isRemoteVpsDaemon) {
+      const vpsOrd =
+        remoteVpsSnapshot?.pendingOrders.find((o) => o.id === orderId) ??
+        rt.snapshot.pendingOrders.find((o) => o.id === orderId);
+      if (vpsOrd) {
+        await dispatchVpsControl({ action: 'close_position', symbol: vpsOrd.symbol });
+      }
       return;
     }
+    const ord = rt.snapshot.pendingOrders.find((o) => o.id === orderId);
     if (
       accountMode === 'Live' &&
       ord?.exchangeOrderId &&
@@ -1940,20 +2692,50 @@ export default function App() {
       liveStatus.armedForLiveOrders
     ) {
       try {
-        await apiFetch('/api/live/order', {
-          method: 'DELETE',
+        const resp = await apiFetch('/api/live/cancel-order', {
+          method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             symbol: ord.symbol,
             venue: ord.venue ?? config.trading.venue,
             orderId: ord.exchangeOrderId,
+            side: ord.side === 'Long' ? 'BUY' : 'SELL',
+            reason: 'Manual pending order cancel',
           }),
         });
-      } catch {
-        // Proceed with local removal after attempt
+        const data = (await resp.json().catch(() => ({}))) as {
+          ok?: boolean;
+          alreadyFilled?: boolean;
+          executedQty?: number;
+          avgPrice?: number;
+          error?: string;
+        };
+        if (resp.ok && data.ok && data.alreadyFilled) {
+          rt.promoteExternalLivePendingOrder(
+            orderId,
+            data.avgPrice,
+            data.executedQty,
+            Date.now()
+          );
+          syncSnapshots();
+          return;
+        }
+        if (!resp.ok || !data.ok) {
+          rt.reportLiveAutoRejected(
+            `Live cancel failed (${ord.symbol}): ${data.error ?? `HTTP ${resp.status}`} — keeping pending order tracked`
+          );
+          syncSnapshots();
+          return;
+        }
+      } catch (err) {
+        rt.reportLiveAutoRejected(
+          `Live cancel error (${ord.symbol}): ${err instanceof Error ? err.message : 'network error'} — keeping pending order tracked`
+        );
+        syncSnapshots();
+        return;
       }
     }
-    rt.cancelPendingOrder(orderId);
+    rt.confirmLivePendingCanceled(orderId, 'Manual pending order cancel', Date.now());
     syncSnapshots();
   };
 
@@ -1988,6 +2770,51 @@ export default function App() {
 
   const handleSelectPairAndTrade = (symbol: string) => {
     setSelectedSymbol(symbol);
+    setSection('trade');
+  };
+
+  const handleUpdatePairSelectionMode = (mode: PairSelectionMode) => {
+    handleUpdateConfig({
+      ...config,
+      trading: {
+        ...config.trading,
+        pairSelectionMode: mode,
+      },
+    });
+  };
+
+  const handleTogglePinPair = (symbol: string) => {
+    const clean = symbol.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!clean) return;
+    const exists = config.trading.pairs.includes(clean);
+    const nextPairs = exists
+      ? config.trading.pairs.length > 1 || config.trading.pairSelectionMode !== 'static'
+        ? config.trading.pairs.filter((s) => s !== clean)
+        : config.trading.pairs
+      : [...config.trading.pairs, clean];
+    handleUpdateConfig({
+      ...config,
+      trading: {
+        ...config.trading,
+        pairs: nextPairs,
+      },
+    });
+  };
+
+  const handlePinAndTradeSymbol = (symbol: string) => {
+    const clean = symbol.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!clean) return;
+    const activeAlready = displaySnapshot.pairs.some((p) => p.symbol === clean);
+    if (!activeAlready && !config.trading.pairs.includes(clean)) {
+      handleUpdateConfig({
+        ...config,
+        trading: {
+          ...config.trading,
+          pairs: [...config.trading.pairs, clean],
+        },
+      });
+    }
+    setSelectedSymbol(clean);
     setSection('trade');
   };
 
@@ -2081,7 +2908,11 @@ export default function App() {
       const safeLeverage = Math.min(20, Math.max(1, payload.leverage));
       const nextVenue = payload.venue;
       const nextDirection =
-        nextVenue === 'Futures' ? 'both' : config.automation.directionPolicy;
+        nextVenue === 'Spot'
+          ? 'long_only'
+          : config.automation.directionPolicy === 'long_only'
+            ? 'both'
+            : config.automation.directionPolicy;
       if (nextVenue !== config.trading.venue) {
         paperRuntimeRef.current?.setVenue(nextVenue);
         liveRuntimeRef.current?.setVenue(nextVenue);
@@ -2097,6 +2928,7 @@ export default function App() {
         automation: {
           ...config.automation,
           directionPolicy: nextDirection,
+          autoFlipOnReversal: nextVenue === 'Spot' ? false : config.automation.autoFlipOnReversal,
         },
       });
       return {
@@ -2341,7 +3173,7 @@ export default function App() {
               }`}
               aria-hidden="true"
             />
-            {displaySnapshot.transport.mode} · {config.trading.pairs.length} Pairs
+            {displaySnapshot.transport.mode} · {displaySnapshot.pairs.length || config.trading.pairs.length} Pairs ({config.trading.pairSelectionMode})
           </span>
 
           <button
@@ -2605,6 +3437,12 @@ export default function App() {
               onSelectPairAndTrade={handleSelectPairAndTrade}
               onSimulateTransport={handleSimulateTransport}
               onToggleFeedSource={handleToggleFeedSource}
+              screenerSnapshot={screenerSnapshot}
+              screenerCategory={screenerCategory}
+              onChangeScreenerCategory={setScreenerCategory}
+              onUpdatePairSelectionMode={handleUpdatePairSelectionMode}
+              onTogglePinPair={handleTogglePinPair}
+              onPinAndTradeSymbol={handlePinAndTradeSymbol}
             />
           )}
 
@@ -2613,7 +3451,9 @@ export default function App() {
               accountMode={accountMode}
               activeSymbol={selectedSymbol}
               activeVenue={config.trading.venue}
-              symbols={config.trading.pairs}
+              symbols={Array.from(
+                new Set([...config.trading.pairs, ...displaySnapshot.pairs.map((p) => p.symbol)])
+              )}
               refreshKey={orderLogRefreshKey}
               serverTargetLabel={serverTargetLabel}
               onSelectPairAndTrade={handleSelectPairAndTrade}

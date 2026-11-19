@@ -89,3 +89,12 @@ test('IndicatorPipeline populates full snapshot after warmup bars', () => {
   assert.ok(snap.rsi !== null);
   assert.ok(snap.vwap !== null);
 });
+
+test('Wilder RSI returns neutral 50 on completely flat price series', () => {
+  const rsi = new WilderRsi(14);
+  let last: number | null = null;
+  for (let i = 0; i < 20; i += 1) {
+    last = rsi.next(100);
+  }
+  assert.equal(last, 50);
+});

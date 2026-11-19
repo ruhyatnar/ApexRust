@@ -5,11 +5,14 @@ import type {
   DirectionPolicy,
   EngineSnapshot,
   ExecutionOrderMethod,
+  PairSelectionMode,
   PositionSizingMode,
   StrategyMode,
   StrategyProfile,
   Timeframe,
   TimeInForce,
+  TrendingCategory,
+  TrendingRankingSource,
 } from '../engine/types';
 
 interface StrategyConfigViewProps {
@@ -394,17 +397,18 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:col-span-6">
             <div>
               <label htmlFor="auto-direction-policy" className="block text-xs font-medium text-slate-400">
-                Direction Policy
+                Direction Policy {config.trading.venue === 'Spot' ? '(Spot Long Only)' : ''}
               </label>
               <select
                 id="auto-direction-policy"
-                disabled={!config.features.automatedTrading}
-                value={auto.directionPolicy}
+                disabled={!config.features.automatedTrading || config.trading.venue === 'Spot'}
+                value={config.trading.venue === 'Spot' ? 'long_only' : auto.directionPolicy}
                 onChange={(e) => updateAutomation('directionPolicy', e.target.value as DirectionPolicy)}
-                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed"
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
               >
-                <option value="long_only">Spot Long Only</option>
-                <option value="both">Long & Short</option>
+                <option value="long_only">Spot / Long Only</option>
+                <option value="both">Long &amp; Short</option>
+                <option value="short_only">Short Only (Futures)</option>
               </select>
             </div>
 
@@ -497,6 +501,332 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                 />
               </label>
             </div>
+          </div>
+        </div>
+
+        {/* Dynamic Pending Order & Early Open-Position Exit Controls */}
+        <div className={`border-t border-white/[0.06] pt-4 space-y-3 ${!config.features.automatedTrading ? 'opacity-50' : ''}`}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+              Dynamic Order Lifecycle &amp; Reversal Protection
+            </span>
+            <span className="font-mono text-[11px] text-slate-400">
+              Cancels stale limits &amp; closes reversals before capital sits trapped
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <label
+              htmlFor="auto-cancel-rev"
+              className="flex cursor-pointer items-center justify-between gap-2 rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 text-xs text-slate-200"
+            >
+              <span>Cancel Pending on Signal Flip</span>
+              <input
+                id="auto-cancel-rev"
+                type="checkbox"
+                disabled={!config.features.automatedTrading}
+                checked={auto.cancelPendingOnSignalReversal ?? true}
+                onChange={(e) => updateAutomation('cancelPendingOnSignalReversal', e.target.checked)}
+                className="h-4 w-4 rounded border-white/[0.15] bg-[#141820] text-[#7DF2AD]"
+              />
+            </label>
+            <label
+              htmlFor="auto-cancel-exh"
+              className="flex cursor-pointer items-center justify-between gap-2 rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 text-xs text-slate-200"
+            >
+              <span>Cancel Pending on Exhaustion</span>
+              <input
+                id="auto-cancel-exh"
+                type="checkbox"
+                disabled={!config.features.automatedTrading}
+                checked={auto.cancelPendingOnExhaustion ?? true}
+                onChange={(e) => updateAutomation('cancelPendingOnExhaustion', e.target.checked)}
+                className="h-4 w-4 rounded border-white/[0.15] bg-[#141820] text-[#7DF2AD]"
+              />
+            </label>
+            <label
+              htmlFor="auto-early-rev-exit"
+              className="flex cursor-pointer items-center justify-between gap-2 rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 text-xs text-slate-200"
+            >
+              <span>Early Exit on Opposite Signal</span>
+              <input
+                id="auto-early-rev-exit"
+                type="checkbox"
+                disabled={!config.features.automatedTrading}
+                checked={auto.exitPositionOnSignalReversal ?? true}
+                onChange={(e) => updateAutomation('exitPositionOnSignalReversal', e.target.checked)}
+                className="h-4 w-4 rounded border-white/[0.15] bg-[#141820] text-[#7DF2AD]"
+              />
+            </label>
+            <label
+              htmlFor="auto-tighten-trail"
+              className="flex cursor-pointer items-center justify-between gap-2 rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 text-xs text-slate-200"
+            >
+              <span>Tighten Trail (0.55×) on Fade</span>
+              <input
+                id="auto-tighten-trail"
+                type="checkbox"
+                disabled={!config.features.automatedTrading}
+                checked={auto.tightenTrailingOnExhaustion ?? true}
+                onChange={(e) => updateAutomation('tightenTrailingOnExhaustion', e.target.checked)}
+                className="h-4 w-4 rounded border-white/[0.15] bg-[#141820] text-[#7DF2AD]"
+              />
+            </label>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div>
+              <label htmlFor="cfg-pending-ttl" className="block text-xs font-medium text-slate-400">
+                Pending Limit Max Age (Bars)
+              </label>
+              <input
+                id="cfg-pending-ttl"
+                type="number"
+                min="1"
+                max="50"
+                disabled={!config.features.automatedTrading}
+                value={auto.maxPendingOrderBars ?? 6}
+                onChange={(e) =>
+                  updateAutomation('maxPendingOrderBars', Math.max(1, Number(e.target.value) || 6))
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label htmlFor="cfg-pending-runaway" className="block text-xs font-medium text-slate-400">
+                Runaway Cancel Distance (× ATR)
+              </label>
+              <input
+                id="cfg-pending-runaway"
+                type="number"
+                step="0.1"
+                min="0.5"
+                max="10"
+                disabled={!config.features.automatedTrading}
+                value={auto.maxPendingRunawayAtr ?? 1.8}
+                onChange={(e) =>
+                  updateAutomation(
+                    'maxPendingRunawayAtr',
+                    Math.max(0.5, Number(e.target.value) || 1.8)
+                  )
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+            <div className="flex flex-col justify-end">
+              <label
+                htmlFor="auto-flip-rev"
+                className={`flex items-center justify-between gap-2 rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 text-xs ${
+                  config.trading.venue === 'Spot'
+                    ? 'cursor-not-allowed text-slate-500 opacity-60'
+                    : 'cursor-pointer text-slate-200'
+                }`}
+              >
+                <span>
+                  Auto-Flip Reversal {config.trading.venue === 'Spot' ? '(Futures Only)' : ''}
+                </span>
+                <input
+                  id="auto-flip-rev"
+                  type="checkbox"
+                  disabled={!config.features.automatedTrading || config.trading.venue === 'Spot'}
+                  checked={config.trading.venue === 'Spot' ? false : (auto.autoFlipOnReversal ?? false)}
+                  onChange={(e) => updateAutomation('autoFlipOnReversal', e.target.checked)}
+                  className="h-4 w-4 rounded border-white/[0.15] bg-[#141820] text-[#7DF2AD]"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Watchlist Mode & Trending Pair Discovery */}
+      <div className="rounded-xl border border-white/[0.06] bg-[#141820] p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] pb-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-100">
+              Multi-Pair Watchlist &amp; Binance Trending Scanner
+            </h3>
+            <p className="text-xs text-slate-400">
+              Switch between Static Only, Hybrid (Pinned + Auto-Trending), or Dynamic Auto-Rotation with hysteresis &amp; dwell protection.
+            </p>
+          </div>
+          <span className="font-mono text-xs text-[#7DF2AD]">
+            Active Slots: {snapshot.pairs.length}/{config.trading.maxWatchlistPairs}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div>
+            <label htmlFor="cfg-pair-mode" className="block text-xs font-medium text-slate-400">
+              Pair Selection Mode
+            </label>
+            <select
+              id="cfg-pair-mode"
+              value={config.trading.pairSelectionMode ?? 'hybrid'}
+              onChange={(e) => updateTrading('pairSelectionMode', e.target.value as PairSelectionMode)}
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-[#7DF2AD] focus:border-[#7DF2AD] focus:outline-none"
+            >
+              <option value="static">static (Pinned Only)</option>
+              <option value="hybrid">hybrid (Pinned + Trending)</option>
+              <option value="dynamic">dynamic (Full Auto-Trending)</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="cfg-trend-cat" className="block text-xs font-medium text-slate-400">
+              Trending Screener Mode
+            </label>
+            <select
+              id="cfg-trend-cat"
+              value={config.trading.trendingCategory ?? 'hot_volume'}
+              onChange={(e) => updateTrading('trendingCategory', e.target.value as TrendingCategory)}
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            >
+              <option value="hot_volume">hot_volume (24h Liquidity)</option>
+              <option value="top_gainers">top_gainers (24h Breakout)</option>
+              <option value="top_losers">top_losers (Futures Shorts)</option>
+              <option value="volatility_leaders">volatility_leaders (High Range)</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="cfg-rank-src" className="block text-xs font-medium text-slate-400">
+              Screener Data Source
+            </label>
+            <select
+              id="cfg-rank-src"
+              value={config.trading.rankingSource ?? 'auto'}
+              onChange={(e) => updateTrading('rankingSource', e.target.value as TrendingRankingSource)}
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            >
+              <option value="auto">auto (Prod WS + Venue Filter)</option>
+              <option value="production">production (Mainnet Rankings)</option>
+              <option value="environment">environment (Same Env)</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="cfg-quote-asset" className="block text-xs font-medium text-slate-400">
+              Quote Asset
+            </label>
+            <select
+              id="cfg-quote-asset"
+              value={config.trading.quoteAsset ?? 'USDT'}
+              onChange={(e) => updateTrading('quoteAsset', e.target.value)}
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            >
+              <option value="USDT">USDT</option>
+              <option value="USDC">USDC</option>
+              <option value="FDUSD">FDUSD</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <div>
+            <label htmlFor="cfg-max-watch" className="block text-xs font-medium text-slate-400">
+              Max Watchlist
+            </label>
+            <input
+              id="cfg-max-watch"
+              type="number"
+              min="1"
+              max="40"
+              value={config.trading.maxWatchlistPairs ?? 20}
+              onChange={(e) =>
+                updateTrading('maxWatchlistPairs', Math.min(40, Math.max(1, Number(e.target.value) || 20)))
+              }
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+          <div>
+            <label htmlFor="cfg-trend-n" className="block text-xs font-medium text-slate-400">
+              Trending Top N
+            </label>
+            <input
+              id="cfg-trend-n"
+              type="number"
+              min="1"
+              max="20"
+              value={config.trading.trendingTopN ?? 5}
+              onChange={(e) =>
+                updateTrading('trendingTopN', Math.min(20, Math.max(1, Number(e.target.value) || 5)))
+              }
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+          <div>
+            <label htmlFor="cfg-max-same-dir" className="block text-xs font-medium text-slate-400">
+              Max Same Dir
+            </label>
+            <input
+              id="cfg-max-same-dir"
+              type="number"
+              min="1"
+              max="10"
+              value={config.trading.maxSameDirectionPositions ?? 2}
+              onChange={(e) =>
+                updateTrading(
+                  'maxSameDirectionPositions',
+                  Math.min(10, Math.max(1, Number(e.target.value) || 2))
+                )
+              }
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+          <div>
+            <label htmlFor="cfg-min-vol-usdt" className="block text-xs font-medium text-slate-400">
+              Min 24h Vol ($M)
+            </label>
+            <input
+              id="cfg-min-vol-usdt"
+              type="number"
+              min="1"
+              step="5"
+              value={Math.round((config.trading.trendingMinQuoteVolumeUsdt ?? 10_000_000) / 1_000_000)}
+              onChange={(e) =>
+                updateTrading(
+                  'trendingMinQuoteVolumeUsdt',
+                  Math.max(1_000_000, (Number(e.target.value) || 10) * 1_000_000)
+                )
+              }
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+          <div>
+            <label htmlFor="cfg-dwell-min" className="block text-xs font-medium text-slate-400">
+              Min Dwell (Min)
+            </label>
+            <input
+              id="cfg-dwell-min"
+              type="number"
+              min="0"
+              max="120"
+              value={config.trading.trendingMinDwellMinutes ?? 15}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                updateTrading(
+                  'trendingMinDwellMinutes',
+                  e.target.value !== '' && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0
+                );
+              }}
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
+          </div>
+          <div>
+            <label htmlFor="cfg-hyst-buf" className="block text-xs font-medium text-slate-400">
+              Hysteresis Buffer
+            </label>
+            <input
+              id="cfg-hyst-buf"
+              type="number"
+              min="0"
+              max="10"
+              value={config.trading.trendingHysteresisRankBuffer ?? 3}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                updateTrading(
+                  'trendingHysteresisRankBuffer',
+                  e.target.value !== '' && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0
+                );
+              }}
+              className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+            />
           </div>
         </div>
       </div>
@@ -767,6 +1097,165 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               onChange={(e) => updateIndicators('requireVwapAlignment', e.target.checked)}
               className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-[#7DF2AD] disabled:cursor-not-allowed disabled:opacity-40"
             />
+          </div>
+
+          <div className="border-t border-white/[0.06] pt-3 space-y-3">
+            <span className="block text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              11-Layer Anti-False-Signal Mitigation
+            </span>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label htmlFor="cfg-ema-ext" className="block text-xs font-medium text-slate-400">
+                  Max EMA21 Dist (ATR)
+                </label>
+                <input
+                  id="cfg-ema-ext"
+                  type="number"
+                  step="0.1"
+                  min="0.5"
+                  max="6"
+                  value={config.indicators.maxEmaMidExtensionAtr ?? 2.2}
+                  onChange={(e) =>
+                    updateIndicators('maxEmaMidExtensionAtr', Number(e.target.value) || 2.2)
+                  }
+                  className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-vwap-ext" className="block text-xs font-medium text-slate-400">
+                  Max VWAP Dist (ATR)
+                </label>
+                <input
+                  id="cfg-vwap-ext"
+                  type="number"
+                  step="0.1"
+                  min="0.5"
+                  max="6"
+                  value={config.indicators.maxVwapExtensionAtr ?? 2.8}
+                  onChange={(e) =>
+                    updateIndicators('maxVwapExtensionAtr', Number(e.target.value) || 2.8)
+                  }
+                  className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-close-str" className="block text-xs font-medium text-slate-400">
+                  Min Close Strength
+                </label>
+                <input
+                  id="cfg-close-str"
+                  type="number"
+                  step="0.05"
+                  min="0"
+                  max="0.95"
+                  value={config.indicators.minCloseStrengthRatio ?? 0.55}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    updateIndicators(
+                      'minCloseStrengthRatio',
+                      e.target.value !== '' && Number.isFinite(v) ? Math.max(0, v) : 0
+                    );
+                  }}
+                  className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-body-ratio" className="block text-xs font-medium text-slate-400">
+                  Min Body Ratio
+                </label>
+                <input
+                  id="cfg-body-ratio"
+                  type="number"
+                  step="0.05"
+                  min="0"
+                  max="0.9"
+                  value={config.indicators.minCandleBodyRatio ?? 0.3}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    updateIndicators(
+                      'minCandleBodyRatio',
+                      e.target.value !== '' && Number.isFinite(v) ? Math.max(0, v) : 0
+                    );
+                  }}
+                  className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-di-spread" className="block text-xs font-medium text-slate-400">
+                  Min DI Spread (+DI/-DI)
+                </label>
+                <input
+                  id="cfg-di-spread"
+                  type="number"
+                  step="0.5"
+                  min="0"
+                  max="20"
+                  value={config.indicators.minDiSpread ?? 3}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    updateIndicators(
+                      'minDiSpread',
+                      e.target.value !== '' && Number.isFinite(v) ? Math.max(0, v) : 0
+                    );
+                  }}
+                  className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-max-spread" className="block text-xs font-medium text-slate-400">
+                  Max Spread (bps)
+                </label>
+                <input
+                  id="cfg-max-spread"
+                  type="number"
+                  step="1"
+                  min="1"
+                  max="100"
+                  value={config.indicators.maxSpreadBps ?? 20}
+                  onChange={(e) => updateIndicators('maxSpreadBps', Number(e.target.value) || 20)}
+                  className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-min-warm" className="block text-xs font-medium text-slate-400">
+                  Min Warmup Bars
+                </label>
+                <input
+                  id="cfg-min-warm"
+                  type="number"
+                  step="10"
+                  min="50"
+                  max="220"
+                  value={config.indicators.minWarmupBars ?? 50}
+                  onChange={(e) => updateIndicators('minWarmupBars', Number(e.target.value) || 50)}
+                  className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                />
+              </div>
+              <div className="flex flex-col justify-end gap-1.5">
+                <label htmlFor="cfg-macro-scalp" className="flex items-center justify-between text-xs text-slate-300">
+                  <span>Macro EMA in Scalp</span>
+                  <input
+                    id="cfg-macro-scalp"
+                    type="checkbox"
+                    checked={config.indicators.requireMacroEmaInScalping ?? true}
+                    onChange={(e) =>
+                      updateIndicators('requireMacroEmaInScalping', e.target.checked)
+                    }
+                    className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-[#7DF2AD]"
+                  />
+                </label>
+                <label htmlFor="cfg-rising-adx" className="flex items-center justify-between text-xs text-slate-300">
+                  <span>Require Rising ADX</span>
+                  <input
+                    id="cfg-rising-adx"
+                    type="checkbox"
+                    checked={config.indicators.requireRisingAdx ?? true}
+                    onChange={(e) => updateIndicators('requireRisingAdx', e.target.checked)}
+                    className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-[#7DF2AD]"
+                  />
+                </label>
+              </div>
+            </div>
           </div>
         </div>
 

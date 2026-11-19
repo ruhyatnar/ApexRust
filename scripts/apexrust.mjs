@@ -85,7 +85,6 @@ Commands:
   stop [target]         Stop running component(s) gracefully
   restart [target]      Restart component(s) (supports --host, --lan, --web-port, --bot-port, --token)
   status                Show running PIDs, health checks, URLs, and OS services
-  status                Show running PIDs, health checks, URLs, and OS services
   logs [target]         Print or follow logs (-n <lines>, -f / --follow)
   doctor                Verify toolchains, configs, binaries, ports, and services
   update                git pull --ff-only, rebuild, and restart running services (--components, --no-restart)
@@ -107,6 +106,8 @@ Setup / Service Flags:
   --components <web|bot|both>    Which components to build & configure
   --env <testnet|production>     Binance environment (bot.toml always starts with paper_trading=true)
   --venue <spot|futures>         Trading venue
+  --pair-mode <mode>             Watchlist mode: static, hybrid (default), or dynamic
+  --trending-category <cat>      Trending filter: hot_volume, top_gainers, top_losers, volatility_leaders
   --auth <hmac|ed25519|paper>    Credential auth method (paper clears live keys)
   --api-key <key>                Binance API key (optional)
   --api-secret <secret>          Binance API secret (for HMAC)
@@ -135,7 +136,7 @@ function parseCliArgs(argv) {
   const positionals = [];
   const valueFlags = new Set([
     'components', 'role', 'remote-url', 'remote-name', 'remote-token', 'allowed-origins',
-    'env', 'venue', 'auth', 'api-key', 'api-secret', 'key-path',
+    'env', 'venue', 'pair-mode', 'trending-category', 'auth', 'api-key', 'api-secret', 'key-path',
     'leverage', 'margin', 'web-port', 'bot-port', 'host', 'token', 'bytes', 'web-bind', 'lines', 'log',
   ]);
   for (let i = 0; i < argv.length; i += 1) {
@@ -524,6 +525,40 @@ async function cmdSetup(flags) {
           existingVenue === 'futures' ? 'futures' : 'spot'
         ));
 
+  const existingPairMode = (readTomlValue(existingToml, 'trading', 'pair_selection_mode') || 'hybrid').toLowerCase();
+  const pairModeFlag = flags['pair-mode'] ? String(flags['pair-mode']).toLowerCase() : null;
+  if (pairModeFlag && !['static', 'hybrid', 'dynamic'].includes(pairModeFlag)) {
+    throw new Error(`Invalid --pair-mode "${flags['pair-mode']}". Choose static, hybrid, or dynamic.`);
+  }
+  const pairSelectionMode = pairModeFlag
+    ?? (skipLocalTradingPrompts
+      ? (['static', 'dynamic'].includes(existingPairMode) ? existingPairMode : 'hybrid')
+      : await select(
+          'Pair discovery & watchlist mode:',
+          [
+            { value: 'hybrid', label: 'Hybrid (Pinned watchlist + auto-rotating Binance trending pairs) (Recommended)' },
+            { value: 'static', label: 'Static Only (Trade only explicitly configured pairs)' },
+            { value: 'dynamic', label: 'Dynamic Auto-Rotation (Rotate entire watchlist via live WS screener)' },
+          ],
+          ['static', 'dynamic'].includes(existingPairMode) ? existingPairMode : 'hybrid'
+        ));
+
+  const existingTrendCat = (readTomlValue(existingToml, 'trading', 'trending_category') || 'hot_volume').toLowerCase();
+  const trendCatFlag = flags['trending-category'] ? String(flags['trending-category']).toLowerCase() : null;
+  if (
+    trendCatFlag &&
+    !['hot_volume', 'top_gainers', 'top_losers', 'volatility_leaders'].includes(trendCatFlag)
+  ) {
+    throw new Error(
+      `Invalid --trending-category "${flags['trending-category']}". Choose hot_volume, top_gainers, top_losers, or volatility_leaders.`
+    );
+  }
+  const trendingCategory =
+    trendCatFlag ??
+    (['top_gainers', 'top_losers', 'volatility_leaders'].includes(existingTrendCat)
+      ? existingTrendCat
+      : 'hot_volume');
+
   let leverage = flags.leverage !== undefined
     ? Number(flags.leverage)
     : Number(readTomlValue(existingToml, 'exchange', 'leverage') ?? 3) || 3;
@@ -737,7 +772,7 @@ async function cmdSetup(flags) {
   }
   const existingProxyTok = (existingEnv.APEXRUST_PROXY_TOKEN || '').trim();
   const proxyToken =
-    host === '0.0.0.0'
+    !isPrivateOrLoopbackHost(host)
       ? (existingProxyTok.length >= 32 ? existingProxyTok : crypto.randomBytes(24).toString('hex'))
       : existingProxyTok;
   const existingEngineTok = (existingEnv.APEXRUST_WEB_TOKEN || existingEnv.APEXRUST_ENGINE_TOKEN || '').trim();
@@ -792,10 +827,12 @@ async function cmdSetup(flags) {
       botHost: botBindHost,
       botPort,
       webPort,
+      pairSelectionMode,
+      trendingCategory,
     });
     fs.writeFileSync(PATHS.botToml, nextToml, 'utf8');
     chmodOwnerOnly(PATHS.botToml);
-    ok(`Wrote ${path.relative(REPO_DIR, PATHS.botToml)} (paper_trading = true, armed_for_live_orders = false)`);
+    ok(`Wrote ${path.relative(REPO_DIR, PATHS.botToml)} (paper_trading = true, armed_for_live_orders = false, pair_mode=${pairSelectionMode})`);
   }
 
   writeState({
@@ -1244,7 +1281,12 @@ async function cmdDoctor() {
     const toml = readCurrentTomlText();
     const paper = readTomlValue(toml, 'exchange', 'paper_trading');
     const armed = readTomlValue(toml, 'exchange.credentials', 'armed_for_live_orders');
-    ok(`rust-bot/config/bot.toml present (paper_trading=${paper}, armed_for_live_orders=${armed})`);
+    const pairMode = readTomlValue(toml, 'trading', 'pair_selection_mode') ?? 'hybrid';
+    const docEnv = readCurrentEnv();
+    const sqlitePath = path.resolve(REPO_DIR, (docEnv.APEXRUST_ORDER_DB_PATH || '').trim() || '.apexrust-orders.sqlite');
+    const sqliteExists = fs.existsSync(sqlitePath);
+    ok(`rust-bot/config/bot.toml present (paper_trading=${paper}, armed_for_live_orders=${armed}, pair_mode=${pairMode})`);
+    info(`SQLite WAL order database (${path.relative(REPO_DIR, sqlitePath)}): ${sqliteExists ? 'initialized' : 'will auto-create on first start'}`);
   } else if (needRust) {
     issues += 1;
     fail('rust-bot/config/bot.toml missing (run ./apexrust setup)');
@@ -1281,9 +1323,9 @@ async function cmdDoctor() {
   } else {
     info('No Cloudflare One / CGNAT (100.64.0.0/10) mesh interface detected locally');
   }
-  if (bindHost === '0.0.0.0' && proxyTok.length < 32 && currentEnv.APEXRUST_TRUST_ZERO_TRUST_MESH !== 'true') {
+  if (!isPrivateOrLoopbackHost(bindHost) && proxyTok.length < 32 && currentEnv.APEXRUST_TRUST_ZERO_TRUST_MESH !== 'true') {
     issues += 1;
-    fail('HOST=0.0.0.0 requires a >= 32-char APEXRUST_PROXY_TOKEN (or set HOST=127.0.0.1 / Cloudflare One WARP IP)');
+    fail(`Non-private bind HOST="${bindHost}" requires a >= 32-char APEXRUST_PROXY_TOKEN (or set HOST=127.0.0.1 / Cloudflare One WARP IP)`);
   } else {
     ok(`Bind safety OK (HOST=${bindHost}, authority=${currentEnv.APEXRUST_ENGINE_AUTHORITY || 'browser'})`);
   }
@@ -1328,6 +1370,21 @@ async function cmdDoctor() {
     const free = await isPortFree(port, probeHost);
     if (health.ok) {
       ok(`${c} responding on ${probeHost}:${port} (pid ${pid ?? 'external'})`);
+      if (c === 'web') {
+        try {
+          const headers = proxyTok ? { Authorization: `Bearer ${proxyTok}` } : {};
+          const scr = await fetch(`http://${probeHost}:${port}/api/market/screener?limit=5`, {
+            headers,
+            signal: AbortSignal.timeout(2000),
+          });
+          if (scr.ok) {
+            const payload = await scr.json();
+            ok(`Binance !miniTicker@arr screener endpoint ready (stream=${Boolean(payload.streamConnected)}, tradable=${payload.totalTradableSymbols ?? 0})`);
+          }
+        } catch {
+          // Ignore optional screener check failure
+        }
+      }
     } else if (!free) {
       warn(`Port ${port} (${c}) on ${probeHost} is occupied by a process not answering /api/health`);
     } else {

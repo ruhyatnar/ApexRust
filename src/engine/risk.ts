@@ -85,6 +85,10 @@ export class RiskManager {
       return { ok: false, reason: 'Zero stop-loss distance' };
     }
 
+    if (!Number.isFinite(this.currentEquity) || this.currentEquity <= 0) {
+      return { ok: false, reason: 'Insufficient account equity' };
+    }
+
     const riskUsdt = this.currentEquity * (this.tradingCfg.baseRiskPerTradePct / 100);
     return { ok: true, quantity: riskUsdt / stopDist };
   }
@@ -127,11 +131,11 @@ export class RiskManager {
 
     // 4. Streak guards (do not downgrade an already Halted circuit breaker)
     if (this.state !== 'Halted') {
-      if (this.loseStreak >= this.riskCfg.maxLoseStreak) {
+      if (this.riskCfg.maxLoseStreak > 0 && this.loseStreak >= this.riskCfg.maxLoseStreak) {
         this.state = 'Cooldown';
         this.cooldownUntilMs = nowMs + this.riskCfg.streakCooldownMinutes * 60_000;
         this.haltReason = `Max lose streak (${this.loseStreak}) reached — ${this.riskCfg.streakCooldownMinutes}m cooldown`;
-      } else if (this.winStreak >= this.riskCfg.maxWinStreak) {
+      } else if (this.riskCfg.maxWinStreak > 0 && this.winStreak >= this.riskCfg.maxWinStreak) {
         this.state = 'Cooldown';
         this.cooldownUntilMs = nowMs + this.riskCfg.streakCooldownMinutes * 60_000;
         this.haltReason = `Max win streak (${this.winStreak}) cap reached — protecting profits`;

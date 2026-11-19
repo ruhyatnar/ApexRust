@@ -12,11 +12,13 @@ use bot_core::{is_private_or_zero_trust_bind_addr, BotConfig};
 use bot_engine::{EngineCommand, TradingEngine};
 use bot_web::WebState;
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -121,6 +123,42 @@ enum RemoteAction {
     },
     /// Reset the 24/7 VPS risk circuit breaker and clear pair quarantines
     ResetCb,
+    /// Print live Binance WS trending screener candidates on the 24/7 VPS
+    Trending {
+        /// Category: hot_volume, top_gainers, top_losers, or volatility_leaders
+        #[arg(long, default_value = "hot_volume")]
+        category: String,
+        /// Number of top pairs to show
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
+        /// Quote asset filter (e.g. USDT)
+        #[arg(long)]
+        quote: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update watchlist selection mode or pinned pairs on the 24/7 VPS bot
+    Watchlist {
+        /// Selection mode: static, hybrid, or dynamic
+        #[arg(long)]
+        mode: Option<String>,
+        /// Comma-separated pinned pairs (e.g. BTCUSDT,ETHUSDT,SOLUSDT)
+        #[arg(long)]
+        pairs: Option<String>,
+        /// Trending category: hot_volume, top_gainers, top_losers, or volatility_leaders
+        #[arg(long)]
+        category: Option<String>,
+        /// Quote asset (e.g. USDT)
+        #[arg(long)]
+        quote: Option<String>,
+        /// Max total pairs monitored simultaneously
+        #[arg(long)]
+        max_pairs: Option<usize>,
+        /// Trending slots reserved in hybrid/dynamic mode
+        #[arg(long)]
+        top_n: Option<usize>,
+    },
     /// Emergency flatten all open positions on the 24/7 VPS bot
     FlattenAll {
         /// Skip interactive confirmation prompt
@@ -329,10 +367,9 @@ impl RemoteClient {
         Ok(val)
     }
 
-    async fn post_control(&self, payload: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}/control", self.engine_api_base);
+    async fn post_json(&self, url: &str, payload: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let resp = self
-            .apply_auth(self.http.post(&url))
+            .apply_auth(self.http.post(url))
             .json(&payload)
             .send()
             .await?;
@@ -344,10 +381,37 @@ impl RemoteClient {
         if !status.is_success() {
             let msg = val["error"]
                 .as_str()
-                .unwrap_or("Remote control command failed");
+                .unwrap_or("Remote request failed");
             return Err(anyhow!("HTTP {status}: {msg}"));
         }
         Ok(val)
+    }
+
+    async fn post_control(&self, payload: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}/control", self.engine_api_base);
+        self.post_json(&url, payload).await
+    }
+
+    fn ws_telemetry_url(&self) -> String {
+        let ws_root = if let Some(rest) = self.server_root.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = self.server_root.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            self.server_root.clone()
+        };
+        if let Some(ref tok) = self.token {
+            let encoded = reqwest::Url::parse("http://localhost/")
+                .map(|mut u| {
+                    u.query_pairs_mut().append_pair("token", tok);
+                    u.query().unwrap_or_default().to_string()
+                })
+                .unwrap_or_default();
+            if !encoded.is_empty() {
+                return format!("{ws_root}/ws/telemetry?{encoded}");
+            }
+        }
+        format!("{ws_root}/ws/telemetry")
     }
 }
 
@@ -483,24 +547,54 @@ async fn run_remote_action(
         }
         RemoteAction::Watch { interval } => {
             let wait_sec = interval.max(1);
+            let ws_url = client.ws_telemetry_url();
             let snap_url = format!("{}/snapshot", client.engine_api_base);
             println!(
-                "Connected to 24/7 Remote VPS ({}) — polling every {}s (Ctrl+C to exit)...",
+                "Connecting to 24/7 Remote VPS ({}) — WebSocket /ws/telemetry with {}s HTTP fallback (Ctrl+C to exit)...",
                 client.server_root, wait_sec
             );
             let shutdown = wait_for_shutdown_signal();
             tokio::pin!(shutdown);
             loop {
-                let res = tokio::select! {
-                    _ = &mut shutdown => {
-                        println!("\nDisconnected from Remote VPS monitor (24/7 VPS bot continues running on server).");
-                        break;
+                let mut exit_requested = false;
+                match connect_async(&ws_url).await {
+                    Ok((mut ws_stream, _)) => {
+                        println!("[OK] Real-time WebSocket telemetry stream connected.");
+                        loop {
+                            tokio::select! {
+                                _ = &mut shutdown => {
+                                    println!("\nDisconnected from Remote VPS monitor (24/7 VPS bot continues running on server).");
+                                    exit_requested = true;
+                                    break;
+                                }
+                                msg = ws_stream.next() => {
+                                    match msg {
+                                        Some(Ok(WsMessage::Text(text))) => {
+                                            if let Ok(snap) = serde_json::from_str::<serde_json::Value>(&text) {
+                                                let payload = snap.get("snapshot").unwrap_or(&snap);
+                                                print_compact_snapshot(payload, &client.server_root);
+                                            }
+                                        }
+                                        Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => {
+                                            eprintln!("[WARN] Telemetry WS disconnected; falling back temporarily before reconnect...");
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                     }
-                    res = client.get_json(&snap_url) => res,
-                };
-                match res {
-                    Ok(snap) => print_compact_snapshot(&snap, &client.server_root),
-                    Err(err) => eprintln!("[WARN] VPS snapshot poll error: {err}"),
+                    Err(ws_err) => {
+                        eprintln!("[WARN] WS /ws/telemetry unavailable ({ws_err}) — polling HTTP every {wait_sec}s...");
+                        match client.get_json(&snap_url).await {
+                            Ok(snap) => print_compact_snapshot(&snap, &client.server_root),
+                            Err(err) => eprintln!("[WARN] VPS snapshot poll error: {err}"),
+                        }
+                    }
+                }
+                if exit_requested {
+                    break;
                 }
                 tokio::select! {
                     _ = &mut shutdown => {
@@ -583,6 +677,91 @@ async fn run_remote_action(
                 .await?;
             println!("24/7 VPS Circuit Breaker Reset: {}", res);
         }
+        RemoteAction::Trending {
+            category,
+            limit,
+            quote,
+            json,
+        } => {
+            let mut url = format!(
+                "{}/market/screener?category={}&limit={}",
+                client.engine_api_base,
+                category.trim(),
+                limit.clamp(1, 100)
+            );
+            if let Some(q) = quote {
+                let clean_q = q.trim().to_uppercase();
+                if !clean_q.is_empty() {
+                    url.push_str(&format!("&quoteAsset={clean_q}"));
+                }
+            }
+            let val = client.get_json(&url).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&val)?);
+            } else {
+                let venue = val["venue"].as_str().unwrap_or("-");
+                let stream_ok = val["streamConnected"].as_bool().unwrap_or(false);
+                println!(
+                    "=== Binance Live Screener ({category}, venue={venue}, ws={stream_ok}) ==="
+                );
+                if let Some(tickers) = val["tickers"].as_array() {
+                    for (idx, t) in tickers.iter().take(limit).enumerate() {
+                        let sym = t["symbol"].as_str().unwrap_or("-");
+                        let px = t["lastPrice"].as_f64().unwrap_or(0.0);
+                        let chg = t["priceChangePercent"].as_f64().unwrap_or(0.0);
+                        let qvol = t["quoteVolume"].as_f64().unwrap_or(0.0) / 1_000_000.0;
+                        let rng = t["rangePct24h"].as_f64().unwrap_or(0.0);
+                        let src = t["sourceTag"].as_str().unwrap_or("screener");
+                        println!(
+                            "  {:>2}. {:<12} px=${:<12.4} chg={:+6.2}% vol=${:>8.1}M range={:>5.2}% [{}]",
+                            idx + 1,
+                            sym,
+                            px,
+                            chg,
+                            qvol,
+                            rng,
+                            src
+                        );
+                    }
+                }
+            }
+        }
+        RemoteAction::Watchlist {
+            mode,
+            pairs,
+            category,
+            quote,
+            max_pairs,
+            top_n,
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(m) = mode {
+                body.insert("pairSelectionMode".into(), serde_json::json!(m.trim().to_lowercase()));
+            }
+            if let Some(p) = pairs {
+                let list: Vec<String> = p
+                    .split(',')
+                    .map(|s| s.trim().to_uppercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                body.insert("pinnedPairs".into(), serde_json::json!(list));
+            }
+            if let Some(c) = category {
+                body.insert("trendingCategory".into(), serde_json::json!(c.trim()));
+            }
+            if let Some(q) = quote {
+                body.insert("quoteAsset".into(), serde_json::json!(q.trim().to_uppercase()));
+            }
+            if let Some(mx) = max_pairs {
+                body.insert("maxWatchlistPairs".into(), serde_json::json!(mx));
+            }
+            if let Some(tn) = top_n {
+                body.insert("trendingTopN".into(), serde_json::json!(tn));
+            }
+            let url = format!("{}/watchlist", client.engine_api_base);
+            let res = client.post_json(&url, serde_json::Value::Object(body)).await?;
+            println!("24/7 VPS Watchlist Updated: {}", serde_json::to_string_pretty(&res)?);
+        }
         RemoteAction::FlattenAll { yes } => {
             confirm_dangerous_cli_action(yes, "Emergency Flatten All open positions on 24/7 Remote VPS")?;
             let res = client
@@ -620,9 +799,9 @@ async fn run_remote_action(
                 ),
             )?;
             let norm_side = if side.trim().eq_ignore_ascii_case("short") {
-                "short"
+                "Short"
             } else {
-                "long"
+                "Long"
             };
             let norm_method = match method.trim().to_uppercase().as_str() {
                 "LIMIT" => "LIMIT",
@@ -653,13 +832,18 @@ fn print_compact_snapshot(snap: &serde_json::Value, server_label: &str) {
     let running = snap["running"].as_bool().unwrap_or(false);
     let venue = snap["venue"].as_str().unwrap_or("spot");
     let transport = snap["transport_mode"].as_str().unwrap_or("WsPrimary");
+    let pair_mode = snap["pair_selection_mode"].as_str().unwrap_or("hybrid");
     let cb_state = snap["risk"]["state"].as_str().unwrap_or("Normal");
     let eq = snap["risk"]["current_equity"].as_f64().unwrap_or(0.0);
-    let daily_pnl = snap["risk"]["daily_pnl_usdt"].as_f64().unwrap_or(0.0);
+    let daily_pnl = snap["risk"]["cumulative_daily_pnl_usdt"]
+        .as_f64()
+        .or_else(|| snap["risk"]["daily_pnl_usdt"].as_f64())
+        .unwrap_or(0.0);
     println!(
-        "\n[☁️ Remote VPS: {server_label}] Status={} | Venue={} | Feed={} | CB={} | Equity=${eq:.2} (Daily PnL: ${daily_pnl:+.2})",
+        "\n[☁️ Remote VPS: {server_label}] Status={} | Venue={} | Mode={} | Feed={} | CB={} | Equity=${eq:.2} (Daily PnL: ${daily_pnl:+.2})",
         if running { "RUNNING" } else { "PAUSED" },
         venue.to_uppercase(),
+        pair_mode,
         transport,
         cb_state
     );
@@ -667,6 +851,9 @@ fn print_compact_snapshot(snap: &serde_json::Value, server_label: &str) {
         for p in pairs {
             let sym = p["symbol"].as_str().unwrap_or("-");
             let px = p["last_price"].as_f64().unwrap_or(0.0);
+            let src = p["source_tag"].as_str().unwrap_or("pinned");
+            let spread_bps = p["spread_bps"].as_f64().unwrap_or(0.0);
+            let warm = p["bars_warmed_up"].as_u64().unwrap_or(0);
             let pos_str = if let Some(pos) = p["open_position"].as_object() {
                 let side = pos.get("side").and_then(|v| v.as_str()).unwrap_or("Long");
                 let entry = pos.get("entry_price").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -675,7 +862,32 @@ fn print_compact_snapshot(snap: &serde_json::Value, server_label: &str) {
             } else {
                 "FLAT".to_string()
             };
-            println!("  • {sym:<10} px=${px:<12.4} | {pos_str}");
+            println!(
+                "  • {sym:<10} [{src:<9}] px=${px:<11.4} spread={spread_bps:>4.1}bps bars={warm:<3} | {pos_str}"
+            );
+        }
+    }
+    if let Some(pending) = snap["pending_orders"].as_array() {
+        if !pending.is_empty() {
+            println!("  Pending Resting Orders ({}):", pending.len());
+            for o in pending {
+                let sym = o["symbol"].as_str().unwrap_or("-");
+                let side = o["side"].as_str().unwrap_or("-");
+                let lim = o["limit_price"].as_f64().unwrap_or(0.0);
+                let src = o["source"].as_str().unwrap_or_else(|| {
+                    if o["is_manual"].as_bool().unwrap_or(false) {
+                        "manual"
+                    } else {
+                        "auto"
+                    }
+                });
+                let age_bars = o["age_bars"].as_u64().unwrap_or(0);
+                let note = o["dynamic_status_note"]
+                    .as_str()
+                    .or_else(|| o["rationale"].as_str())
+                    .unwrap_or("");
+                println!("    - {sym} {side} @ ${lim:.4} ({src}, {age_bars}b) {note}");
+            }
         }
     }
 }
@@ -824,7 +1036,12 @@ async fn main() -> anyhow::Result<()> {
         ));
         info!(%addr, "Serving WebApp telemetry API & WebSocket");
         tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, app).await {
+            if let Err(err) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
                 tracing::error!(%err, "Web server terminated");
             }
         });
@@ -900,5 +1117,34 @@ mod tests {
             "200",
         ]);
         assert!(parsed_remote.is_ok());
+
+        let parsed_trending = Cli::try_parse_from([
+            "bot-desktop",
+            "remote",
+            "trending",
+            "--category",
+            "top_gainers",
+            "--limit",
+            "10",
+        ]);
+        assert!(parsed_trending.is_ok());
+
+        let parsed_watchlist = Cli::try_parse_from([
+            "bot-desktop",
+            "remote",
+            "watchlist",
+            "--mode",
+            "hybrid",
+            "--pairs",
+            "BTCUSDT,SOLUSDT",
+        ]);
+        assert!(parsed_watchlist.is_ok());
+    }
+
+    #[test]
+    fn remote_client_builds_ws_telemetry_url_with_token() {
+        let client = RemoteClient::new("https://vps.example.com", Some("sec ret".into())).unwrap();
+        let ws_url = client.ws_telemetry_url();
+        assert_eq!(ws_url, "wss://vps.example.com/ws/telemetry?token=sec+ret");
     }
 }

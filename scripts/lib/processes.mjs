@@ -18,7 +18,7 @@ export function isAlive(pid) {
   }
 }
 
-export function readPid(component) {
+function readPid(component) {
   try {
     const pid = Number(fs.readFileSync(pidFile(component), 'utf8').trim());
     return Number.isInteger(pid) && pid > 0 ? pid : null;

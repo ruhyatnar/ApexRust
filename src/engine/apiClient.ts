@@ -205,6 +205,39 @@ export function setActiveConnectionProfile(profile: ConnectionProfile): void {
 }
 
 /**
+ * Builds a WebSocket (`ws://` or `wss://`) URL for local proxy or Remote VPS endpoints,
+ * appending `?token=` when an access token is configured.
+ */
+export function buildWebSocketUrl(
+  wsPath: string,
+  profile: ConnectionProfile = getActiveConnectionProfile()
+): string {
+  const cleanPath = wsPath.startsWith('/') ? wsPath : `/${wsPath}`;
+  let base = '';
+  if (profile.kind === 'remote' && profile.baseUrl.trim()) {
+    base = profile.baseUrl
+      .trim()
+      .replace(/\/+$/, '')
+      .replace(/^https:/i, 'wss:')
+      .replace(/^http:/i, 'ws:');
+  } else if (typeof window !== 'undefined' && window.location) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    base = `${proto}//${window.location.host}`;
+  } else {
+    base = 'ws://127.0.0.1:4173';
+  }
+  const tok =
+    profile.kind === 'remote'
+      ? profile.token.trim()
+      : getLocalAccessToken();
+  if (!tok) {
+    return `${base}${cleanPath}`;
+  }
+  const sep = cleanPath.includes('?') ? '&' : '?';
+  return `${base}${cleanPath}${sep}token=${encodeURIComponent(tok)}`;
+}
+
+/**
  * Drop-in replacement for `fetch('/api/...')` that routes to either:
  * - `🖥️ This Computer (Local)` (same-origin `/api/...`)
  * - `☁️ Remote VPS (24/7 Server)` (`<baseUrl>/api/...` with Cloudflare One / Bearer token headers)

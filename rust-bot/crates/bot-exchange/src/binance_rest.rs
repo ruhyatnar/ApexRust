@@ -1,12 +1,13 @@
 use crate::{
     build_sdk_rest_config, extract_base_asset, get_or_fetch_symbol_filters,
-    to_binance_step_decimal, validate_exchange_filters, validate_live_safety, ExchangeOrderStatus,
-    LiveOrderAck, LiveOrderRequest, SymbolFilters,
+    parse_ticker_24h_array, parse_tradable_symbols_from_exchange_info, to_binance_step_decimal,
+    validate_exchange_filters, validate_live_safety, CancelOrderOutcome, ExchangeOrderStatus,
+    LiveOrderAck, LiveOrderRequest, RestRateBudget, SymbolFilters,
 };
 use binance_sdk::spot::rest_api::{
-    DeleteOpenOrdersParams, DeleteOrderListParams, GetAccountParams, GetOpenOrdersParams,
-    GetOrderParams, NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderSideEnum,
-    NewOrderTimeInForceEnum, NewOrderTypeEnum, OrderListOcoAboveTypeEnum,
+    DeleteOpenOrdersParams, DeleteOrderListParams, DeleteOrderParams, GetAccountParams,
+    GetOpenOrdersParams, GetOrderParams, NewOrderNewOrderRespTypeEnum, NewOrderParams,
+    NewOrderSideEnum, NewOrderTimeInForceEnum, NewOrderTypeEnum, OrderListOcoAboveTypeEnum,
     OrderListOcoBelowTimeInForceEnum, OrderListOcoBelowTypeEnum, OrderListOcoParams,
     OrderListOcoSideEnum, OrderTestParams, OrderTestSideEnum, OrderTestTimeInForceEnum,
     OrderTestTypeEnum,
@@ -14,11 +15,12 @@ use binance_sdk::spot::rest_api::{
 use binance_sdk::spot::SpotRestApi;
 use bot_core::{
     BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent,
-    OrderExecutionMethod, Result, Side, TransportMode,
+    MarketTicker24h, OrderExecutionMethod, Result, Side, TransportMode,
 };
 use chrono::Utc;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -30,6 +32,7 @@ pub struct BinanceRestClient {
     http: reqwest::Client,
     sdk_client: Option<binance_sdk::spot::rest_api::RestApi>,
     filter_cache: RwLock<HashMap<String, SymbolFilters>>,
+    rate_budget: Arc<RestRateBudget>,
 }
 
 impl BinanceRestClient {
@@ -84,7 +87,10 @@ impl BinanceRestClient {
         }
     }
 
-    pub fn new(cfg: ExchangeConfig) -> Result<Self> {
+    pub fn new_with_budget(
+        cfg: ExchangeConfig,
+        rate_budget: Arc<RestRateBudget>,
+    ) -> Result<Self> {
         let sdk_client = if let Some(mut rest_cfg) = build_sdk_rest_config(&cfg)? {
             rest_cfg.base_path = Some(Self::resolve_base_url(&cfg).to_string());
             Some(SpotRestApi::from_config(rest_cfg))
@@ -103,6 +109,7 @@ impl BinanceRestClient {
             http,
             sdk_client,
             filter_cache: RwLock::new(HashMap::new()),
+            rate_budget,
         })
     }
 
@@ -130,7 +137,9 @@ impl BinanceRestClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| BotError::RestApi(format!("REST HTTP request failed: {e}")))?
+            .map_err(|e| BotError::RestApi(format!("REST HTTP request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
             .error_for_status()
             .map_err(|e| BotError::RestApi(format!("REST HTTP status error: {e}")))?;
 
@@ -178,7 +187,9 @@ impl BinanceRestClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| BotError::RestApi(format!("Spot ticker request failed: {e}")))?
+            .map_err(|e| BotError::RestApi(format!("Spot ticker request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
             .error_for_status()
             .map_err(|e| BotError::RestApi(format!("Spot ticker status error: {e}")))?;
         let val: serde_json::Value = resp
@@ -252,6 +263,7 @@ impl BinanceRestClient {
             ExchangeVenue::Spot,
             &sym,
             ref_px,
+            &self.rate_budget,
         )
         .await;
         let side_buy = match req.side {
@@ -299,11 +311,13 @@ impl BinanceRestClient {
         } else {
             None
         };
-        let est_notional = req.quote_order_qty.unwrap_or_else(|| {
+        let est_notional = if quote_dec.is_some() {
+            req.quote_order_qty.unwrap_or(0.0)
+        } else {
             let q = qty_num.unwrap_or(req.quantity);
             let p = limit_px_num.unwrap_or(ref_px);
             q * p
-        });
+        };
         validate_exchange_filters(
             &sym,
             &filters,
@@ -432,12 +446,7 @@ impl BinanceRestClient {
             .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        let filled = status == "FILLED"
-            || (exec_qty > 0.0
-                && !matches!(
-                    status.as_str(),
-                    "NEW" | "CANCELED" | "REJECTED" | "EXPIRED" | "EXPIRED_IN_MATCH"
-                ));
+        let filled = status == "FILLED" || exec_qty > 0.0;
         let cum_quote: f64 = resp
             .cummulative_quote_qty
             .as_deref()
@@ -579,7 +588,9 @@ impl BinanceRestClient {
             bracket_warning,
             status,
             filled,
-            executed_qty: exec_qty,
+            // For Spot BUY orders, report post-commission net base quantity so subsequent
+            // protective exit SELLs never hit Binance -2010 Insufficient Balance.
+            executed_qty: if side_buy { net_exec_qty } else { exec_qty },
             avg_price,
         })
     }
@@ -593,10 +604,19 @@ impl BinanceRestClient {
             .recv_window(self.spot_recv_window())
             .build()
             .map_err(|e| BotError::RestApi(format!("Cancel OCO params error: {e}")))?;
-        sdk.delete_order_list(params)
-            .await
-            .map_err(|e| BotError::RestApi(format!("Spot delete_order_list failed: {e}")))?;
-        Ok(())
+        match sdk.delete_order_list(params).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("-2011") {
+                    Ok(())
+                } else {
+                    Err(BotError::RestApi(format!(
+                        "Spot delete_order_list failed: {msg}"
+                    )))
+                }
+            }
+        }
     }
 
     pub async fn cancel_spot_open_orders(&self, symbol: &str) -> Result<()> {
@@ -751,5 +771,110 @@ impl BinanceRestClient {
             .and_then(|b| b.free.as_deref()?.parse::<f64>().ok())
             .unwrap_or(0.0);
         Ok(free)
+    }
+
+    pub async fn fetch_spot_tradable_symbols(&self) -> Result<HashSet<String>> {
+        let url = format!("{}/api/v3/exchangeInfo", self.effective_base_url());
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot exchangeInfo request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| BotError::RestApi(format!("Spot exchangeInfo status error: {e}")))?;
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot exchangeInfo decode failed: {e}")))?;
+        Ok(parse_tradable_symbols_from_exchange_info(ExchangeVenue::Spot, &val))
+    }
+
+    pub async fn fetch_spot_ticker_24h_all(
+        &self,
+        custom_base_url: Option<&str>,
+    ) -> Result<Vec<MarketTicker24h>> {
+        let base = custom_base_url.unwrap_or_else(|| self.effective_base_url());
+        let url = format!("{}/api/v3/ticker/24hr", base.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot ticker/24hr request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| BotError::RestApi(format!("Spot ticker/24hr status error: {e}")))?;
+        let rows: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Spot ticker/24hr decode failed: {e}")))?;
+        Ok(parse_ticker_24h_array(ExchangeVenue::Spot, &rows))
+    }
+
+    pub async fn cancel_spot_order(
+        &self,
+        symbol: &str,
+        order_id: i64,
+    ) -> Result<CancelOrderOutcome> {
+        let Some(sdk) = self.sdk_client.as_ref() else {
+            return Ok(CancelOrderOutcome::Canceled);
+        };
+        let params = DeleteOrderParams::builder(symbol.to_uppercase())
+            .order_id(order_id)
+            .recv_window(self.spot_recv_window())
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Spot delete_order params error: {e}")))?;
+        match sdk.delete_order(params).await {
+            Ok(resp) => {
+                if let Ok(data) = resp.data().await {
+                    let exec_qty = data
+                        .executed_qty
+                        .as_deref()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    if exec_qty > 0.0 {
+                        let cum_quote = data
+                            .cummulative_quote_qty
+                            .as_deref()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let avg_price = if cum_quote > 0.0 {
+                            cum_quote / exec_qty
+                        } else {
+                            data.price
+                                .as_deref()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0)
+                        };
+                        return Ok(CancelOrderOutcome::AlreadyFilled(ExchangeOrderStatus {
+                            order_id: data.order_id.unwrap_or(order_id).to_string(),
+                            status: "PARTIALLY_FILLED".to_string(),
+                            executed_qty: exec_qty,
+                            avg_price,
+                        }));
+                    }
+                }
+                Ok(CancelOrderOutcome::Canceled)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("-2011") {
+                    if let Ok(st) = self.query_spot_order_status(symbol, order_id).await {
+                        if matches!(st.status.as_str(), "FILLED" | "PARTIALLY_FILLED")
+                            && st.executed_qty > 0.0
+                        {
+                            return Ok(CancelOrderOutcome::AlreadyFilled(st));
+                        }
+                    }
+                    Ok(CancelOrderOutcome::Canceled)
+                } else {
+                    Err(BotError::RestApi(format!("Spot delete_order failed: {msg}")))
+                }
+            }
+        }
     }
 }

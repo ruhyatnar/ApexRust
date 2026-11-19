@@ -56,7 +56,7 @@ export function collectNewLiveFillNotifications(
   for (const rec of records) {
     if (rec.accountMode !== 'Live') continue;
     if (rec.orderStatus !== 'FILLED' && rec.orderStatus !== 'PARTIALLY_FILLED') continue;
-    if (rec.id.startsWith('binance-trade-')) continue;
+    if (rec.id.startsWith('binance-trade-') || rec.id.startsWith('live-sync-')) continue;
     if (notifiedIds.has(rec.id)) continue;
     notifiedIds.add(rec.id);
     fresh.push(rec);

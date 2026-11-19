@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { RiskManager } from './risk';
 import { DEFAULT_BOT_CONFIG, SimulationRuntime } from './simulator';
-import { buildExitPlan, evaluateEntrySignal, managePositionTick } from './strategy';
+import { buildExitPlan, evaluateEntrySignal, evaluateSignalDiagnostics, managePositionTick } from './strategy';
 import {
   calculateQuantitativePositionSizeUsdt,
   computeExpectancyStats,
@@ -1045,6 +1045,187 @@ test('FeatureToggles OFF blocks auto-scan, circuit breaker trip/reset, and trans
   });
   rt.setTransportMode('RestFallback');
   assert.equal(rt.snapshot.transport.mode, 'WsPrimary');
+});
+
+test('Audit regressions: RiskManager equity/streak guards, SignalDiagnostics direction policy, Pearson tail alignment, flatten pending & Spot base fee', () => {
+  // 1. RiskManager rejects entry when equity <= 0 and does not trip cooldown when streak caps are 0
+  const rmZeroEq = new RiskManager(
+    { ...DEFAULT_BOT_CONFIG.risk, maxLoseStreak: 0, maxWinStreak: 0 },
+    { ...DEFAULT_BOT_CONFIG.trading, initialEquityUsdt: 0 },
+    1_763_280_000_000
+  );
+  const blockedZeroEq = rmZeroEq.authorizeEntry('BTCUSDT', 100, 98, 0, 1_763_280_001_000);
+  assert.equal(blockedZeroEq.ok, false);
+
+  const rmNoStreak = new RiskManager(
+    { ...DEFAULT_BOT_CONFIG.risk, maxLoseStreak: 0, maxWinStreak: 0 },
+    { ...DEFAULT_BOT_CONFIG.trading, initialEquityUsdt: 10000 },
+    1_763_280_000_000
+  );
+  rmNoStreak.recordRealizedPnl('BTCUSDT', -10, 1_763_280_001_000);
+  rmNoStreak.recordRealizedPnl('BTCUSDT', 10, 1_763_280_002_000);
+  assert.equal(rmNoStreak.status().state, 'Active');
+
+  // 2. evaluateSignalDiagnostics respects enforceVenueLongOnly on Spot and short_only on Futures
+  const bearCandle: Candle = {
+    openTimeMs: 1_763_280_000_000,
+    open: 98,
+    high: 98.4,
+    low: 96.5,
+    close: 96.8,
+    volume: 5000,
+    isClosed: true,
+  };
+  const bearInd: IndicatorSnapshot = {
+    emaFast: 97.2,
+    emaMid: 98.0,
+    emaSlow: 99.5,
+    emaMacro: 102.0,
+    rsi: 46,
+    prevRsi: 49,
+    adx: 30,
+    plusDi: 14,
+    minusDi: 28,
+    atr: 1.5,
+    vwap: 97.9,
+  };
+  const spotDiag = evaluateSignalDiagnostics(
+    'BTCUSDT',
+    [bearCandle],
+    bearInd,
+    { ...DEFAULT_BOT_CONFIG.trading, venue: 'Spot' },
+    DEFAULT_BOT_CONFIG.indicators,
+    bearCandle.openTimeMs,
+    { directionPolicy: 'both', enforceVenueLongOnly: true }
+  );
+  assert.equal(spotDiag.preferredSide, 'Long');
+  assert.match(spotDiag.bias, /Spot Long-Only Filtered/);
+
+  const shortOnlyDiag = evaluateSignalDiagnostics(
+    'BTCUSDT',
+    [{ ...bearCandle, open: 101, high: 103, low: 100.5, close: 102.8 }],
+    {
+      ...bearInd,
+      emaFast: 102.5,
+      emaMid: 101.8,
+      emaSlow: 100.5,
+      emaMacro: 98.0,
+      plusDi: 28,
+      minusDi: 14,
+    },
+    { ...DEFAULT_BOT_CONFIG.trading, venue: 'Futures' },
+    DEFAULT_BOT_CONFIG.indicators,
+    bearCandle.openTimeMs,
+    { directionPolicy: 'short_only', enforceVenueLongOnly: true }
+  );
+  assert.equal(shortOnlyDiag.preferredSide, 'Short');
+  assert.match(shortOnlyDiag.bias, /Short-Only Filtered/);
+
+  // 3. computePortfolioCorrelationMatrix aligns array tails when candle histories have unequal lengths
+  const baseRt = new SimulationRuntime(DEFAULT_BOT_CONFIG, 1_763_280_000_000, { seedDemoData: false });
+  const tailCloses = [100, 102, 101, 105, 104, 108, 107, 111, 110, 115];
+  const makeCandles = (closes: number[]): Candle[] =>
+    closes.map((c, idx) => ({
+      openTimeMs: 1_763_280_000_000 + idx * 300_000,
+      open: c,
+      high: c + 0.5,
+      low: c - 0.5,
+      close: c,
+      volume: 1000,
+      isClosed: true,
+    }));
+  // Prepend negatively-correlated prefix to pair A, identical recent tail to pair B
+  const pairA = { ...baseRt.snapshot.pairs[0], symbol: 'AAAUSDT', candles: makeCandles([200, 180, 195, 170, 185, ...tailCloses]) };
+  const pairB = { ...baseRt.snapshot.pairs[1], symbol: 'BBBUSDT', candles: makeCandles(tailCloses) };
+  const cov = computePortfolioCorrelationMatrix([pairA, pairB], 2.0);
+  assert.equal(cov.matrix[0][1], 1);
+
+  // 4. flattenAllPositions cancels pending orders & maxConcurrentPositions applies even when circuitBreaker=false
+  const rtNoCb = new SimulationRuntime(
+    {
+      ...DEFAULT_BOT_CONFIG,
+      trading: { ...DEFAULT_BOT_CONFIG.trading, maxConcurrentPositions: 1 },
+      features: { ...DEFAULT_BOT_CONFIG.features, circuitBreaker: false },
+    },
+    1_763_280_000_000,
+    { seedDemoData: false }
+  );
+  const btcPrice = rtNoCb.snapshot.pairs[0].lastPrice;
+  const limRes = rtNoCb.submitManualOrder(
+    {
+      symbol: 'BTCUSDT',
+      orderType: 'LIMIT',
+      side: 'Long',
+      usdtAmount: 200,
+      limitPrice: Number((btcPrice * 0.95).toFixed(2)),
+      timeInForce: 'GTC',
+      stopLossMode: 'ATR',
+      stopLossPct: 1.5,
+      useBreakEven: true,
+      useTrailingStop: true,
+      targets: [{ pctOffset: 2, allocationPct: 100 }],
+    },
+    1_763_280_001_000
+  );
+  assert.equal(limRes.ok, true);
+  assert.equal(rtNoCb.snapshot.pendingOrders.length, 1);
+
+  const secondBlocked = rtNoCb.submitManualOrder(
+    {
+      symbol: 'ETHUSDT',
+      orderType: 'MARKET',
+      side: 'Long',
+      usdtAmount: 200,
+      timeInForce: 'GTC',
+      stopLossMode: 'ATR',
+      stopLossPct: 1.5,
+      useBreakEven: true,
+      useTrailingStop: true,
+      targets: [{ pctOffset: 2, allocationPct: 100 }],
+    },
+    1_763_280_002_000
+  );
+  assert.equal(secondBlocked.ok, false);
+  if (!secondBlocked.ok) {
+    assert.match(secondBlocked.reason, /Max concurrent positions/);
+  }
+
+  rtNoCb.flattenAllPositions(1_763_280_003_000);
+  assert.equal(rtNoCb.snapshot.pendingOrders.length, 0);
+
+  // 5. recordExternalLiveOrder converts Spot base-asset commission into USDT for feePaidUsdt
+  const spotRt = new SimulationRuntime(
+    { ...DEFAULT_BOT_CONFIG, trading: { ...DEFAULT_BOT_CONFIG.trading, venue: 'Spot' } },
+    1_763_280_000_000,
+    { accountMode: 'Live', seedDemoData: false }
+  );
+  spotRt.recordExternalLiveOrder(
+    {
+      symbol: 'BTCUSDT',
+      orderType: 'MARKET',
+      side: 'Long',
+      usdtAmount: 1000,
+      timeInForce: 'GTC',
+      stopLossMode: 'ATR',
+      stopLossPct: 1.5,
+      useBreakEven: true,
+      useTrailingStop: true,
+      targets: [{ pctOffset: 2, allocationPct: 100 }],
+    },
+    'Live Spot BUY with base commission',
+    1_763_280_004_000,
+    {
+      orderId: '9001',
+      avgPrice: 50000,
+      executedQty: 0.02,
+      commission: 0.00002,
+      commissionAsset: 'BTC',
+    }
+  );
+  const spotPos = spotRt.snapshot.pairs.find((p) => p.symbol === 'BTCUSDT')?.openPosition;
+  assert.ok(spotPos);
+  assert.ok(Math.abs(spotPos.remainingQuantity - 0.01998) < 1e-9);
+  assert.ok(Math.abs((spotPos.feePaidUsdt ?? 0) - 1.0) < 1e-6);
 });
 
 

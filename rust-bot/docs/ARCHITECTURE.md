@@ -79,7 +79,7 @@ Official reference: [Binance Connectors — Rust](https://developers.binance.com
 - **POST-ONLY MAKER**: `LIMIT_MAKER` on Spot; `LIMIT` + `timeInForce = GTX` on USD-M Futures.
 - **OCO / Bracket**:
   - **Spot**: `/api/v3/orderList/oco` (`aboveType = LIMIT_MAKER`, `belowType = STOP_LOSS_LIMIT`).
-  - **Futures**: Margin & leverage alignment (`/fapi/v1/marginType`, `/fapi/v1/leverage`) followed by `TAKE_PROFIT_MARKET` and `STOP_MARKET` protective triggers (`workingType = MARK_PRICE`, `priceProtect = TRUE`).
+  - **Futures**: Margin & leverage alignment (`/fapi/v1/marginType`, `/fapi/v1/leverage`, skipped on `reduceOnly` closes) followed by conditional `/fapi/v1/algoOrder` `TAKE_PROFIT_MARKET` and `STOP_MARKET` protective triggers (`algoType = CONDITIONAL`, `workingType = MARK_PRICE`, `priceProtect = "true"`, `closePosition = "true"`).
 - **Preflight**: Optional signed `/api/v3/order/test` or `/fapi/v1/order/test` validation before live order dispatch.
 
 ---

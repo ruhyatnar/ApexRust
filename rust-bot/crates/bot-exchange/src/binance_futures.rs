@@ -1,26 +1,30 @@
 use crate::{
-    build_sdk_rest_config, get_or_fetch_symbol_filters, to_binance_step_decimal,
-    validate_exchange_filters, validate_live_safety, ExchangeOpenPosition, ExchangeOrderStatus,
-    LiveOrderAck, LiveOrderRequest, SymbolFilters,
+    build_sdk_rest_config, get_or_fetch_symbol_filters, parse_ticker_24h_array,
+    parse_tradable_symbols_from_exchange_info, to_binance_step_decimal, validate_exchange_filters,
+    validate_live_safety, CancelOrderOutcome, ExchangeOpenPosition, ExchangeOrderStatus,
+    LiveOrderAck, LiveOrderRequest, RestRateBudget, SymbolFilters,
 };
 use binance_sdk::derivatives_trading_usds_futures::rest_api::{
     CancelAlgoOrderParams, CancelAllAlgoOpenOrdersParams, CancelAllOpenOrdersParams,
-    ChangeInitialLeverageParams, ChangeMarginTypeMarginTypeEnum, ChangeMarginTypeParams,
-    CurrentAllAlgoOpenOrdersParams, GetCurrentPositionModeParams, NewAlgoOrderAlgoTypeEnum,
-    NewAlgoOrderClosePositionEnum, NewAlgoOrderParams, NewAlgoOrderPriceProtectEnum,
-    NewAlgoOrderSideEnum, NewAlgoOrderTypeEnum, NewAlgoOrderWorkingTypeEnum,
-    NewOrderNewOrderRespTypeEnum, NewOrderParams, NewOrderReduceOnlyEnum, NewOrderSideEnum,
-    NewOrderTimeInForceEnum, NewOrderTypeEnum, PositionInformationV2Params, QueryAlgoOrderParams,
-    QueryOrderParams, TestOrderNewOrderRespTypeEnum, TestOrderParams, TestOrderPositionSideEnum,
+    CancelOrderParams, ChangeInitialLeverageParams, ChangeMarginTypeMarginTypeEnum,
+    ChangeMarginTypeParams, CurrentAllAlgoOpenOrdersParams, GetCurrentPositionModeParams,
+    NewAlgoOrderAlgoTypeEnum, NewAlgoOrderClosePositionEnum, NewAlgoOrderParams,
+    NewAlgoOrderPriceProtectEnum, NewAlgoOrderSideEnum, NewAlgoOrderTypeEnum,
+    NewAlgoOrderWorkingTypeEnum, NewOrderNewOrderRespTypeEnum, NewOrderParams,
+    NewOrderReduceOnlyEnum, NewOrderSideEnum, NewOrderTimeInForceEnum, NewOrderTypeEnum,
+    PositionInformationV2Params, PositionInformationV3Params, QueryAlgoOrderParams,
+    QueryOrderParams,
+    TestOrderNewOrderRespTypeEnum, TestOrderParams, TestOrderPositionSideEnum,
     TestOrderReduceOnlyEnum, TestOrderSideEnum, TestOrderTimeInForceEnum, TestOrderTypeEnum,
 };
 use binance_sdk::derivatives_trading_usds_futures::DerivativesTradingUsdsFuturesRestApi;
 use bot_core::{
     BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarginType, MarketEvent,
-    OrderExecutionMethod, Result, Side, TransportMode,
+    MarketTicker24h, OrderExecutionMethod, Result, Side, TransportMode,
 };
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -40,6 +44,7 @@ pub struct BinanceFuturesClient {
     sdk_client: Option<binance_sdk::derivatives_trading_usds_futures::rest_api::RestApi>,
     filter_cache: RwLock<HashMap<String, SymbolFilters>>,
     dual_side_mode: RwLock<Option<bool>>,
+    rate_budget: Arc<RestRateBudget>,
 }
 
 impl BinanceFuturesClient {
@@ -73,7 +78,10 @@ impl BinanceFuturesClient {
         }
     }
 
-    pub fn new(cfg: ExchangeConfig) -> Result<Self> {
+    pub fn new_with_budget(
+        cfg: ExchangeConfig,
+        rate_budget: Arc<RestRateBudget>,
+    ) -> Result<Self> {
         let sdk_client = if let Some(mut rest_cfg) = build_sdk_rest_config(&cfg)? {
             rest_cfg.base_path = Some(Self::resolve_rest_base_url(&cfg).to_string());
             Some(DerivativesTradingUsdsFuturesRestApi::from_config(rest_cfg))
@@ -93,6 +101,7 @@ impl BinanceFuturesClient {
             sdk_client,
             filter_cache: RwLock::new(HashMap::new()),
             dual_side_mode: RwLock::new(None),
+            rate_budget,
         })
     }
 
@@ -121,7 +130,9 @@ impl BinanceFuturesClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| BotError::RestApi(format!("Futures REST request failed: {e}")))?
+            .map_err(|e| BotError::RestApi(format!("Futures REST request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
             .error_for_status()
             .map_err(|e| BotError::RestApi(format!("Futures REST HTTP status error: {e}")))?;
 
@@ -162,7 +173,9 @@ impl BinanceFuturesClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| BotError::RestApi(format!("Futures ticker request failed: {e}")))?
+            .map_err(|e| BotError::RestApi(format!("Futures ticker request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
             .error_for_status()
             .map_err(|e| BotError::RestApi(format!("Futures ticker status error: {e}")))?;
         let val: serde_json::Value = resp
@@ -202,6 +215,10 @@ impl BinanceFuturesClient {
             .as_ref()
             .map(|c| c.recv_window_ms as i64)
             .unwrap_or(5000)
+    }
+
+    pub async fn is_hedge_mode(&self) -> bool {
+        self.is_dual_side_position(self.futures_recv_window()).await
     }
 
     async fn is_dual_side_position(&self, recv_window: i64) -> bool {
@@ -263,6 +280,7 @@ impl BinanceFuturesClient {
             ExchangeVenue::Futures,
             &sym,
             ref_px,
+            &self.rate_budget,
         )
         .await;
         let entry_buy = match req.side {
@@ -442,12 +460,7 @@ impl BinanceFuturesClient {
             .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
-        let filled = status == "FILLED"
-            || (exec_qty > 0.0
-                && !matches!(
-                    status.as_str(),
-                    "NEW" | "CANCELED" | "REJECTED" | "EXPIRED" | "EXPIRED_IN_MATCH"
-                ));
+        let filled = status == "FILLED" || exec_qty > 0.0;
         let mut avg_price: f64 = 0.0;
 
         if exec_qty > 0.0 {
@@ -764,11 +777,23 @@ impl BinanceFuturesClient {
             .data()
             .await
             .map_err(|e| BotError::RestApi(format!("Futures query_algo_order decode failed: {e}")))?;
+        let status = data
+            .algo_status
+            .unwrap_or_else(|| "UNKNOWN".to_string())
+            .to_uppercase();
+        let is_triggered_or_finished = matches!(status.as_str(), "FILLED" | "FINISHED" | "TRIGGERED");
         let executed_qty = data
             .actual_qty
             .as_deref()
             .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| data.quantity.as_deref()?.parse::<f64>().ok())
+            .filter(|&q| q > 0.0)
+            .or_else(|| {
+                if is_triggered_or_finished {
+                    data.quantity.as_deref()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0.0);
         let avg_price = data
             .actual_price
@@ -779,10 +804,7 @@ impl BinanceFuturesClient {
             .unwrap_or(0.0);
         Ok(ExchangeOrderStatus {
             order_id: data.algo_id.unwrap_or(algo_id).to_string(),
-            status: data
-                .algo_status
-                .unwrap_or_else(|| "UNKNOWN".to_string())
-                .to_uppercase(),
+            status,
             executed_qty,
             avg_price,
         })
@@ -796,6 +818,37 @@ impl BinanceFuturesClient {
             .sdk_client
             .as_ref()
             .ok_or_else(|| BotError::RestApi("Futures SDK credentials not configured".into()))?;
+        let mut b3 = PositionInformationV3Params::builder().recv_window(self.futures_recv_window());
+        if let Some(sym) = symbol {
+            b3 = b3.symbol(sym.to_uppercase());
+        }
+        if let Ok(params3) = b3.build() {
+            if let Ok(resp3) = sdk.position_information_v3(params3).await {
+                if let Ok(rows3) = resp3.data().await {
+                    return Ok(rows3
+                        .into_iter()
+                        .filter_map(|p| {
+                            let sym = p.symbol?;
+                            let amt = p.position_amt.as_deref()?.parse::<f64>().ok()?;
+                            if amt.abs() <= 1e-12 {
+                                return None;
+                            }
+                            let pnl = p
+                                .un_realized_profit
+                                .as_deref()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            Some(ExchangeOpenPosition {
+                                symbol: sym.to_uppercase(),
+                                position_amt: amt,
+                                unrealized_pnl: pnl,
+                            })
+                        })
+                        .collect());
+                }
+            }
+        }
+        // Fallback to legacy v2 if an environment/mock rejects v3
         let mut builder = PositionInformationV2Params::builder().recv_window(self.futures_recv_window());
         if let Some(sym) = symbol {
             builder = builder.symbol(sym.to_uppercase());
@@ -858,5 +911,107 @@ impl BinanceFuturesClient {
             .await
             .map_err(|e| BotError::RestApi(format!("Futures algo open orders decode failed: {e}")))?;
         Ok(rows.into_iter().filter_map(|r| r.algo_id).collect())
+    }
+
+    pub async fn fetch_futures_tradable_symbols(&self) -> Result<HashSet<String>> {
+        let url = format!("{}/fapi/v1/exchangeInfo", self.rest_base_url());
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Futures exchangeInfo request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| BotError::RestApi(format!("Futures exchangeInfo status error: {e}")))?;
+        let val: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Futures exchangeInfo decode failed: {e}")))?;
+        Ok(parse_tradable_symbols_from_exchange_info(ExchangeVenue::Futures, &val))
+    }
+
+    pub async fn fetch_futures_ticker_24h_all(
+        &self,
+        custom_base_url: Option<&str>,
+    ) -> Result<Vec<MarketTicker24h>> {
+        let base = custom_base_url.unwrap_or_else(|| self.rest_base_url());
+        let url = format!("{}/fapi/v1/ticker/24hr", base.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Futures ticker/24hr request failed: {e}")))?;
+        self.rate_budget.report_response(resp.status(), resp.headers());
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| BotError::RestApi(format!("Futures ticker/24hr status error: {e}")))?;
+        let rows: Vec<serde_json::Value> = resp
+            .json()
+            .await
+            .map_err(|e| BotError::RestApi(format!("Futures ticker/24hr decode failed: {e}")))?;
+        Ok(parse_ticker_24h_array(ExchangeVenue::Futures, &rows))
+    }
+
+    pub async fn cancel_futures_order(
+        &self,
+        symbol: &str,
+        order_id: i64,
+    ) -> Result<CancelOrderOutcome> {
+        let Some(sdk) = self.sdk_client.as_ref() else {
+            return Ok(CancelOrderOutcome::Canceled);
+        };
+        let params = CancelOrderParams::builder(symbol.to_uppercase())
+            .order_id(order_id)
+            .recv_window(self.futures_recv_window())
+            .build()
+            .map_err(|e| BotError::RestApi(format!("Futures cancel_order params error: {e}")))?;
+        match sdk.cancel_order(params).await {
+            Ok(resp) => {
+                if let Ok(data) = resp.data().await {
+                    let exec_qty = data
+                        .executed_qty
+                        .as_deref()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    if exec_qty > 0.0 {
+                        if let Ok(st) = self.query_futures_order_status(symbol, order_id).await {
+                            if st.executed_qty > 0.0 {
+                                return Ok(CancelOrderOutcome::AlreadyFilled(st));
+                            }
+                        }
+                        let avg_price = data
+                            .price
+                            .as_deref()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        return Ok(CancelOrderOutcome::AlreadyFilled(ExchangeOrderStatus {
+                            order_id: data.order_id.unwrap_or(order_id).to_string(),
+                            status: "PARTIALLY_FILLED".to_string(),
+                            executed_qty: exec_qty,
+                            avg_price,
+                        }));
+                    }
+                }
+                Ok(CancelOrderOutcome::Canceled)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("-2011") {
+                    if let Ok(st) = self.query_futures_order_status(symbol, order_id).await {
+                        if matches!(st.status.as_str(), "FILLED" | "PARTIALLY_FILLED")
+                            && st.executed_qty > 0.0
+                        {
+                            return Ok(CancelOrderOutcome::AlreadyFilled(st));
+                        }
+                    }
+                    Ok(CancelOrderOutcome::Canceled)
+                } else {
+                    Err(BotError::RestApi(format!("Futures cancel_order failed: {msg}")))
+                }
+            }
+        }
     }
 }

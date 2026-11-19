@@ -46,6 +46,8 @@ test('renderBotToml always keeps paper_trading=true, armed_for_live_orders=false
     botHost: '0.0.0.0',
     botPort: 8090,
     webPort: 3001,
+    pairSelectionMode: 'dynamic',
+    trendingCategory: 'top_gainers',
   });
 
   assert.equal(readTomlValue(futuresProd, 'exchange', 'environment'), 'production');
@@ -58,6 +60,9 @@ test('renderBotToml always keeps paper_trading=true, armed_for_live_orders=false
   assert.equal(readTomlValue(futuresProd, 'exchange.credentials', 'auth_method'), 'ed25519');
   assert.equal(readTomlValue(futuresProd, 'exchange.credentials', 'armed_for_live_orders'), false);
   assert.equal(readTomlValue(futuresProd, 'exchange.credentials', 'ed25519_key_path'), '/home/user/key.pem');
+  assert.equal(readTomlValue(futuresProd, 'trading', 'pair_selection_mode'), 'dynamic');
+  assert.equal(readTomlValue(futuresProd, 'trading', 'trending_category'), 'top_gainers');
+  assert.equal(readTomlValue(futuresProd, 'automation', 'direction_policy'), 'both');
   assert.equal(readTomlValue(futuresProd, 'web', 'bind_addr'), '0.0.0.0:8090');
   assert.equal(readTomlValue(futuresProd, 'web', 'allowed_origin'), 'http://localhost:3001');
   assert.equal(botPortFromToml(futuresProd), 8090);
@@ -72,6 +77,9 @@ test('renderBotToml always keeps paper_trading=true, armed_for_live_orders=false
   assert.equal(readTomlValue(spotTestnet, 'exchange', 'rest_base_url'), 'https://testnet.binance.vision');
   assert.equal(readTomlValue(spotTestnet, 'exchange', 'paper_trading'), true);
   assert.equal(readTomlValue(spotTestnet, 'exchange.credentials', 'armed_for_live_orders'), false);
+  assert.equal(readTomlValue(spotTestnet, 'trading', 'pair_selection_mode'), 'hybrid');
+  assert.equal(readTomlValue(spotTestnet, 'trading', 'trending_category'), 'hot_volume');
+  assert.equal(readTomlValue(spotTestnet, 'automation', 'direction_policy'), 'long_only');
   assert.equal(readTomlValue(spotTestnet, 'web', 'auth_token'), '');
   assert.equal(readTomlValue("[web]\nbind_addr = '127.0.0.1:99999'\n", 'web', 'bind_addr'), '127.0.0.1:99999');
   assert.equal(botPortFromToml("[web]\nbind_addr = '127.0.0.1:99999'\n", 8080), 8080);
@@ -85,4 +93,13 @@ test('renderBotToml always keeps paper_trading=true, armed_for_live_orders=false
   });
   assert.equal(readTomlValue(vpsLoopback, 'web', 'bind_addr'), '100.96.1.10:8080');
   assert.equal(readTomlValue(vpsLoopback, 'web', 'auth_token'), '');
+
+  const ipv6Loopback = renderBotToml(example, {
+    environment: 'testnet',
+    venue: 'spot',
+    botHost: '::1',
+    botPort: 8080,
+    webPort: 3000,
+  });
+  assert.equal(readTomlValue(ipv6Loopback, 'web', 'bind_addr'), '[::1]:8080');
 });

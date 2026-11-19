@@ -11,17 +11,20 @@ pub mod failover;
 
 pub use binance_futures::BinanceFuturesClient;
 pub use binance_rest::BinanceRestClient;
-pub use binance_ws::BinanceWsDriver;
+pub use binance_ws::{BinanceWsDriver, WsStreamEvent};
 pub use failover::{FailoverGateway, FailoverHealth};
 
 use binance_sdk::config::{ConfigurationRestApi, PrivateKey};
 use bot_core::{
-    AuthMethod, BotError, ExchangeConfig, ExchangeVenue, OrderExecutionMethod, Result, Side,
+    AuthMethod, BotError, ExchangeConfig, ExchangeVenue, MarketTicker24h, OrderExecutionMethod,
+    Result, Side,
 };
+use chrono::Utc;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
@@ -47,7 +50,15 @@ pub(crate) struct SymbolFilters {
 
 impl SymbolFilters {
     pub(crate) fn fallback(venue: ExchangeVenue, ref_price: f64) -> Self {
-        let tick_decimals = if ref_price >= 100.0 { 2 } else { 4 };
+        let tick_decimals = if ref_price >= 100.0 {
+            2
+        } else if ref_price >= 1.0 {
+            4
+        } else if ref_price >= 0.01 {
+            6
+        } else {
+            8
+        };
         let tick_size = 10f64.powi(-(tick_decimals as i32));
         let (step_size, step_decimals) = match venue {
             ExchangeVenue::Futures => (0.001, 3),
@@ -121,6 +132,7 @@ pub(crate) async fn get_or_fetch_symbol_filters(
     venue: ExchangeVenue,
     symbol: &str,
     ref_price: f64,
+    rate_budget: &RestRateBudget,
 ) -> SymbolFilters {
     let key = format!("{:?}:{}", venue, symbol.to_uppercase());
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -139,6 +151,7 @@ pub(crate) async fn get_or_fetch_symbol_filters(
         ExchangeVenue::Spot => format!("{base_url}/api/v3/exchangeInfo?symbol={sym}"),
     };
     if let Ok(resp) = http.get(&info_url).send().await {
+        rate_budget.report_response(resp.status(), resp.headers());
         if let Ok(ok_resp) = resp.error_for_status() {
             if let Ok(json) = ok_resp.json::<serde_json::Value>().await {
                 if let Some(arr) = json.get("symbols").and_then(|s| s.as_array()) {
@@ -264,6 +277,163 @@ pub struct ExchangeOrderStatus {
     pub status: String,
     pub executed_qty: f64,
     pub avg_price: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum CancelOrderOutcome {
+    Canceled,
+    AlreadyFilled(ExchangeOrderStatus),
+}
+
+#[derive(Debug, Default)]
+pub struct RestRateBudget {
+    used_weight_1m: AtomicU64,
+    updated_at_ms: AtomicI64,
+    blocked_until_ms: AtomicI64,
+}
+
+impl RestRateBudget {
+    pub fn report_response(
+        &self,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
+        if let Some(w) = headers
+            .get("x-mbx-used-weight-1m")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            self.used_weight_1m.store(w, Ordering::Relaxed);
+            self.updated_at_ms.store(now_ms, Ordering::Relaxed);
+        }
+        let code = status.as_u16();
+        if code == 429 || code == 418 {
+            let retry_sec = headers
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&s| s > 0)
+                .unwrap_or(if code == 418 { 120 } else { 15 });
+            let until = now_ms + retry_sec * 1000;
+            let _ = self.blocked_until_ms.fetch_max(until, Ordering::Relaxed);
+        }
+    }
+
+    pub fn used_weight(&self) -> u64 {
+        let now_ms = Utc::now().timestamp_millis();
+        let last = self.updated_at_ms.load(Ordering::Relaxed);
+        if last == 0 || now_ms.saturating_sub(last) > 65_000 {
+            0
+        } else {
+            self.used_weight_1m.load(Ordering::Relaxed)
+        }
+    }
+
+    pub fn is_constrained(&self, venue: ExchangeVenue) -> bool {
+        let now_ms = Utc::now().timestamp_millis();
+        if self.blocked_until_ms.load(Ordering::Relaxed) > now_ms {
+            return true;
+        }
+        let limit = match venue {
+            ExchangeVenue::Futures => 2400,
+            ExchangeVenue::Spot => 6000,
+        };
+        self.used_weight() >= (limit * 7) / 10
+    }
+}
+
+pub(crate) fn parse_tradable_symbols_from_exchange_info(
+    venue: ExchangeVenue,
+    val: &serde_json::Value,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(list) = val.get("symbols").and_then(|s| s.as_array()) else {
+        return out;
+    };
+    for s in list {
+        let Some(sym) = s.get("symbol").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let status = s
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_uppercase();
+        if status != "TRADING" {
+            continue;
+        }
+        match venue {
+            ExchangeVenue::Futures => {
+                if s.get("contractType")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|ct| !ct.eq_ignore_ascii_case("PERPETUAL"))
+                {
+                    continue;
+                }
+            }
+            ExchangeVenue::Spot => {
+                if s.get("isSpotTradingAllowed")
+                    .and_then(|v| v.as_bool())
+                    == Some(false)
+                {
+                    continue;
+                }
+            }
+        }
+        out.insert(sym.trim().to_uppercase());
+    }
+    out
+}
+
+pub(crate) fn parse_ticker_24h_array(
+    venue: ExchangeVenue,
+    rows: &[serde_json::Value],
+) -> Vec<MarketTicker24h> {
+    let now_ms = Utc::now().timestamp_millis();
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let Some(sym) = r.get("symbol").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let parse_f = |k: &str| -> f64 {
+            r.get(k)
+                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                .unwrap_or(0.0)
+        };
+        let last_price = parse_f("lastPrice");
+        if !last_price.is_finite() || last_price <= 0.0 {
+            continue;
+        }
+        let open_price = parse_f("openPrice");
+        let high_price = parse_f("highPrice");
+        let low_price = parse_f("lowPrice");
+        let base_volume = parse_f("volume");
+        let quote_volume = parse_f("quoteVolume");
+        let price_change_percent = parse_f("priceChangePercent");
+        let range_pct_24h = if low_price > 0.0 && high_price >= low_price {
+            ((high_price - low_price) / low_price.max(1e-12)) * 100.0
+        } else {
+            0.0
+        };
+        out.push(MarketTicker24h {
+            symbol: sym.trim().to_uppercase(),
+            venue,
+            last_price,
+            open_price_24h: if open_price > 0.0 { open_price } else { last_price },
+            high_price_24h: if high_price > 0.0 { high_price } else { last_price },
+            low_price_24h: if low_price > 0.0 { low_price } else { last_price },
+            price_change_percent,
+            base_volume,
+            quote_volume,
+            range_pct_24h,
+            tradable_on_active_env: true,
+            in_watchlist: false,
+            source_tag: None,
+            updated_at_ms: r.get("closeTime").and_then(|v| v.as_i64()).unwrap_or(now_ms),
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -478,5 +648,18 @@ mod tests {
         assert_eq!(count_step_decimals("1e-8"), 8);
         assert_eq!(count_step_decimals("2.5e-4"), 5);
         assert_eq!(count_step_decimals("0.010"), 2);
+    }
+
+    #[test]
+    fn fallback_filters_preserve_sub_cent_precision() {
+        let btc = SymbolFilters::fallback(ExchangeVenue::Spot, 65_000.0);
+        assert_eq!(btc.tick_decimals, 2);
+        let sol = SymbolFilters::fallback(ExchangeVenue::Spot, 12.5);
+        assert_eq!(sol.tick_decimals, 4);
+        let doge = SymbolFilters::fallback(ExchangeVenue::Futures, 0.085);
+        assert_eq!(doge.tick_decimals, 6);
+        let pepe = SymbolFilters::fallback(ExchangeVenue::Spot, 0.00001234);
+        assert_eq!(pepe.tick_decimals, 8);
+        assert!((pepe.tick_size - 1e-8).abs() < 1e-12);
     }
 }

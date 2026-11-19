@@ -72,7 +72,9 @@ export class WilderRsi {
   }
 
   private static computeRsi(avgGain: number, avgLoss: number): number {
-    if (avgLoss <= 1e-12) return 100;
+    if (avgLoss <= 1e-12) {
+      return avgGain <= 1e-12 ? 50 : 100;
+    }
     const rs = avgGain / avgLoss;
     return 100 - 100 / (1 + rs);
   }
@@ -127,6 +129,7 @@ export class Adx {
   private dxCount = 0;
   private dxAcc = 0;
   private adx: number | null = null;
+  private prevAdx: number | null = null;
   private plusDi: number | null = null;
   private minusDi: number | null = null;
 
@@ -134,10 +137,15 @@ export class Adx {
     this.period = Math.max(2, Math.floor(period));
   }
 
-  next(candle: Candle): { adx: number | null; plusDi: number | null; minusDi: number | null } {
+  next(candle: Candle): {
+    adx: number | null;
+    prevAdx: number | null;
+    plusDi: number | null;
+    minusDi: number | null;
+  } {
     if (!this.prevCandle) {
       this.prevCandle = candle;
-      return { adx: null, plusDi: null, minusDi: null };
+      return { adx: null, prevAdx: null, plusDi: null, minusDi: null };
     }
     const prev = this.prevCandle;
     this.prevCandle = candle;
@@ -163,7 +171,7 @@ export class Adx {
       this.plusDmAcc += plusDm;
       this.minusDmAcc += minusDm;
       if (this.dmCount < p) {
-        return { adx: null, plusDi: null, minusDi: null };
+        return { adx: null, prevAdx: null, plusDi: null, minusDi: null };
       }
       this.smoothedTr = this.trAcc;
       this.smoothedPlusDm = this.plusDmAcc;
@@ -171,7 +179,7 @@ export class Adx {
     }
 
     if (this.smoothedTr <= 1e-12) {
-      return { adx: this.adx, plusDi: this.plusDi, minusDi: this.minusDi };
+      return { adx: this.adx, prevAdx: this.prevAdx, plusDi: this.plusDi, minusDi: this.minusDi };
     }
 
     const pdi = 100 * (this.smoothedPlusDm / this.smoothedTr);
@@ -182,6 +190,7 @@ export class Adx {
     const diSum = pdi + mdi;
     const dx = diSum > 1e-12 ? 100 * (Math.abs(pdi - mdi) / diSum) : 0;
 
+    this.prevAdx = this.adx;
     if (this.adx !== null) {
       this.adx = (this.adx * (p - 1) + dx) / p;
     } else {
@@ -192,7 +201,7 @@ export class Adx {
       }
     }
 
-    return { adx: this.adx, plusDi: this.plusDi, minusDi: this.minusDi };
+    return { adx: this.adx, prevAdx: this.prevAdx, plusDi: this.plusDi, minusDi: this.minusDi };
   }
 }
 
@@ -254,20 +263,25 @@ export class IndicatorPipeline {
   private readonly adx: Adx;
   private readonly vwap: SessionVwap;
   private readonly volSma: VolumeSma;
+  private warmupBarsCount = 0;
   private latest: IndicatorSnapshot = {
     emaFast: null,
     emaMid: null,
     emaSlow: null,
     emaMacro: null,
+    prevEmaMid: null,
     rsi: null,
     prevRsi: null,
     adx: null,
+    prevAdx: null,
     plusDi: null,
     minusDi: null,
     atr: null,
     vwap: null,
     volumeSma20: null,
     volumeRatio: null,
+    warmupBarsCount: 0,
+    hasBarGap: false,
   };
 
   constructor(cfg: IndicatorConfig) {
@@ -282,31 +296,37 @@ export class IndicatorPipeline {
     this.volSma = new VolumeSma(20);
   }
 
-  update(candle: Candle): IndicatorSnapshot {
+  update(candle: Candle, hasBarGap = false): IndicatorSnapshot {
+    const prevEmaMid = this.latest.emaMid;
     const emaFast = this.emaFast.next(candle.close);
     const emaMid = this.emaMid.next(candle.close);
     const emaSlow = this.emaSlow.next(candle.close);
     const emaMacro = this.emaMacro.next(candle.close);
     const rsi = this.rsi.next(candle.close);
     const atr = this.atr.next(candle);
-    const { adx, plusDi, minusDi } = this.adx.next(candle);
+    const { adx, prevAdx, plusDi, minusDi } = this.adx.next(candle);
     const vwap = this.vwap.next(candle);
     const { sma: volumeSma20, ratio: volumeRatio } = this.volSma.next(candle.volume);
+    this.warmupBarsCount += 1;
 
     this.latest = {
       emaFast,
       emaMid,
       emaSlow,
       emaMacro,
+      prevEmaMid,
       rsi,
       prevRsi: this.rsi.previous,
       adx,
+      prevAdx,
       plusDi,
       minusDi,
       atr,
       vwap,
       volumeSma20,
       volumeRatio,
+      warmupBarsCount: this.warmupBarsCount,
+      hasBarGap,
     };
     return this.latest;
   }

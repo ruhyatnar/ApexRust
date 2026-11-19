@@ -147,8 +147,24 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
   const last = hasLiveBook ? liveTicker!.last : activePair.lastPrice;
   const priceDecimals = last >= 100 ? 2 : last >= 1 ? 4 : 6;
   const spread = last * 0.0002;
-  const bid = hasLiveBook && liveTicker!.bid > 0 ? liveTicker!.bid : last - spread;
-  const ask = hasLiveBook && liveTicker!.ask > 0 ? liveTicker!.ask : last + spread;
+  const bid =
+    hasLiveBook && liveTicker!.bid > 0
+      ? liveTicker!.bid
+      : (activePair.bestBid ?? 0) > 0
+        ? activePair.bestBid!
+        : last - spread;
+  const ask =
+    hasLiveBook && liveTicker!.ask > 0
+      ? liveTicker!.ask
+      : (activePair.bestAsk ?? 0) > 0
+        ? activePair.bestAsk!
+        : last + spread;
+  const computedSpreadBps =
+    (activePair.spreadBps ?? 0) > 0
+      ? activePair.spreadBps!
+      : bid > 0 && ask >= bid
+        ? ((ask - bid) / bid) * 10000
+        : 0;
 
   const atrExitsEnabled = config.features.atrDynamicExits;
   const tpLadderEnabled = config.features.takeProfitLadder;
@@ -723,27 +739,71 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
         )}
 
         {/* Market / Coin Selector */}
-        <div className="grid grid-cols-2 gap-2.5">
-          <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-3 py-2">
-            <span className="text-xs text-slate-400">Market</span>
-            <span className="font-mono text-xs font-semibold text-slate-100">USDT</span>
+        <div className="space-y-1.5">
+          <div className="grid grid-cols-2 gap-2.5">
+            <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-3 py-2">
+              <span className="text-xs text-slate-400">Market</span>
+              <span className="font-mono text-xs font-semibold text-slate-100">
+                {config.trading.quoteAsset || 'USDT'} ·{' '}
+                <span className={activeVenue === 'Spot' ? 'text-[#7DF2AD]' : 'text-amber-300'}>
+                  {activeVenue === 'Spot' ? 'LONG' : 'L/S'}
+                </span>
+              </span>
+            </div>
+            <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-3 py-2">
+              <label htmlFor="ticket-coin" className="text-xs text-slate-400">
+                Coin
+              </label>
+              <select
+                id="ticket-coin"
+                value={activePair.symbol}
+                onChange={(e) => onSelectSymbol(e.target.value)}
+                className="bg-transparent font-mono text-xs font-semibold text-slate-100 focus:outline-none"
+              >
+                {snapshot.pairs.map((p) => (
+                  <option key={p.symbol} value={p.symbol} className="bg-[#141820]">
+                    {p.symbol.replace(/(USDT|USDC|FDUSD)$/, '')}
+                    {p.sourceTag === 'trending'
+                      ? ' ★'
+                      : p.sourceTag === 'protected_position'
+                        ? ' •'
+                        : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
-          <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-3 py-2">
-            <label htmlFor="ticket-coin" className="text-xs text-slate-400">
-              Coin
-            </label>
-            <select
-              id="ticket-coin"
-              value={activePair.symbol}
-              onChange={(e) => onSelectSymbol(e.target.value)}
-              className="bg-transparent font-mono text-xs font-semibold text-slate-100 focus:outline-none"
-            >
-              {snapshot.pairs.map((p) => (
-                <option key={p.symbol} value={p.symbol} className="bg-[#141820]">
-                  {p.symbol.replace('USDT', '')}
-                </option>
-              ))}
-            </select>
+          <div className="flex items-center justify-between px-1 font-mono text-[10px] text-slate-400">
+            <span>
+              Source:{' '}
+              <strong
+                className={
+                  activePair.sourceTag === 'trending'
+                    ? 'text-amber-300'
+                    : activePair.sourceTag === 'protected_position'
+                      ? 'text-cyan-300'
+                      : 'text-[#7DF2AD]'
+                }
+              >
+                {activePair.sourceTag === 'trending'
+                  ? 'Auto-Trending'
+                  : activePair.sourceTag === 'protected_position'
+                    ? 'Protected Position'
+                    : 'Pinned Watchlist'}
+              </strong>
+            </span>
+            <span>
+              Spread:{' '}
+              <strong
+                className={
+                  computedSpreadBps > (config.indicators.maxSpreadBps ?? 25)
+                    ? 'text-amber-300'
+                    : 'text-slate-300'
+                }
+              >
+                {computedSpreadBps.toFixed(1)} bps
+              </strong>
+            </span>
           </div>
         </div>
 

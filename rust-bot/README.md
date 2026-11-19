@@ -31,7 +31,7 @@ rust-bot/
 ## Key Capabilities
 
 1. **Official Binance Rust SDK (`binance-sdk`) — Spot & USD-M Futures**
-   - Supports **Binance Spot** (`/api/v3/*`) and **Binance USD-M Futures** (`/fapi/v1/*`, `/fapi/v2/*`) with configurable leverage (`1x–20x`) and `ISOLATED` / `CROSSED` margin modes.
+   - Supports **Binance Spot** (`/api/v3/*`) and **Binance USD-M Futures** (`/fapi/v1/*`, `/fapi/v3/*` with `/fapi/v2/*` fallback) with configurable leverage (`1x–20x`) and `ISOLATED` / `CROSSED` margin modes.
    - Supported order methods: **Market**, **Limit** (`GTC` / `IOC` / `FOK`), **Post-Only Maker** (Spot `LIMIT_MAKER` / Futures `GTX`), and **OCO** (Spot `/api/v3/orderList/oco` + Futures `TAKE_PROFIT_MARKET` & `STOP_MARKET` bracket).
 
 2. **WebSocket-First Architecture with Automatic REST Fallback**
@@ -77,7 +77,7 @@ rust-bot/
 ## Quick Start on Linux Desktop
 
 ### 1. Prerequisites
-- Rust `1.86+` (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- Rust `1.85+` (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - Binance Spot or USD-M Futures API Key & HMAC/Ed25519 Secret (Testnet recommended first)
 
 ### 2. Configure Environment & Strategy

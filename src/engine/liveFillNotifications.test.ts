@@ -85,6 +85,7 @@ test('collectNewLiveFillNotifications ignores Paper records, historical syncs, a
     makeExecRecord({ id: 'already-seen', orderId: 200 }),
     makeExecRecord({ id: 'paper-ignored', accountMode: 'Paper', orderId: 199 }),
     makeExecRecord({ id: 'binance-trade-BTCUSDT-55', orderId: 198 }),
+    makeExecRecord({ id: 'live-sync-Spot-Testnet-BTCUSDT-77', orderId: 197 }),
   ];
 
   const firstPass = collectNewLiveFillNotifications(records, notified);

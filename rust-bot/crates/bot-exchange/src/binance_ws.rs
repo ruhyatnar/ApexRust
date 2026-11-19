@@ -1,19 +1,35 @@
 use bot_core::{
-    BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent, Result,
-    TransportMode,
+    BotError, Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent,
+    MarketTicker24h, Result, TransportMode,
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use std::collections::HashSet;
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
-/// Binance combined WebSocket stream wrapper (`<symbol>@kline_<tf>`) for Spot and USD-M Futures.
-/// Designed to interoperate with `binance-sdk` SpotWsStreams & DerivativesTradingUsdsFuturesWsStreams.
+const MAX_COMBINED_STREAMS_PER_CONN: usize = 1024;
+const WS_PROACTIVE_ROTATE_SECS: u64 = 23 * 3600;
+
+#[derive(Debug, Clone)]
+pub enum WsStreamEvent {
+    Candle(MarketEvent),
+    BookTicker {
+        symbol: String,
+        best_bid: f64,
+        best_ask: f64,
+    },
+    MiniTickerAll(Vec<MarketTicker24h>),
+}
+
+/// Binance combined WebSocket stream wrapper (`<symbol>@kline_<tf>`, `<symbol>@bookTicker`,
+/// `!miniTicker@arr`) for Spot and USD-M Futures with live `SUBSCRIBE`/`UNSUBSCRIBE` diffs
+/// and proactive `< 23h` connection rotation.
 pub struct BinanceWsDriver {
     cfg: ExchangeConfig,
-    pairs: Vec<String>,
     timeframe: String,
 }
 
@@ -49,18 +65,44 @@ struct KlineBarPayload {
     is_closed: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct BookTickerPayload {
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "b")]
+    best_bid: String,
+    #[serde(rename = "a")]
+    best_ask: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MiniTickerRaw {
+    #[serde(rename = "s")]
+    symbol: String,
+    #[serde(rename = "c")]
+    close: String,
+    #[serde(rename = "o")]
+    open: String,
+    #[serde(rename = "h")]
+    high: String,
+    #[serde(rename = "l")]
+    low: String,
+    #[serde(rename = "v")]
+    base_volume: String,
+    #[serde(rename = "q")]
+    quote_volume: String,
+    #[serde(rename = "E", default)]
+    event_time_ms: i64,
+}
+
 impl BinanceWsDriver {
-    pub fn new(cfg: ExchangeConfig, pairs: Vec<String>, timeframe: String) -> Self {
-        Self {
-            cfg,
-            pairs,
-            timeframe,
-        }
+    pub fn new(cfg: ExchangeConfig, timeframe: String) -> Self {
+        Self { cfg, timeframe }
     }
 
-    pub fn build_combined_stream_url(&self) -> String {
-        let trimmed = self.cfg.ws_stream_url.trim().trim_end_matches('/');
-        let base = match (self.cfg.venue, self.cfg.environment) {
+    pub fn resolve_stream_base(cfg: &ExchangeConfig) -> String {
+        let trimmed = cfg.ws_stream_url.trim().trim_end_matches('/');
+        let raw = match (cfg.venue, cfg.environment) {
             (ExchangeVenue::Futures, ExchangeEnvironment::Production) => {
                 if !trimmed.is_empty()
                     && (trimmed.contains("fstream.binance.com")
@@ -106,66 +148,276 @@ impl BinanceWsDriver {
                 }
             }
         };
-        let streams = self
-            .pairs
-            .iter()
-            .map(|p| format!("{}@kline_{}", p.to_lowercase(), self.timeframe))
-            .collect::<Vec<_>>()
-            .join("/");
-        format!("{}?streams={}", base.trim_end_matches('/'), streams)
+        if let Some(prefix) = raw.strip_suffix("/ws") {
+            format!("{prefix}/stream")
+        } else if raw.ends_with("/stream") {
+            raw.to_string()
+        } else {
+            format!("{raw}/stream")
+        }
     }
 
-    /// Connect to Binance WebSocket Streams and forward parsed `MarketEvent`s
-    /// until the socket terminates or a heartbeat error occurs.
-    pub async fn run_once(&self, tx: &mpsc::Sender<MarketEvent>) -> Result<()> {
-        let url = self.build_combined_stream_url();
-        info!(%url, "Connecting to Binance WebSocket primary stream");
+    pub fn build_mini_ticker_ws_url(
+        venue: ExchangeVenue,
+        environment: ExchangeEnvironment,
+    ) -> &'static str {
+        match (venue, environment) {
+            (ExchangeVenue::Futures, ExchangeEnvironment::Production) => {
+                "wss://fstream.binance.com/ws/!miniTicker@arr"
+            }
+            (ExchangeVenue::Futures, ExchangeEnvironment::Testnet) => {
+                "wss://stream.binancefuture.com/ws/!miniTicker@arr"
+            }
+            (ExchangeVenue::Spot, ExchangeEnvironment::Production) => {
+                "wss://stream.binance.com:9443/ws/!miniTicker@arr"
+            }
+            (ExchangeVenue::Spot, ExchangeEnvironment::Testnet) => {
+                "wss://stream.testnet.binance.vision/ws/!miniTicker@arr"
+            }
+        }
+    }
 
-        let (mut ws, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            connect_async(&url),
-        )
-        .await
-        .map_err(|_| BotError::WebSocket("WebSocket connect timed out (15s)".into()))?
-        .map_err(|e| BotError::WebSocket(format!("Connect failed: {e}")))?;
-
-        let read_timeout = std::time::Duration::from_millis((self.cfg.ws_heartbeat_timeout_ms * 2).max(5000));
-        loop {
-            let frame_opt = tokio::time::timeout(read_timeout, ws.next())
-                .await
-                .map_err(|_| BotError::WebSocket("WebSocket stream heartbeat timeout".into()))?;
-            let Some(frame) = frame_opt else {
+    fn build_combined_url_for_pairs(
+        base: &str,
+        pairs: &[String],
+        timeframe: &str,
+        include_mini_ticker: bool,
+    ) -> String {
+        let mut streams = Vec::with_capacity(pairs.len() * 2 + 1);
+        if include_mini_ticker {
+            streams.push("!miniTicker@arr".to_string());
+        }
+        for p in pairs {
+            if streams.len() + 2 > MAX_COMBINED_STREAMS_PER_CONN {
                 break;
-            };
-            match frame {
-                Ok(Message::Text(txt)) => {
-                    if let Some(ev) = Self::parse_combined_event(&txt) {
-                        if tx.send(ev).await.is_err() {
-                            return Ok(());
+            }
+            let lower = p.trim().to_lowercase();
+            if lower.is_empty() {
+                continue;
+            }
+            streams.push(format!("{lower}@kline_{timeframe}"));
+            streams.push(format!("{lower}@bookTicker"));
+        }
+        if streams.is_empty() {
+            streams.push("!miniTicker@arr".to_string());
+        }
+        format!("{}?streams={}", base.trim_end_matches('/'), streams.join("/"))
+    }
+
+    /// Connects combined `<sym>@kline_<tf>` + `<sym>@bookTicker` (+ optional `!miniTicker@arr`),
+    /// honors live `watch::Receiver<Vec<String>>` changes via debounced in-place `SUBSCRIBE`/`UNSUBSCRIBE`,
+    /// and rotates cleanly before Binance's 24h connection limit.
+    pub async fn run_reactive_once(
+        &self,
+        pairs_rx: &mut watch::Receiver<Vec<String>>,
+        tx: &mpsc::Sender<WsStreamEvent>,
+        include_mini_ticker: bool,
+    ) -> Result<()> {
+        let max_pairs = (MAX_COMBINED_STREAMS_PER_CONN - usize::from(include_mini_ticker)) / 2;
+        let initial_pairs: Vec<String> = pairs_rx
+            .borrow_and_update()
+            .iter()
+            .map(|p| p.trim().to_uppercase())
+            .filter(|p| !p.is_empty())
+            .take(max_pairs)
+            .collect();
+        let base = Self::resolve_stream_base(&self.cfg);
+        let url = Self::build_combined_url_for_pairs(
+            &base,
+            &initial_pairs,
+            &self.timeframe,
+            include_mini_ticker,
+        );
+        info!(%url, count = initial_pairs.len(), "Connecting to Binance reactive combined WebSocket");
+
+        let (mut ws, _) = tokio::time::timeout(Duration::from_secs(15), connect_async(&url))
+            .await
+            .map_err(|_| BotError::WebSocket("WebSocket connect timed out (15s)".into()))?
+            .map_err(|e| BotError::WebSocket(format!("Connect failed: {e}")))?;
+
+        let mut active_pairs: HashSet<String> = initial_pairs.into_iter().collect();
+        let mut msg_id: u64 = 1;
+        let read_timeout = Duration::from_millis((self.cfg.ws_heartbeat_timeout_ms * 2).max(5000));
+        let rotate_sleep = tokio::time::sleep(Duration::from_secs(WS_PROACTIVE_ROTATE_SECS));
+        tokio::pin!(rotate_sleep);
+
+        loop {
+            let timeout_sleep = tokio::time::sleep(read_timeout);
+            tokio::pin!(timeout_sleep);
+
+            tokio::select! {
+                _ = &mut rotate_sleep => {
+                    info!("Proactively rotating Binance WebSocket stream before 24h limit");
+                    let _ = ws.close(None).await;
+                    return Ok(());
+                }
+                _ = &mut timeout_sleep => {
+                    return Err(BotError::WebSocket("WebSocket stream heartbeat timeout".into()));
+                }
+                Ok(()) = pairs_rx.changed() => {
+                    // Debounce burst watchlist mutations cleanly
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    let target_vec: Vec<String> = pairs_rx
+                        .borrow_and_update()
+                        .iter()
+                        .map(|p| p.trim().to_uppercase())
+                        .filter(|p| !p.is_empty())
+                        .take(max_pairs)
+                        .collect();
+                    let target_set: HashSet<String> = target_vec.into_iter().collect();
+                    let to_add: Vec<String> = target_set.difference(&active_pairs).cloned().collect();
+                    let to_remove: Vec<String> = active_pairs.difference(&target_set).cloned().collect();
+
+                    if !to_remove.is_empty() {
+                        let mut streams = Vec::with_capacity(to_remove.len() * 2);
+                        for sym in &to_remove {
+                            let l = sym.to_lowercase();
+                            streams.push(format!("{l}@kline_{}", self.timeframe));
+                            streams.push(format!("{l}@bookTicker"));
+                        }
+                        for chunk in streams.chunks(50) {
+                            let payload = serde_json::json!({
+                                "method": "UNSUBSCRIBE",
+                                "params": chunk,
+                                "id": msg_id,
+                            });
+                            msg_id += 1;
+                            if ws.send(Message::Text(payload.to_string().into())).await.is_err() {
+                                return Err(BotError::WebSocket("Failed to send UNSUBSCRIBE".into()));
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
                         }
                     }
+
+                    if !to_add.is_empty() {
+                        let mut streams = Vec::with_capacity(to_add.len() * 2);
+                        for sym in &to_add {
+                            let l = sym.to_lowercase();
+                            streams.push(format!("{l}@kline_{}", self.timeframe));
+                            streams.push(format!("{l}@bookTicker"));
+                        }
+                        for chunk in streams.chunks(50) {
+                            let payload = serde_json::json!({
+                                "method": "SUBSCRIBE",
+                                "params": chunk,
+                                "id": msg_id,
+                            });
+                            msg_id += 1;
+                            if ws.send(Message::Text(payload.to_string().into())).await.is_err() {
+                                return Err(BotError::WebSocket("Failed to send SUBSCRIBE".into()));
+                            }
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    }
+                    active_pairs = target_set;
                 }
-                Ok(Message::Ping(payload)) => {
-                    ws.send(Message::Pong(payload))
-                        .await
-                        .map_err(|e| BotError::WebSocket(format!("Pong send failed: {e}")))?;
+                frame_opt = ws.next() => {
+                    let Some(frame) = frame_opt else {
+                        break;
+                    };
+                    match frame {
+                        Ok(Message::Text(txt)) => {
+                            if let Some(ev) = Self::parse_combined_event_ex(self.cfg.venue, &txt) {
+                                if tx.send(ev).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            ws.send(Message::Pong(payload))
+                                .await
+                                .map_err(|e| BotError::WebSocket(format!("Pong send failed: {e}")))?;
+                        }
+                        Ok(Message::Close(frame)) => {
+                            warn!(?frame, "Binance WebSocket closed by remote");
+                            return Err(BotError::WebSocket("Remote closed WebSocket".into()));
+                        }
+                        Err(e) => {
+                            return Err(BotError::WebSocket(format!("Stream read error: {e}")));
+                        }
+                        _ => {}
+                    }
                 }
-                Ok(Message::Close(frame)) => {
-                    warn!(?frame, "Binance WebSocket closed by remote");
-                    return Err(BotError::WebSocket("Remote closed WebSocket".into()));
-                }
-                Err(e) => {
-                    return Err(BotError::WebSocket(format!("Stream read error: {e}")));
-                }
-                _ => {}
             }
         }
 
         Err(BotError::WebSocket("WebSocket stream ended unexpectedly".into()))
     }
 
-    fn parse_combined_event(raw: &str) -> Option<MarketEvent> {
-        let env: CombinedStreamEnvelope = serde_json::from_str(raw).ok()?;
+    pub async fn run_mini_ticker_once(
+        venue: ExchangeVenue,
+        environment: ExchangeEnvironment,
+        tx: &mpsc::Sender<WsStreamEvent>,
+    ) -> Result<()> {
+        let url = Self::build_mini_ticker_ws_url(venue, environment);
+        let (mut ws, _) = tokio::time::timeout(Duration::from_secs(15), connect_async(url))
+            .await
+            .map_err(|_| BotError::WebSocket("MiniTicker WS connect timed out".into()))?
+            .map_err(|e| BotError::WebSocket(format!("MiniTicker WS connect failed: {e}")))?;
+        let rotate_sleep = tokio::time::sleep(Duration::from_secs(WS_PROACTIVE_ROTATE_SECS));
+        tokio::pin!(rotate_sleep);
+
+        loop {
+            let timeout_sleep = tokio::time::sleep(Duration::from_secs(60));
+            tokio::pin!(timeout_sleep);
+            tokio::select! {
+                _ = &mut rotate_sleep => {
+                    let _ = ws.close(None).await;
+                    return Ok(());
+                }
+                _ = &mut timeout_sleep => {
+                    return Err(BotError::WebSocket("MiniTicker WS heartbeat timeout".into()));
+                }
+                frame_opt = ws.next() => {
+                    let Some(frame) = frame_opt else {
+                        break;
+                    };
+                    match frame {
+                        Ok(Message::Text(txt)) => {
+                            if let Some(ev) = Self::parse_combined_event_ex(venue, &txt) {
+                                if tx.send(ev).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(payload)) => {
+                            let _ = ws.send(Message::Pong(payload)).await;
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(e) => return Err(BotError::WebSocket(format!("MiniTicker WS read error: {e}"))),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Err(BotError::WebSocket("MiniTicker WS stream ended".into()))
+    }
+
+    pub fn parse_combined_event_ex(venue: ExchangeVenue, raw: &str) -> Option<WsStreamEvent> {
+        let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+        if val.is_array() {
+            let items: Vec<MiniTickerRaw> = serde_json::from_value(val).ok()?;
+            return Some(WsStreamEvent::MiniTickerAll(Self::convert_mini_tickers(venue, items)));
+        }
+
+        let env: CombinedStreamEnvelope = serde_json::from_value(val).ok()?;
+        if env.stream == "!miniTicker@arr" {
+            let items: Vec<MiniTickerRaw> = serde_json::from_value(env.data).ok()?;
+            return Some(WsStreamEvent::MiniTickerAll(Self::convert_mini_tickers(venue, items)));
+        }
+        if env.stream.ends_with("@bookTicker") {
+            let payload: BookTickerPayload = serde_json::from_value(env.data).ok()?;
+            let best_bid = payload.best_bid.parse::<f64>().ok()?;
+            let best_ask = payload.best_ask.parse::<f64>().ok()?;
+            if best_bid > 0.0 && best_ask > 0.0 {
+                return Some(WsStreamEvent::BookTicker {
+                    symbol: payload.symbol.to_uppercase(),
+                    best_bid,
+                    best_ask,
+                });
+            }
+            return None;
+        }
         if !env.stream.contains("@kline_") {
             return None;
         }
@@ -181,12 +433,113 @@ impl BinanceWsDriver {
             is_closed: payload.kline.is_closed,
         };
 
-        Some(MarketEvent {
-            symbol: payload.symbol,
+        Some(WsStreamEvent::Candle(MarketEvent {
+            symbol: payload.symbol.to_uppercase(),
             price: close,
             candle,
             source: TransportMode::WsPrimary,
             received_at: Utc::now(),
-        })
+        }))
+    }
+
+    fn convert_mini_tickers(venue: ExchangeVenue, items: Vec<MiniTickerRaw>) -> Vec<MarketTicker24h> {
+        let fallback_now = Utc::now().timestamp_millis();
+        items
+            .into_iter()
+            .filter_map(|item| {
+                let last_price = item.close.parse::<f64>().ok()?;
+                if !last_price.is_finite() || last_price <= 0.0 {
+                    return None;
+                }
+                let open_price = item.open.parse::<f64>().ok().filter(|&p| p > 0.0).unwrap_or(last_price);
+                let high_price = item.high.parse::<f64>().ok().filter(|&p| p > 0.0).unwrap_or(last_price);
+                let low_price = item.low.parse::<f64>().ok().filter(|&p| p > 0.0).unwrap_or(last_price);
+                let base_volume = item.base_volume.parse::<f64>().unwrap_or(0.0);
+                let quote_volume = item.quote_volume.parse::<f64>().unwrap_or(0.0);
+                let price_change_percent = ((last_price - open_price) / open_price) * 100.0;
+                let range_pct_24h = if low_price > 0.0 && high_price >= low_price {
+                    ((high_price - low_price) / low_price.max(1e-12)) * 100.0
+                } else {
+                    0.0
+                };
+                Some(MarketTicker24h {
+                    symbol: item.symbol.to_uppercase(),
+                    venue,
+                    last_price,
+                    open_price_24h: open_price,
+                    high_price_24h: high_price,
+                    low_price_24h: low_price,
+                    price_change_percent,
+                    base_volume,
+                    quote_volume,
+                    range_pct_24h,
+                    tradable_on_active_env: true,
+                    in_watchlist: false,
+                    source_tag: None,
+                    updated_at_ms: if item.event_time_ms > 0 { item.event_time_ms } else { fallback_now },
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bot_core::MarginType;
+
+    fn sample_exchange_cfg(
+        venue: ExchangeVenue,
+        environment: ExchangeEnvironment,
+        ws_stream_url: &str,
+    ) -> ExchangeConfig {
+        ExchangeConfig {
+            environment,
+            venue,
+            leverage: 3,
+            margin_type: MarginType::Isolated,
+            paper_trading: true,
+            credentials: None,
+            ws_stream_url: ws_stream_url.into(),
+            rest_base_url: String::new(),
+            ws_heartbeat_timeout_ms: 15_000,
+            rest_poll_interval_ms: 3_000,
+            ws_reconnect_initial_ms: 1_000,
+            ws_reconnect_max_ms: 30_000,
+            max_consecutive_rest_failures: 5,
+        }
+    }
+
+    #[test]
+    fn resolve_stream_base_normalizes_ws_and_bare_host_to_stream() {
+        let spot_ws = sample_exchange_cfg(
+            ExchangeVenue::Spot,
+            ExchangeEnvironment::Production,
+            "wss://stream.binance.com:9443/ws/",
+        );
+        assert_eq!(
+            BinanceWsDriver::resolve_stream_base(&spot_ws),
+            "wss://stream.binance.com:9443/stream"
+        );
+
+        let futures_bare = sample_exchange_cfg(
+            ExchangeVenue::Futures,
+            ExchangeEnvironment::Production,
+            "wss://fstream.binance.com",
+        );
+        assert_eq!(
+            BinanceWsDriver::resolve_stream_base(&futures_bare),
+            "wss://fstream.binance.com/stream"
+        );
+
+        let futures_ws = sample_exchange_cfg(
+            ExchangeVenue::Futures,
+            ExchangeEnvironment::Testnet,
+            "wss://stream.binancefuture.com/ws",
+        );
+        assert_eq!(
+            BinanceWsDriver::resolve_stream_base(&futures_ws),
+            "wss://stream.binancefuture.com/stream"
+        );
     }
 }

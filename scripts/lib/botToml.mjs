@@ -1,7 +1,7 @@
 // Pure bot.toml renderer: edits rust-bot/config/bot.example.toml line-by-line within
 // [section] scope so every comment and default is preserved.
 
-export const ENDPOINTS = {
+const ENDPOINTS = {
   spot: {
     testnet: {
       ws_stream_url: 'wss://stream.testnet.binance.vision/stream',
@@ -144,6 +144,17 @@ export function renderBotToml(exampleText, opts) {
   const botHost = rawBotHost || '127.0.0.1';
   const botPort = Number(opts.botPort ?? 8080) || 8080;
   const webPort = Number(opts.webPort ?? 3000) || 3000;
+  const rawPairMode = String(opts.pairSelectionMode ?? 'hybrid').toLowerCase();
+  const pairSelectionMode =
+    rawPairMode === 'static' || rawPairMode === 'dynamic' ? rawPairMode : 'hybrid';
+  const rawCategory = String(opts.trendingCategory ?? 'hot_volume').toLowerCase();
+  const trendingCategory =
+    rawCategory === 'top_gainers' ||
+    rawCategory === 'top_losers' ||
+    rawCategory === 'volatility_leaders'
+      ? rawCategory
+      : 'hot_volume';
+  const directionPolicy = venue === 'futures' ? 'both' : 'long_only';
 
   const credentials = {
     auth_method: authMethod,
@@ -183,8 +194,16 @@ export function renderBotToml(exampleText, opts) {
       ...endpoints,
     },
     'exchange.credentials': credentials,
+    trading: {
+      pair_selection_mode: pairSelectionMode,
+      trending_category: trendingCategory,
+    },
+    automation: {
+      direction_policy: directionPolicy,
+      auto_flip_on_reversal: false,
+    },
     web: {
-      bind_addr: `${botHost}:${botPort}`,
+      bind_addr: `${botHost.includes(':') && !botHost.startsWith('[') ? `[${botHost}]` : botHost}:${botPort}`,
       allowed_origin: `http://localhost:${webPort}`,
       auth_token: '',
     },
