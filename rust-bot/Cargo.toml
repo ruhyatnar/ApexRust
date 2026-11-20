@@ -18,7 +18,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Official Binance Rust Connector SDK (https://developers.binance.com/en/docs/sdks-tools/connectors/rust)
-binance-sdk = { version = "78.1.0", default-features = false, features = ["rustls-tls", "spot", "derivatives_trading_usds_futures"] }
+binance-sdk = { version = "=78.3.0", default-features = false, features = ["rustls-tls", "spot", "derivatives_trading_usds_futures"] }
 
 # Async Runtime & Networking
 tokio = { version = "1.47", features = ["full"] }

@@ -1,6 +1,6 @@
 # ApexRust Quant — Binance Multi-Pair Trading Bot & Web Command Center
 
-A full-stack quantitative cryptocurrency trading platform combining an interactive **React 19 + TypeScript Web & Desktop PWA Command Center**, a local **Express Binance Signing, Order Ledger & Git Backup Proxy (`server.ts`)**, and a modular **8-crate Rust trading engine (`rust-bot/`)** built on the official **Binance Rust SDK (`binance-sdk 78.1.0`)** for **Binance Spot** and **Binance USD-M Futures**.
+A full-stack quantitative cryptocurrency trading platform combining an interactive **React 19 + TypeScript Web & Desktop PWA Command Center**, a local **Express Binance Signing, Order Ledger & Git Backup Proxy (`server.ts`)**, and a modular **8-crate Rust trading engine (`rust-bot/`)** built on the official **Binance Rust SDK (`binance-sdk 78.3.0`)** for **Binance Spot** and **Binance USD-M Futures**.
 
 ---
 
@@ -160,6 +160,7 @@ You can run the 24/7 Rust Trading Daemon (`bot-desktop --daemon`) and Express Ga
    ```bash
    ./install.sh --role vps --service
    # Sets APEXRUST_ENGINE_AUTHORITY=daemon, APEXRUST_PERSIST_VAULT=true, and starts both `web` and `bot`
+   # UI-saved API keys land in `.apexrust/secrets.env` (0600, gitignored), never in `.env` or logs
    ```
    - Whitelist your VPS outbound IP in Binance API Management and keep public ports `3000`/`8080` blocked on public `ufw`/`eth0`.
 
@@ -216,7 +217,7 @@ ApexRust Quant maintains parity across two runtimes sharing an identical domain 
 +------------------------------^----------------------------------------------+
                                | (Native 24/7 Alternative / Parity Engine)
 +------------------------------+----------------------------------------------+
-| Rust 8-Crate Workspace (rust-bot/, Tokio + binance-sdk 78.1.0)              |
+| Rust 8-Crate Workspace (rust-bot/, Tokio + binance-sdk 78.3.0)              |
 |  - bot-desktop CLI / systemd daemon + bot-web Axum telemetry bridge (:8080) |
 |  - WebSocket primary feed with automatic REST fallback & exponential backoff|
 +-----------------------------------------------------------------------------+
@@ -312,6 +313,7 @@ ApexRust Quant maintains parity across two runtimes sharing an identical domain 
   - `hybrid` (*Pinned + Auto-Trending*, default): Monitors your pinned watchlist alongside auto-rotating trending pairs (`trendingTopN`) up to `maxWatchlistPairs`.
   - `dynamic` (*Full Auto-Trending*): Continuously rotates active watchlist pairs via Binance's live `!miniTicker@arr` WebSocket screener (`hot_volume`, `top_gainers`, `top_losers` for Futures shorts, `volatility_leaders`) with **Zero Orphan Protection** (open positions and pending orders are never dropped), rank hysteresis buffer (`N + 3`), `15m` minimum dwell, and `exchangeInfo` venue/environment validation.
 - **WebSocket-First & Binance Rate-Limit Compliant**: Combined `<sym>@kline_<tf>` + `<sym>@bookTicker` streams plus `!miniTicker@arr` screener WS use debounced in-place `SUBSCRIBE`/`UNSUBSCRIBE` diffs (respecting Spot `<= 5 msg/s`, Futures `<= 10 msg/s`, `<= 1024 streams/conn`, and `< 23h` reconnect), 30-minute `exchangeInfo` TTL cache, staggered 220-bar warmup, and `X-MBX-USED-WEIGHT-1M >= 70%` + `429`/`418 Retry-After` throttling.
+- **User Data Stream Reconciliation**: The Rust daemon keeps a per-account `listenKey` (Spot `POST /api/v3/userDataStream`, Futures `POST /fapi/v1/listenKey`) with 30-minute keepalive, automatic key recreation, and reconnects. `executionReport` / `ORDER_TRADE_UPDATE` events wake the order reconciler immediately instead of waiting for the next 3s poll; `X-MBX-ORDER-COUNT-10S/1M` headers gate new orders before Binance returns a ban-triggering 429.
 - **11-Layer Anti-False-Signal Mitigation Matrix**: Enforces EMA `9/21/50/200` alignment (`requireMacroEmaInScalping`), distance caps (`maxEmaMidExtensionAtr`, `maxVwapExtensionAtr`), candle close strength & body ratio anti-wick gates, ADX + `minDiSpread` (+ optional rising ADX), volume expansion multiplier, live `@bookTicker` spread guard (`maxSpreadBps`), `minWarmupBars`, and per-direction concurrency limits (`maxSameDirectionPositions`).
 - **Dynamic Pending Auto-Cancel & Early Reversal Protection**: Auto-cancels resting auto limits when signals reverse (`SignalReversed` + cooldown bypass for fast opposite entries), momentum exhausts (`MomentumExhaustion`), price runs away (`PriceRunaway`), or TTL bars expire (`ExpiredBars`). Uses `POST /api/live/cancel-order` so Binance `-2011` (`Unknown order sent`) verifies order status and promotes already-`FILLED` limits instead of dropping them. Early open-position management supports `SignalReversal` exits (Spot safe close; optional Futures `autoFlipOnReversal`) and `0.55×` ATR trailing tightening (`tightenTrailingOnExhaustion`).
 - **Futures Controls**: Configurable leverage (`1x–20x`), `ISOLATED` or `CROSSED` margin alignment (`/fapi/v1/marginType`, `/fapi/v1/leverage`), skipping margin/leverage calls on `reduceOnly` exits so Binance error `-4048` never blocks protective closes.
@@ -411,6 +413,7 @@ Express runs on port `3000` (`0.0.0.0:3000`), mounting Vite middleware in develo
 | :--- | :--- |
 | `GET /api/health`, `/_ah/health` | Health check returning active environment and venue |
 | `GET /api/market/screener` | Live Binance `!miniTicker@arr` WebSocket screener snapshot (`hot_volume`, `top_gainers`, `top_losers`, `volatility_leaders`) filtered by active venue/env `exchangeInfo` |
+| `POST /api/ws-ticket` | Issues a single-use 30-second ticket for `WS /ws/telemetry` and `WS /ws/screener` (tokens stay out of URLs); `?token=` remains as a deprecated fallback |
 | `WS /ws/screener` | Pushes real-time `screener_snapshot` updates and accepts live JSON filter updates without polling |
 | `WS /ws/telemetry` | Streams real-time Rust daemon telemetry snapshots to the Web UI and `bot-desktop` CLI |
 | `GET /api/market/klines` | Public Binance Spot/Futures kline proxy (avoids browser CORS on Futures/Testnet) |
@@ -472,7 +475,7 @@ Use the built-in CLI helper on Linux, macOS (`./apexrust`), or Windows (`.\apexr
 
 ## Rust Workspace (`rust-bot/`) & Headless Deployment
 
-The `rust-bot/` workspace implements the full trading engine in Rust (`edition = "2021"`, `binance-sdk 78.1.0`, `tokio 1.47`, `axum 0.8`):
+The `rust-bot/` workspace implements the full trading engine in Rust (`edition = "2021"`, `binance-sdk 78.3.0`, `tokio 1.47`, `axum 0.8`):
 
 | Crate | Responsibility |
 | :--- | :--- |

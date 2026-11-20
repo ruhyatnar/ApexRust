@@ -7,7 +7,7 @@ use axum::{
         ConnectInfo, Query, Request, State,
     },
     http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
         HeaderName, HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
@@ -35,6 +35,8 @@ pub struct WebState {
     pub auth_token: Option<Arc<str>>,
     pub dedupe_cache: Arc<Mutex<HashMap<String, Instant>>>,
     auth_failures: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
+    /// Single-use WebSocket tickets (browsers cannot send an Authorization header on upgrade).
+    ws_tickets: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl WebState {
@@ -53,8 +55,54 @@ impl WebState {
             auth_token: resolved,
             dedupe_cache: Arc::new(Mutex::new(HashMap::new())),
             auth_failures: Arc::new(Mutex::new(HashMap::new())),
+            ws_tickets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+const WS_TICKET_TTL: Duration = Duration::from_secs(30);
+const WS_TICKET_MAX: usize = 256;
+
+/// 128 bits derived from OS-seeded SipHash keys; unguessable enough for a 30s,
+/// single-use handshake ticket without adding a random-number dependency.
+fn random_ws_ticket() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut first = std::collections::hash_map::RandomState::new().build_hasher();
+    first.write_u128(nanos);
+    first.write_u32(std::process::id());
+    let a = first.finish();
+    let mut second = std::collections::hash_map::RandomState::new().build_hasher();
+    second.write_u64(a);
+    second.write_u128(nanos.rotate_left(29));
+    let b = second.finish();
+    format!("{a:016x}{b:016x}{:016x}", a.rotate_left(31) ^ b)
+}
+
+async fn ws_ticket_handler(State(state): State<WebState>) -> impl IntoResponse {
+    let now = Instant::now();
+    let ticket = random_ws_ticket();
+    if let Ok(mut guard) = state.ws_tickets.lock() {
+        guard.retain(|_, expires_at| *expires_at > now);
+        if guard.len() >= WS_TICKET_MAX {
+            if let Some(oldest) = guard.keys().next().cloned() {
+                guard.remove(&oldest);
+            }
+        }
+        guard.insert(ticket.clone(), now + WS_TICKET_TTL);
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "ticket": ticket,
+            "expires_in_ms": WS_TICKET_TTL.as_millis() as u64
+        })),
+    )
 }
 
 /// Constant-time token comparison using a bitwise XOR accumulator (no extra dependency).
@@ -96,6 +144,24 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Parse and normalize a forwarded client IP. Rejects arbitrary strings so a
+/// spoofed header cannot create unbounded limiter keys or dodge a lockout.
+fn normalize_forwarded_ip(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('"');
+    let candidate = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or(trimmed);
+    let parsed: std::net::IpAddr = candidate.parse().ok()?;
+    Some(match parsed {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| v4.to_string())
+            .unwrap_or_else(|| parsed.to_string()),
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+    })
+}
+
 fn client_rate_key(req: &Request) -> String {
     let peer_ip = req
         .extensions()
@@ -109,9 +175,8 @@ fn client_rate_key(req: &Request) -> String {
             .get("cf-connecting-ip")
             .and_then(|v| v.to_str().ok())
         {
-            let trimmed = cf.trim();
-            if !trimmed.is_empty() {
-                return format!("cf:{trimmed}");
+            if let Some(ip) = normalize_forwarded_ip(cf) {
+                return format!("cf:{ip}");
             }
         }
         if let Some(xff) = req
@@ -120,9 +185,8 @@ fn client_rate_key(req: &Request) -> String {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.split(',').next())
         {
-            let trimmed = xff.trim();
-            if !trimmed.is_empty() {
-                return format!("xff:{trimmed}");
+            if let Some(ip) = normalize_forwarded_ip(xff) {
+                return format!("xff:{ip}");
             }
         }
     }
@@ -187,29 +251,38 @@ async fn require_auth_middleware(
         return next.run(req).await;
     }
 
-    if let Some(ref expected) = state.auth_token {
-        let rate_key = client_rate_key(&req);
-        let now = Instant::now();
-        {
-            if let Ok(mut guard) = state.auth_failures.lock() {
-                if guard.len() > 256 {
-                    guard.retain(|_, (_, ts)| now.duration_since(*ts) < Duration::from_secs(300));
-                }
-                if let Some((count, first_ts)) = guard.get(&rate_key).copied() {
-                    if now.duration_since(first_ts) < Duration::from_secs(300) && count >= 10 {
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(serde_json::json!({
-                                "ok": false,
-                                "error": "Too many failed authentication attempts; try again later."
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
+    // WebSocket ticket path: consumed once, no failure counter (an expired ticket
+    // during reconnect must not lock the client out of the whole API).
+    if matches!(req.uri().path(), "/ws/telemetry" | "/ws/screener") {
+        if let Some(ticket) = req.uri().query().and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("ticket="))
+                .map(|value| percent_decode(value.trim()))
+        }) {
+            let valid = state
+                .ws_tickets
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.remove(&ticket))
+                .is_some_and(|expires_at| expires_at > Instant::now());
+            if valid {
+                return next.run(req).await;
             }
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Invalid or expired WebSocket ticket"
+                })),
+            )
+                .into_response();
         }
+    }
 
+    if let Some(ref expected) = state.auth_token {
+        // Validate credentials BEFORE consulting the failure limiter: a correct
+        // token must never be locked out by earlier failures from the same IP.
         let mut authorized = false;
 
         if let Some(auth_val) = req
@@ -251,8 +324,27 @@ async fn require_auth_middleware(
             }
         }
 
-        if !authorized {
+        if authorized {
             if let Ok(mut guard) = state.auth_failures.lock() {
+                guard.remove(&client_rate_key(&req));
+            }
+            return next.run(req).await;
+        }
+
+        let rate_key = client_rate_key(&req);
+        let now = Instant::now();
+        let mut retry_after_ms: Option<u128> = None;
+        if let Ok(mut guard) = state.auth_failures.lock() {
+            if guard.len() > 256 {
+                guard.retain(|_, (_, ts)| now.duration_since(*ts) < Duration::from_secs(300));
+            }
+            if let Some((count, first_ts)) = guard.get(&rate_key).copied() {
+                let elapsed = now.duration_since(first_ts);
+                if elapsed < Duration::from_secs(300) && count >= 10 {
+                    retry_after_ms = Some((Duration::from_secs(300) - elapsed).as_millis());
+                }
+            }
+            if retry_after_ms.is_none() {
                 let entry = guard.entry(rate_key).or_insert((0, now));
                 if now.duration_since(entry.1) >= Duration::from_secs(300) {
                     *entry = (1, now);
@@ -260,17 +352,32 @@ async fn require_auth_middleware(
                     entry.0 = entry.0.saturating_add(1);
                 }
             }
-            return (
-                StatusCode::UNAUTHORIZED,
+        }
+
+        if let Some(remaining_ms) = retry_after_ms {
+            let retry_after_secs = remaining_ms.div_ceil(1000).max(1);
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
                 Json(serde_json::json!({
                     "ok": false,
-                    "error": "Unauthorized: missing or invalid bot-web auth token"
+                    "error": "Too many failed authentication attempts; try again later."
                 })),
             )
                 .into_response();
-        } else if let Ok(mut guard) = state.auth_failures.lock() {
-            guard.remove(&rate_key);
+            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp.headers_mut().insert(RETRY_AFTER, value);
+            }
+            return resp;
         }
+
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Unauthorized: missing or invalid bot-web auth token"
+            })),
+        )
+            .into_response();
     }
     next.run(req).await
 }
@@ -290,12 +397,21 @@ pub fn router(state: WebState) -> Router {
         HeaderName::from_static("x-apexrust-client-id"),
         HeaderName::from_static("access-control-request-private-network"),
     ];
-    let cors = if origin_raw == "*" {
+    // Never combine a wildcard origin with an auth token: any website could
+    // then drive the trading API with stolen credentials. Fall back to the
+    // localhost defaults instead of silently exposing the engine.
+    let wildcard_with_auth = origin_raw == "*" && state.auth_token.is_some();
+    if wildcard_with_auth {
+        tracing::warn!(
+            "allowed_origin=\"*\" ignored because web.auth_token is set; falling back to localhost origins"
+        );
+    }
+    let cors = if origin_raw == "*" && !wildcard_with_auth {
         CorsLayer::new()
             .allow_origin(AllowOrigin::any())
             .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers(allowed_headers)
-    } else if !origins.is_empty() {
+    } else if !origins.is_empty() && !wildcard_with_auth {
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(origins))
             .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
@@ -324,6 +440,7 @@ pub fn router(state: WebState) -> Router {
         )
         .route("/api/orders/orphans", get(orders_orphans_handler))
         .route("/api/control", post(control_handler))
+        .route("/api/ws-ticket", post(ws_ticket_handler))
         .route("/ws/telemetry", get(ws_handler))
         .route("/ws/screener", get(ws_screener_handler))
         .route_layer(middleware::from_fn_with_state(
@@ -1118,6 +1235,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            limited.headers().get("retry-after").is_some(),
+            "429 response must advertise Retry-After"
+        );
+
+        // A valid token still wins while the IP is locked out by bad attempts
+        let valid_while_locked = client
+            .get(format!("http://{addr}/api/snapshot"))
+            .bearer_auth(tok)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(valid_while_locked.status(), reqwest::StatusCode::OK);
 
         server.abort();
         let _ = std::fs::remove_file(&tmp_db);
@@ -1159,6 +1289,21 @@ mod tests {
             .extensions_mut()
             .insert(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5000))));
         assert_eq!(client_rate_key(&proxied_req), "cf:198.51.100.9");
+
+        // Malformed forwarded values are ignored instead of becoming limiter keys
+        let mut junk_req = axum::http::Request::builder()
+            .uri("/api/snapshot")
+            .header("cf-connecting-ip", "not-an-ip")
+            .header("x-forwarded-for", "also$bad")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        junk_req
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 5000))));
+        assert_eq!(client_rate_key(&junk_req), "ip:127.0.0.1");
+        assert_eq!(normalize_forwarded_ip("::ffff:203.0.113.9"), Some("203.0.113.9".into()));
+        assert_eq!(normalize_forwarded_ip("[2001:db8::1]"), Some("2001:db8::1".into()));
+        assert_eq!(normalize_forwarded_ip(""), None);
     }
 
     #[tokio::test]

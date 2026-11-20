@@ -4,6 +4,8 @@
  * Desktop ↔ Remote VPS connectivity.
  */
 
+import crypto from 'node:crypto';
+
 export type EngineAuthorityMode = 'browser' | 'daemon';
 
 function stripIpv6BracketsAndZone(rawHost: string): string {
@@ -236,6 +238,106 @@ export class AuthFailureLimiter {
     const key = (ip || 'unknown').trim();
     this.records.delete(key);
   }
+
+  /**
+   * Seconds remaining until the current lockout window expires (0 when not locked).
+   */
+  retryAfterSeconds(ip: string, nowMs = Date.now()): number {
+    const key = (ip || 'unknown').trim();
+    const rec = this.records.get(key);
+    if (!rec) return 0;
+    const remainingMs = rec.firstAttemptMs + this.windowMs - nowMs;
+    if (remainingMs <= 0) {
+      this.records.delete(key);
+      return 0;
+    }
+    if (rec.count < this.maxFailures) return 0;
+    return Math.max(1, Math.ceil(remainingMs / 1000));
+  }
+}
+
+export function safeTokenMatch(provided: string, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(provided, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+export const TOKEN_LOCKOUT_ERROR =
+  'Too many failed token attempts from this IP. Try again in 5 minutes.';
+
+export const TOKEN_INVALID_ERROR =
+  'Unauthorized: missing or invalid Access Token (APEXRUST_PROXY_TOKEN).';
+
+export type TokenAuthDecision =
+  | { ok: true }
+  | {
+      ok: false;
+      status: 401 | 429;
+      error: string;
+      recordFailure: boolean;
+      retryAfterSeconds: number;
+    };
+
+/**
+ * Pure token-auth decision shared by the HTTP guard and the WebSocket upgrade guard.
+ *
+ * Ordering matters: a valid token always wins, even for a locked-out IP, because a
+ * rate limiter is meant to slow guessing rather than reject the correct answer.
+ * Missing tokens and probe requests are never charged against the failure budget;
+ * only a wrong token supplied to a real route is.
+ */
+export function decideTokenAuth(input: {
+  configuredToken: string;
+  candidates: Array<string | undefined | null>;
+  locked: boolean;
+  retryAfterSeconds: number;
+  isProbe?: boolean;
+}): TokenAuthDecision {
+  const expected = (input.configuredToken || '').trim();
+  if (!expected) {
+    return { ok: true };
+  }
+
+  const provided = input.candidates
+    .map((candidate) => String(candidate ?? '').trim())
+    .filter(Boolean);
+
+  if (provided.some((candidate) => safeTokenMatch(candidate, expected))) {
+    return { ok: true };
+  }
+
+  const retryAfterSeconds = Math.max(0, Math.floor(input.retryAfterSeconds));
+
+  // No token supplied, or an unauthenticated health probe: deny without penalty.
+  if (provided.length === 0 || input.isProbe) {
+    return {
+      ok: false,
+      status: 401,
+      error: TOKEN_INVALID_ERROR,
+      recordFailure: false,
+      retryAfterSeconds,
+    };
+  }
+
+  if (input.locked) {
+    return {
+      ok: false,
+      status: 429,
+      error: TOKEN_LOCKOUT_ERROR,
+      recordFailure: false,
+      retryAfterSeconds: Math.max(1, retryAfterSeconds),
+    };
+  }
+
+  return {
+    ok: false,
+    status: 401,
+    error: TOKEN_INVALID_ERROR,
+    recordFailure: true,
+    retryAfterSeconds: 0,
+  };
 }
 
 const ALLOWED_ENGINE_ROUTES: ReadonlyArray<{ method: string; path: string }> = [

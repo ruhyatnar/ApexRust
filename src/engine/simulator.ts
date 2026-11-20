@@ -2003,7 +2003,7 @@ export class SimulationRuntime {
 
       if (existingIdx !== -1) {
         const wasClosed = pair.candles[existingIdx].isClosed;
-        const prevClosed = [...pair.candles.slice(0, existingIdx)].reverse().find((c) => c.isClosed);
+        const prevClosed = pair.candles.slice(0, existingIdx).reverse().find((c) => c.isClosed);
         const updatedCandles = pair.candles.slice();
         updatedCandles[existingIdx] = nextCandle;
         pair.candles = updatedCandles;

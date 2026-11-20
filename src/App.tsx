@@ -29,7 +29,7 @@ import { TradingDeskView } from './components/TradingDeskView';
 import {
   type ConnectionProfile,
   apiFetch,
-  buildWebSocketUrl,
+  buildWebSocketUrlWithTicket,
   loadConnectionProfile,
   setActiveConnectionProfile,
   setLocalAccessToken,
@@ -690,7 +690,10 @@ export default function App() {
       const resp = await apiFetch('/api/connection/info');
       const latencyMs = Math.max(1, Date.now() - started);
       if (resp.status === 401 || resp.status === 429) {
-        const errData = (await resp.json().catch(() => ({}))) as { error?: string };
+        const errData = (await resp.json().catch(() => ({}))) as {
+          error?: string;
+          retryAfterSeconds?: number;
+        };
         setConnectionHealth({
           checkedAtMs: Date.now(),
           reachable: true,
@@ -705,6 +708,10 @@ export default function App() {
           zeroTrustUser: null,
           apiVersion: '2.0.0',
           error: errData.error || 'Access Token rejected (401)',
+          retryAfterSeconds:
+            typeof errData.retryAfterSeconds === 'number' && errData.retryAfterSeconds > 0
+              ? errData.retryAfterSeconds
+              : undefined,
         });
         return;
       }
@@ -926,10 +933,11 @@ export default function App() {
       }, delayMs);
     };
 
-    const connectTelemetryWs = () => {
+    const connectTelemetryWs = async () => {
       if (cancelled) return;
       try {
-        const wsUrl = buildWebSocketUrl('/ws/telemetry', connectionProfile);
+        const wsUrl = await buildWebSocketUrlWithTicket('/ws/telemetry', connectionProfile);
+        if (cancelled) return;
         ws = new WebSocket(wsUrl);
         ws.onopen = () => {
           if (cancelled) {
@@ -1071,10 +1079,11 @@ export default function App() {
       }, delayMs);
     };
 
-    const connectScreenerWs = () => {
+    const connectScreenerWs = async () => {
       if (cancelled) return;
       try {
-        const wsUrl = buildWebSocketUrl(buildQueryString(), connectionProfile);
+        const wsUrl = await buildWebSocketUrlWithTicket(buildQueryString(), connectionProfile);
+        if (cancelled) return;
         ws = new WebSocket(wsUrl);
         screenerWsRef.current = ws;
         ws.onopen = () => {

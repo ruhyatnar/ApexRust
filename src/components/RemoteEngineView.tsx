@@ -42,6 +42,8 @@ export interface ServerConnectionHealth {
   zeroTrustUser: string | null;
   apiVersion: string;
   error?: string;
+  /** Seconds until the Access Token lockout expires, when the server reported one. */
+  retryAfterSeconds?: number;
 }
 
 interface RemoteEngineViewProps {
@@ -489,7 +491,13 @@ export const RemoteEngineView: React.FC<RemoteEngineViewProps> = ({
                         : connectionHealth.authRequired
                           ? 'Access Token Verified'
                           : 'Cloudflare One Mesh / Local Trusted'
-                      : connectionHealth.error || 'Access Token Rejected (401)'}
+                      : connectionHealth.retryAfterSeconds
+                        ? `Too many failed attempts — retry in ${
+                            connectionHealth.retryAfterSeconds >= 60
+                              ? `${Math.floor(connectionHealth.retryAfterSeconds / 60)}m ${connectionHealth.retryAfterSeconds % 60}s`
+                              : `${connectionHealth.retryAfterSeconds}s`
+                          }`
+                        : connectionHealth.error || 'Access Token Rejected (401)'}
                 </div>
               </div>
             </div>

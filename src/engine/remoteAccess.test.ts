@@ -20,6 +20,7 @@ import { OrderHistoryDatabase } from './orderDatabase';
 import {
   AuthFailureLimiter,
   LiveExecutionLeaseManager,
+  decideTokenAuth,
   evaluateBindSafety,
   evaluateEngineAuthorityGuard,
   isEnginePathAllowed,
@@ -87,6 +88,94 @@ test('parseAllowedOrigins, isOriginAllowed, and AuthFailureLimiter enforce CORS 
   limiter.recordFailure(ip, 70_000);
   limiter.recordSuccess(ip);
   assert.equal(limiter.isLocked(ip, 70_001), false);
+});
+
+test('AuthFailureLimiter.retryAfterSeconds reports the remaining lockout window', () => {
+  const limiter = new AuthFailureLimiter(2, 60_000);
+  const ip = '203.0.113.10';
+  limiter.recordFailure(ip, 1000);
+  // Below the failure threshold there is no lockout to wait out
+  assert.equal(limiter.retryAfterSeconds(ip, 2000), 0);
+  limiter.recordFailure(ip, 2000);
+  assert.equal(limiter.retryAfterSeconds(ip, 2000), 59);
+  assert.equal(limiter.retryAfterSeconds(ip, 61_500), 0);
+  assert.equal(limiter.retryAfterSeconds('198.51.100.1', 2000), 0);
+});
+
+test('decideTokenAuth lets a valid token win a lockout and never penalizes missing tokens or probes', () => {
+  const configuredToken = 't'.repeat(32);
+
+  // A correct token always opens the door, even for a locked-out IP (regression: was 429)
+  assert.deepEqual(
+    decideTokenAuth({
+      configuredToken,
+      candidates: [configuredToken],
+      locked: true,
+      retryAfterSeconds: 120,
+    }),
+    { ok: true }
+  );
+
+  // An absent token is denied but not charged against the failure budget
+  const missing = decideTokenAuth({
+    configuredToken,
+    candidates: ['', '   '],
+    locked: false,
+    retryAfterSeconds: 0,
+  });
+  assert.equal(missing.ok, false);
+  if (!missing.ok) {
+    assert.equal(missing.status, 401);
+    assert.equal(missing.recordFailure, false);
+  }
+
+  // The health probe never locks an IP out, but still reports the remaining window
+  const probe = decideTokenAuth({
+    configuredToken,
+    candidates: ['wrong-token'],
+    locked: true,
+    retryAfterSeconds: 42,
+    isProbe: true,
+  });
+  assert.equal(probe.ok, false);
+  if (!probe.ok) {
+    assert.equal(probe.status, 401);
+    assert.equal(probe.recordFailure, false);
+    assert.equal(probe.retryAfterSeconds, 42);
+  }
+
+  // A wrong token on a real route is charged once
+  const wrong = decideTokenAuth({
+    configuredToken,
+    candidates: ['wrong-token'],
+    locked: false,
+    retryAfterSeconds: 0,
+  });
+  assert.equal(wrong.ok, false);
+  if (!wrong.ok) {
+    assert.equal(wrong.status, 401);
+    assert.equal(wrong.recordFailure, true);
+  }
+
+  // Once locked, a wrong token gets 429 with a Retry-After countdown and no extra charge
+  const locked = decideTokenAuth({
+    configuredToken,
+    candidates: ['wrong-token'],
+    locked: true,
+    retryAfterSeconds: 0,
+  });
+  assert.equal(locked.ok, false);
+  if (!locked.ok) {
+    assert.equal(locked.status, 429);
+    assert.equal(locked.recordFailure, false);
+    assert.equal(locked.retryAfterSeconds, 1);
+  }
+
+  // No token configured means the guard is open
+  assert.deepEqual(
+    decideTokenAuth({ configuredToken: '', candidates: [], locked: true, retryAfterSeconds: 60 }),
+    { ok: true }
+  );
 });
 
 test('isEnginePathAllowed, evaluateEngineAuthorityGuard, and LiveExecutionLeaseManager prevent duplicate orders', () => {

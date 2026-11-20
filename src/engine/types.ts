@@ -285,6 +285,8 @@ export interface OrderExecutionLog {
   updateTimeMs?: number;
   workingTimeMs?: number | null;
   timestampMs: number;
+  /** True for seeded showcase rows that must never influence live stats or PnL. */
+  demo?: boolean;
 }
 
 export interface SymbolSyncWatermark {

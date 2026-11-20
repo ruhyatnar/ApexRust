@@ -1,7 +1,7 @@
 # System Architecture
 
 ApexRust Quant spans two parity-aligned runtimes sharing an identical domain model:
-1. **Rust Workspace (`rust-bot/`)**: Native 8-crate Tokio engine (`bot-desktop`, `bot-web`, `bot-engine`, `bot-exchange`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-core`) built on `binance-sdk 78.1.0`.
+1. **Rust Workspace (`rust-bot/`)**: Native 8-crate Tokio engine (`bot-desktop`, `bot-web`, `bot-engine`, `bot-exchange`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-core`) built on `binance-sdk 78.3.0`.
 2. **Web Command Center & Server Proxy (`/src`, `server.ts`, `vite.config.ts`)**: Installable Desktop/Mobile PWA + TypeScript `SimulationRuntime` + Express server-side signing & Git backup proxy on port `3000`.
 
 ---
@@ -64,7 +64,7 @@ ApexRust Quant spans two parity-aligned runtimes sharing an identical domain mod
 
 ## 3. Binance Spot & USD-M Futures Routing (`binance-sdk`)
 
-Official reference: [Binance Connectors — Rust](https://developers.binance.com/en/docs/sdks-tools/connectors/rust) (`binance-sdk` `78.1.0` with `spot` and `derivatives_trading_usds_futures` features).
+Official reference: [Binance Connectors — Rust](https://developers.binance.com/en/docs/sdks-tools/connectors/rust) (`binance-sdk` `78.3.0` with `spot` and `derivatives_trading_usds_futures` features).
 
 | Venue | Environment | REST Base URL | WebSocket Stream URL | WebSocket API URL |
 | :--- | :--- | :--- | :--- | :--- |
@@ -90,6 +90,11 @@ Official reference: [Binance Connectors — Rust](https://developers.binance.com
 2. **Primary Real-Time Stream (`WsPrimary`)**: Connects to Binance combined WebSocket Stream when `features.ws_primary_feed = true`.
 3. **Heartbeat Watchdog & Automatic Degradation (`RestFallback`)**: When `Instant::now() - last_ws_message_at > ws_heartbeat_timeout_ms` (and `features.rest_fallback = true`), `FailoverGateway` degrades transparently to REST polling and re-attempts WebSocket reconnection with exponential backoff.
 4. **Auto-Promotion**: Once WebSocket frames stabilize, `TransportMode` returns to `WsPrimary`.
+
+### User Data Stream (`bot-exchange::user_stream`)
+- Live (non-paper) engines open a Binance account stream: `POST /api/v3/userDataStream` for Spot, `POST /fapi/v1/listenKey` for USD-M Futures, then `wss://.../ws/<listenKey>`.
+- Listen keys need only the `X-MBX-APIKEY` header (no signature) and expire after 60 idle minutes, so the driver sends a keepalive every 30 minutes and recreates the key when Binance reports `listenKeyExpired` or keepalive fails.
+- `executionReport` / `ORDER_TRADE_UPDATE` frames reset the 3s order-reconciliation timer, so fills, cancels and rejects are reflected immediately. Paper mode never opens the stream, and a missing `BINANCE_API_KEY` disables it without failing the engine.
 
 ---
 

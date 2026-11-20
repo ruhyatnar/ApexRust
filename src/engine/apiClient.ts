@@ -238,6 +238,38 @@ export function buildWebSocketUrl(
 }
 
 /**
+ * Preferred WebSocket URL builder: exchanges the bearer token for a 30s
+ * single-use ticket so the long-lived token never appears in request URLs or
+ * proxy access logs. Falls back to the legacy `?token=` form when the ticket
+ * endpoint is unavailable (older engine builds).
+ */
+export async function buildWebSocketUrlWithTicket(
+  wsPath: string,
+  profile: ConnectionProfile = getActiveConnectionProfile()
+): Promise<string> {
+  const legacyUrl = buildWebSocketUrl(wsPath, profile);
+  const token = profile.kind === 'remote' ? profile.token.trim() : getLocalAccessToken();
+  if (!token) return legacyUrl;
+  try {
+    const resp = await fetch(buildApiUrl(profile, '/api/ws-ticket'), {
+      method: 'POST',
+      headers: buildAuthHeaders(profile),
+    });
+    if (!resp.ok) return legacyUrl;
+    const data = (await resp.json()) as { ticket?: unknown };
+    const ticket = typeof data.ticket === 'string' ? data.ticket.trim() : '';
+    if (!ticket) return legacyUrl;
+    const withoutToken = legacyUrl
+      .replace(/([?&])token=[^&]*&?/, '$1')
+      .replace(/[?&]$/, '');
+    const sep = withoutToken.includes('?') ? '&' : '?';
+    return `${withoutToken}${sep}ticket=${encodeURIComponent(ticket)}`;
+  } catch {
+    return legacyUrl;
+  }
+}
+
+/**
  * Drop-in replacement for `fetch('/api/...')` that routes to either:
  * - `🖥️ This Computer (Local)` (same-origin `/api/...`)
  * - `☁️ Remote VPS (24/7 Server)` (`<baseUrl>/api/...` with Cloudflare One / Bearer token headers)

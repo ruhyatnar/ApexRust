@@ -1,5 +1,4 @@
 node_modules/
-package-lock.json
 build/
 .apexrust/
 .env.bak
@@ -8,7 +7,6 @@ dist/
 coverage/
 target/
 rust-bot/target/
-rust-bot/Cargo.lock
 .DS_Store
 *.log
 .env*

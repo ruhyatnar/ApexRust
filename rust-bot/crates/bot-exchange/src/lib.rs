@@ -8,10 +8,12 @@ pub mod binance_futures;
 pub mod binance_rest;
 pub mod binance_ws;
 pub mod failover;
+pub mod user_stream;
 
 pub use binance_futures::BinanceFuturesClient;
 pub use binance_rest::BinanceRestClient;
 pub use binance_ws::{BinanceWsDriver, WsStreamEvent};
+pub use user_stream::{OrderUpdate, UserDataStream, UserStreamEvent};
 pub use failover::{FailoverGateway, FailoverHealth};
 
 use binance_sdk::config::{ConfigurationRestApi, PrivateKey};

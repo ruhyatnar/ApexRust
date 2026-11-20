@@ -446,6 +446,11 @@ export function filterOrderLogs(
     .sort((a, b) => b.timestampMs - a.timestampMs);
 }
 
+/** Seeded showcase rows must never skew performance metrics or exports. */
+function isDemoLog(log: OrderExecutionLog): boolean {
+  return log.demo === true || log.id.startsWith('paper-seed-');
+}
+
 export function computeOrderPerformanceMetrics(logs: OrderExecutionLog[]): OrderPerformanceMetrics {
   let filledOrders = 0;
   let openOrders = 0;
@@ -458,7 +463,7 @@ export function computeOrderPerformanceMetrics(logs: OrderExecutionLog[]): Order
 
   const latencies: number[] = [];
 
-  for (const log of logs) {
+  for (const log of logs.filter((entry) => !isDemoLog(entry))) {
     if (log.status === 'FILLED' || log.status === 'PARTIALLY_FILLED') {
       filledOrders += 1;
       totalVolumeUsdt += Math.max(0, log.quoteQty);
@@ -598,7 +603,8 @@ export function computeOrderPerformanceMetrics(logs: OrderExecutionLog[]): Order
   };
 }
 
-export function formatOrderLogsCsv(logs: OrderExecutionLog[]): string {
+export function formatOrderLogsCsv(allLogs: OrderExecutionLog[]): string {
+  const logs = allLogs.filter((entry) => !isDemoLog(entry));
   const headers = [
     'order_time_iso',
     'update_time_iso',

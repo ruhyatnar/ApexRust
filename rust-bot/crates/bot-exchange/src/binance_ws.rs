@@ -6,13 +6,80 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
 const MAX_COMBINED_STREAMS_PER_CONN: usize = 1024;
 const WS_PROACTIVE_ROTATE_SECS: u64 = 23 * 3600;
+
+/// Binance Spot disconnects a connection that sends more than 5 messages per second
+/// (Futures allows 10). Keep a conservative shared budget for `SUBSCRIBE` /
+/// `UNSUBSCRIBE` so a large watchlist diff can never exceed the limit.
+const WS_MAX_MSGS_PER_SEC: f64 = 4.0;
+/// Streams per `SUBSCRIBE` / `UNSUBSCRIBE` frame (well inside Binance's 1024 cap).
+const WS_BATCH_STREAMS: usize = 20;
+
+/// Token bucket enforcing the inbound WebSocket message rate.
+struct MessageRateLimiter {
+    tokens: f64,
+    last: Instant,
+}
+
+impl MessageRateLimiter {
+    fn new() -> Self {
+        Self {
+            tokens: WS_MAX_MSGS_PER_SEC,
+            last: Instant::now(),
+        }
+    }
+
+    /// Refill up to `now` and consume one token when available.
+    fn try_consume_at(&mut self, now: Instant) -> Option<Duration> {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * WS_MAX_MSGS_PER_SEC).min(WS_MAX_MSGS_PER_SEC);
+        self.last = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            return None;
+        }
+        let wait_secs = (1.0 - self.tokens) / WS_MAX_MSGS_PER_SEC;
+        Some(Duration::from_secs_f64(wait_secs.max(0.0)))
+    }
+
+    async fn acquire(&mut self) {
+        while let Some(wait) = self.try_consume_at(Instant::now()) {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+async fn send_stream_batches<S>(
+    ws: &mut S,
+    method: &str,
+    streams: &[String],
+    msg_id: &mut u64,
+    limiter: &mut MessageRateLimiter,
+) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    for chunk in streams.chunks(WS_BATCH_STREAMS) {
+        limiter.acquire().await;
+        let payload = serde_json::json!({
+            "method": method,
+            "params": chunk,
+            "id": *msg_id,
+        });
+        *msg_id += 1;
+        ws.send(Message::Text(payload.to_string().into()))
+            .await
+            .map_err(|e| BotError::WebSocket(format!("Failed to send {method}: {e}")))?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub enum WsStreamEvent {
@@ -237,6 +304,7 @@ impl BinanceWsDriver {
 
         let mut active_pairs: HashSet<String> = initial_pairs.into_iter().collect();
         let mut msg_id: u64 = 1;
+        let mut limiter = MessageRateLimiter::new();
         let read_timeout = Duration::from_millis((self.cfg.ws_heartbeat_timeout_ms * 2).max(5000));
         let rotate_sleep = tokio::time::sleep(Duration::from_secs(WS_PROACTIVE_ROTATE_SECS));
         tokio::pin!(rotate_sleep);
@@ -275,18 +343,14 @@ impl BinanceWsDriver {
                             streams.push(format!("{l}@kline_{}", self.timeframe));
                             streams.push(format!("{l}@bookTicker"));
                         }
-                        for chunk in streams.chunks(50) {
-                            let payload = serde_json::json!({
-                                "method": "UNSUBSCRIBE",
-                                "params": chunk,
-                                "id": msg_id,
-                            });
-                            msg_id += 1;
-                            if ws.send(Message::Text(payload.to_string().into())).await.is_err() {
-                                return Err(BotError::WebSocket("Failed to send UNSUBSCRIBE".into()));
-                            }
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                        }
+                        send_stream_batches(
+                            &mut ws,
+                            "UNSUBSCRIBE",
+                            &streams,
+                            &mut msg_id,
+                            &mut limiter,
+                        )
+                        .await?;
                     }
 
                     if !to_add.is_empty() {
@@ -296,18 +360,14 @@ impl BinanceWsDriver {
                             streams.push(format!("{l}@kline_{}", self.timeframe));
                             streams.push(format!("{l}@bookTicker"));
                         }
-                        for chunk in streams.chunks(50) {
-                            let payload = serde_json::json!({
-                                "method": "SUBSCRIBE",
-                                "params": chunk,
-                                "id": msg_id,
-                            });
-                            msg_id += 1;
-                            if ws.send(Message::Text(payload.to_string().into())).await.is_err() {
-                                return Err(BotError::WebSocket("Failed to send SUBSCRIBE".into()));
-                            }
-                            tokio::time::sleep(Duration::from_millis(250)).await;
-                        }
+                        send_stream_batches(
+                            &mut ws,
+                            "SUBSCRIBE",
+                            &streams,
+                            &mut msg_id,
+                            &mut limiter,
+                        )
+                        .await?;
                     }
                     active_pairs = target_set;
                 }
@@ -508,6 +568,23 @@ mod tests {
             ws_reconnect_max_ms: 30_000,
             max_consecutive_rest_failures: 5,
         }
+    }
+
+    #[test]
+    fn message_rate_limiter_enforces_four_messages_per_second() {
+        let mut limiter = MessageRateLimiter::new();
+        let start = Instant::now();
+        for _ in 0..4 {
+            assert!(limiter.try_consume_at(start).is_none());
+        }
+        let wait = limiter
+            .try_consume_at(start)
+            .expect("fifth message in the same instant must wait");
+        assert!(wait >= Duration::from_millis(240) && wait <= Duration::from_millis(260));
+        assert!(limiter
+            .try_consume_at(start + Duration::from_millis(250))
+            .is_none());
+        assert_eq!(WS_BATCH_STREAMS, 20);
     }
 
     #[test]

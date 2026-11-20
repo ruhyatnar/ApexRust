@@ -19,7 +19,11 @@ export interface WsRelayContext {
   getDefaultEnv: () => BinanceEnv;
   getEngineBaseUrl: () => string;
   getEngineAuthToken: () => string;
-  authorizeUpgrade: (req: http.IncomingMessage, tokenFromQuery: string) => { ok: boolean; status?: number; reason?: string };
+  authorizeUpgrade: (
+    req: http.IncomingMessage,
+    tokenFromQuery: string,
+    ticketFromQuery: string
+  ) => { ok: boolean; status?: number; reason?: string };
 }
 
 const WS_MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -309,7 +313,8 @@ export function attachWebSocketRelay(server: http.Server, ctx: WsRelayContext): 
     }
 
     const tokenFromQuery = (parsedUrl.searchParams.get('token') ?? '').trim();
-    const auth = ctx.authorizeUpgrade(req, tokenFromQuery);
+    const ticketFromQuery = (parsedUrl.searchParams.get('ticket') ?? '').trim();
+    const auth = ctx.authorizeUpgrade(req, tokenFromQuery, ticketFromQuery);
     if (!auth.ok) {
       rejectHttpUpgrade(socket, auth.status ?? 401, auth.reason ?? 'Unauthorized');
       return;

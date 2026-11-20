@@ -2,12 +2,14 @@ import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import dotenv from 'dotenv';
 import express from 'express';
 import { OrderHistoryDatabase } from './src/engine/orderDatabase';
 import { BinanceScreenerHub } from './src/server/binanceScreenerHub';
+import { OrderCountTracker } from './src/server/orderCountTracker';
 import { attachWebSocketRelay } from './src/server/wsRelay';
 import { validateRemoteBaseUrl } from './src/engine/apiClient';
 import {
@@ -20,6 +22,7 @@ import {
   AuthFailureLimiter,
   type EngineAuthorityMode,
   LiveExecutionLeaseManager,
+  decideTokenAuth,
   evaluateBindSafety,
   evaluateEngineAuthorityGuard,
   isEnginePathAllowed,
@@ -34,6 +37,8 @@ import type {
   TrendingRankingSource,
 } from './src/engine/types';
 
+// Persisted UI secrets live outside `.env`; real process env still wins over both files.
+dotenv.config({ path: path.resolve(process.cwd(), '.apexrust/secrets.env') });
 dotenv.config();
 
 const execFileAsync = promisify(execFile);
@@ -145,7 +150,7 @@ const ORDER_LOGS_FILE = path.resolve(process.cwd(), '.apexrust-order-logs.json')
 
 function buildInitialPaperOrderLogs(): BackendOrderExecutionLog[] {
   const now = Date.now();
-  return [
+  const rows: BackendOrderExecutionLog[] = [
     {
       id: 'paper-seed-btc-exit',
       orderId: '510941',
@@ -329,6 +334,58 @@ function buildInitialPaperOrderLogs(): BackendOrderExecutionLog[] {
       timestampMs: now - 190 * 60 * 1000,
     },
   ];
+  // Mark every seeded row so analytics, PnL and exports can exclude it.
+  return rows.map((row) => ({ ...row, demo: true }));
+}
+
+/**
+ * Short-lived, single-use WebSocket tickets. Browsers cannot set an Authorization
+ * header on `new WebSocket(...)`, so the token used to be embedded in the URL and
+ * leaked into proxy logs; redeem a ticket instead.
+ */
+const WS_TICKET_TTL_MS = 30_000;
+const WS_TICKET_MAX_ENTRIES = 2_000;
+const wsTickets = new Map<string, { expiresAtMs: number }>();
+
+function issueWsTicket(): { ticket: string; expiresAtMs: number } {
+  const now = Date.now();
+  for (const [key, record] of wsTickets) {
+    if (record.expiresAtMs <= now) wsTickets.delete(key);
+  }
+  if (wsTickets.size >= WS_TICKET_MAX_ENTRIES) {
+    const oldest = wsTickets.keys().next().value;
+    if (oldest) wsTickets.delete(oldest);
+  }
+  const ticket = crypto.randomBytes(32).toString('base64url');
+  const expiresAtMs = now + WS_TICKET_TTL_MS;
+  wsTickets.set(ticket, { expiresAtMs });
+  return { ticket, expiresAtMs };
+}
+
+/** Single-use: a presented ticket is consumed even when it already expired. */
+function redeemWsTicket(ticket: string): boolean {
+  if (!ticket) return false;
+  const record = wsTickets.get(ticket);
+  wsTickets.delete(ticket);
+  return Boolean(record && record.expiresAtMs > Date.now());
+}
+
+/**
+ * Normalize an address for rate-limit keying: strip brackets/zones, reject junk,
+ * and collapse IPv4-mapped IPv6 (`::ffff:1.2.3.4`) to plain IPv4 so one client
+ * can never hold two independent lockout buckets.
+ */
+function normalizeClientIp(raw: string): string {
+  const cleaned = raw
+    .trim()
+    .replace(/^\[|\]$/g, '')
+    .split('%')[0]
+    .trim();
+  if (!cleaned || net.isIP(cleaned) === 0) return '';
+  if (/^::ffff:\d{1,3}(?:\.\d{1,3}){3}$/i.test(cleaned)) {
+    return cleaned.slice('::ffff:'.length).toLowerCase();
+  }
+  return cleaned.toLowerCase();
 }
 
 function sanitizeSymbol(raw: unknown, fallback = ''): string {
@@ -338,14 +395,21 @@ function sanitizeSymbol(raw: unknown, fallback = ''): string {
   return clean || fallback;
 }
 
+/** Showcase rows are opt-in and never fabricated for a Production vault. */
+const DEMO_SEED_ENABLED =
+  (process.env.APEXRUST_DEMO_SEED ?? '').trim().toLowerCase() === 'true' &&
+  vault.environment !== 'Production';
+
 const orderHistoryDb = new OrderHistoryDatabase({
   dbPath: ORDER_DB_FILE,
   legacyJsonPath: ORDER_LOGS_FILE,
   maxLiveQuota: 5000,
   maxPaperQuota: 1000,
-  seedInitialPaperLogs: buildInitialPaperOrderLogs,
+  seedInitialPaperLogs: DEMO_SEED_ENABLED ? buildInitialPaperOrderLogs : undefined,
+  purgeDemoLogs: !DEMO_SEED_ENABLED,
 });
 const screenerHub = new BinanceScreenerHub();
+const orderCountTracker = new OrderCountTracker();
 
 function maskApiKey(key: string): string | null {
   const clean = key.trim();
@@ -440,10 +504,51 @@ interface SymbolFilters {
   minNotional: number;
   maxNotional: number;
   quoteDecimals: number;
+  /** PERCENT_PRICE(_BY_SIDE) envelopes relative to the average price. */
+  percentPriceUp: number;
+  percentPriceDown: number;
+  bidMultiplierUp: number;
+  bidMultiplierDown: number;
+  askMultiplierUp: number;
+  askMultiplierDown: number;
+  avgPriceMins: number;
+  /** True when these values came from the heuristic fallback instead of exchangeInfo. */
+  degraded?: boolean;
   fetchedAtMs: number;
 }
 
 const symbolFilterCache = new Map<string, SymbolFilters>();
+const symbolFilterBackoffUntil = new Map<string, number>();
+
+/**
+ * Binance rejects limit prices outside PERCENT_PRICE(_BY_SIDE) relative to the
+ * rolling average price. Validating locally yields an actionable error instead
+ * of an opaque exchange rejection after signing.
+ */
+function validatePercentPrice(
+  filters: SymbolFilters,
+  price: number,
+  refPrice: number,
+  side: 'BUY' | 'SELL'
+): string | null {
+  if (filters.degraded || !(price > 0) || !(refPrice > 0)) return null;
+  const isBuy = side === 'BUY';
+  const up = Math.max(
+    isBuy ? filters.bidMultiplierUp : filters.askMultiplierUp,
+    filters.percentPriceUp
+  );
+  const down = Math.min(
+    isBuy ? filters.bidMultiplierDown : filters.askMultiplierDown,
+    filters.percentPriceDown || Number.POSITIVE_INFINITY
+  );
+  if (up > 0 && price > refPrice * up) {
+    return `Price ${price} exceeds Binance PERCENT_PRICE ceiling (${(refPrice * up).toFixed(8)} = ${up}x reference).`;
+  }
+  if (down > 0 && Number.isFinite(down) && price < refPrice * down) {
+    return `Price ${price} is below Binance PERCENT_PRICE floor (${(refPrice * down).toFixed(8)} = ${down}x reference).`;
+  }
+  return null;
+}
 
 function countStepDecimals(stepStr: string): number {
   if (!stepStr) return 0;
@@ -476,7 +581,8 @@ async function getSymbolFilters(
 ): Promise<SymbolFilters> {
   const key = `${env}:${venue}:${symbol}`;
   const cached = symbolFilterCache.get(key);
-  if (cached && Date.now() - cached.fetchedAtMs < 600_000) {
+  const backoffUntilMs = symbolFilterBackoffUntil.get(key) ?? 0;
+  if (cached && (Date.now() - cached.fetchedAtMs < 600_000 || Date.now() < backoffUntilMs)) {
     return cached;
   }
 
@@ -489,6 +595,20 @@ async function getSymbolFilters(
     const resp = await fetch(infoPath, {
       signal: AbortSignal.timeout(4000),
     });
+    // exchangeInfo consumes real IP weight; account for it and honour 429/418 backoff.
+    screenerHub.reportRestHeaders(
+      env,
+      venue,
+      resp.status,
+      resp.headers.get('x-mbx-used-weight-1m'),
+      resp.headers.get('retry-after')
+    );
+    if (resp.status === 429 || resp.status === 418) {
+      const retrySec = Number(resp.headers.get('retry-after') ?? 0);
+      const waitMs = Number.isFinite(retrySec) && retrySec > 0 ? retrySec * 1000 : 15_000;
+      symbolFilterBackoffUntil.set(key, Date.now() + waitMs);
+      if (cached) return cached;
+    }
     if (resp.ok) {
       const payload = (await resp.json()) as {
         symbols?: Array<{
@@ -507,6 +627,13 @@ async function getSymbolFilters(
             minNotional?: string;
             notional?: string;
             maxNotional?: string;
+            multiplierUp?: string;
+            multiplierDown?: string;
+            bidMultiplierUp?: string;
+            bidMultiplierDown?: string;
+            askMultiplierUp?: string;
+            askMultiplierDown?: string;
+            avgPriceMins?: number;
           }>;
         }>;
       };
@@ -521,6 +648,9 @@ async function getSymbolFilters(
         const marketLotFilter = filters.find((f) => f.filterType === 'MARKET_LOT_SIZE') ?? lotFilter;
         const notionalFilter = filters.find(
           (f) => f.filterType === 'NOTIONAL' || f.filterType === 'MIN_NOTIONAL'
+        );
+        const percentFilter = filters.find(
+          (f) => f.filterType === 'PERCENT_PRICE' || f.filterType === 'PERCENT_PRICE_BY_SIDE'
         );
         const tickStr = priceFilter?.tickSize ?? defaultTickStr;
         const stepStr = lotFilter?.stepSize ?? defaultStepStr;
@@ -546,9 +676,20 @@ async function getSymbolFilters(
           marketStepDecimals: countStepDecimals(mktStepStr),
           marketMinQty: Number(marketLotFilter?.minQty ?? lotFilter?.minQty ?? 0) || 0,
           marketMaxQty: Number(marketLotFilter?.maxQty ?? lotFilter?.maxQty ?? 0) || 0,
-          minNotional: Number(notionalFilter?.minNotional ?? notionalFilter?.notional ?? 0) || 5,
+          minNotional: Number(notionalFilter?.minNotional ?? notionalFilter?.notional ?? 0) || 0,
           maxNotional: Number(notionalFilter?.maxNotional ?? 0) || 0,
           quoteDecimals,
+          percentPriceUp: Number(percentFilter?.multiplierUp ?? 0) || 0,
+          percentPriceDown: Number(percentFilter?.multiplierDown ?? 0) || 0,
+          bidMultiplierUp: Number(percentFilter?.bidMultiplierUp ?? percentFilter?.multiplierUp ?? 0) || 0,
+          bidMultiplierDown: Number(
+            percentFilter?.bidMultiplierDown ?? percentFilter?.multiplierDown ?? 0
+          ) || 0,
+          askMultiplierUp: Number(percentFilter?.askMultiplierUp ?? percentFilter?.multiplierUp ?? 0) || 0,
+          askMultiplierDown: Number(
+            percentFilter?.askMultiplierDown ?? percentFilter?.multiplierDown ?? 0
+          ) || 0,
+          avgPriceMins: Number(percentFilter?.avgPriceMins ?? 5) || 5,
           fetchedAtMs: nowMs,
         };
         symbolFilterCache.set(`${env}:${venue}:${sEntry.symbol}`, resolvedEntry);
@@ -577,9 +718,17 @@ async function getSymbolFilters(
     marketStepDecimals: stepDecimals,
     marketMinQty: stepSize,
     marketMaxQty: 0,
-    minNotional: 5,
+    minNotional: 0,
     maxNotional: 0,
     quoteDecimals: 2,
+    percentPriceUp: 0,
+    percentPriceDown: 0,
+    bidMultiplierUp: 0,
+    bidMultiplierDown: 0,
+    askMultiplierUp: 0,
+    askMultiplierDown: 0,
+    avgPriceMins: 5,
+    degraded: true,
     fetchedAtMs: Date.now(),
   };
 }
@@ -655,14 +804,6 @@ function captureVaultAuthSnapshot(): VaultAuthSnapshot {
   };
 }
 
-function safeTokenMatch(provided: string, expected: string): boolean {
-  if (!provided || !expected) return false;
-  const a = Buffer.from(provided, 'utf8');
-  const b = Buffer.from(expected, 'utf8');
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
-}
-
 async function getSyncedBinanceTimestamp(
   venue: ExchangeVenue,
   env: BinanceEnv = vault.environment,
@@ -734,6 +875,7 @@ async function signedBinanceRequest(
     const latencyMs = Date.now() - startedAt;
     const rawUsedWeight = resp.headers.get('x-mbx-used-weight-1m');
     const usedWeight1m = Number(rawUsedWeight ?? 0) || undefined;
+    orderCountTracker.report(authSnap.environment, venue, resp.headers);
     screenerHub.reportRestHeaders(
       authSnap.environment,
       venue,
@@ -877,6 +1019,8 @@ function sanitizeRemoteUrl(url: string): string {
 
 function isValidGitRemote(url: string): boolean {
   const clean = url.trim();
+  // Credentials in the URL end up in plaintext in .git/config; require SSH or a credential helper.
+  if (/\/\/[^/@]+@/.test(clean)) return false;
   return (
     /^https:\/\/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=-]+$/.test(clean) ||
     /^git@[A-Za-z0-9._-]+:[A-Za-z0-9._/-]+(\.git)?$/.test(clean) ||
@@ -1220,6 +1364,47 @@ function formatDotEnvScalar(value: string): string {
   return value;
 }
 
+function upsertEnvLines(raw: string, updates: Record<string, string>): string {
+  const lines = raw ? raw.split(/\r?\n/) : [];
+  const seen = new Set<string>();
+  const nextLines = lines.map((line) => {
+    const trimmed = line.trim();
+    const isCommented = trimmed.startsWith('#');
+    for (const [k, v] of Object.entries(updates)) {
+      const re = new RegExp(`^\\s*#?\\s*${k}\\s*=`);
+      if (re.test(line)) {
+        seen.add(k);
+        // Do not uncomment commented template lines when persisting an empty/cleared value
+        if (isCommented && v === '') {
+          return line;
+        }
+        return `${k}=${formatDotEnvScalar(v)}`;
+      }
+    }
+    return line;
+  });
+  for (const [k, v] of Object.entries(updates)) {
+    if (!seen.has(k) && v !== '') {
+      nextLines.push(`${k}=${formatDotEnvScalar(v)}`);
+    }
+  }
+  return `${nextLines.join('\n').replace(/\n+$/, '')}\n`;
+}
+
+function writeOwnerOnlyFile(filePath: string, content: string): void {
+  fs.writeFileSync(filePath, content, { encoding: 'utf8', mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // Ignore chmod error on Windows
+  }
+}
+
+/**
+ * Split vault persistence: operational settings stay in `.env`, while API keys
+ * and secrets go to `.apexrust/secrets.env` (gitignored, chmod 600). This keeps
+ * the documented contract that `.env` never receives credentials from the UI.
+ */
 function persistVaultToDotEnvIfEnabled(): boolean {
   if ((process.env.APEXRUST_PERSIST_VAULT ?? '').trim().toLowerCase() !== 'true') {
     return false;
@@ -1227,7 +1412,6 @@ function persistVaultToDotEnvIfEnabled(): boolean {
   try {
     const envPath = path.resolve(process.cwd(), '.env');
     const raw = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-    const lines = raw ? raw.split(/\r?\n/) : [];
     const updates: Record<string, string> = {
       BINANCE_ENVIRONMENT: vault.environment,
       BINANCE_VENUE: vault.venue,
@@ -1237,45 +1421,24 @@ function persistVaultToDotEnvIfEnabled(): boolean {
       APEXRUST_MAX_ORDER_NOTIONAL_USDT: String(vault.maxOrderNotionalUsdt),
       APEXRUST_REQUIRE_PREFLIGHT: vault.requirePreflightTestOrder ? 'true' : 'false',
       BINANCE_AUTH_METHOD: vault.authMethod,
-      BINANCE_API_KEY: vault.apiKey,
-      BINANCE_API_SECRET: vault.authMethod === 'HMAC-SHA256' ? vault.apiSecret : '',
-      BINANCE_ED25519_PRIVATE_KEY: vault.authMethod === 'Ed25519' ? vault.apiSecret : '',
-      BINANCE_PRIVATE_KEY_PATH: '',
     };
-    const seen = new Set<string>();
-    const nextLines = lines.map((line) => {
-      const trimmed = line.trim();
-      const isCommented = trimmed.startsWith('#');
-      for (const [k, v] of Object.entries(updates)) {
-        const re = new RegExp(`^\\s*#?\\s*${k}\\s*=`);
-        if (re.test(line)) {
-          seen.add(k);
-          // Do not uncomment commented template lines when persisting an empty/cleared value
-          if (isCommented && v === '') {
-            return line;
-          }
-          return `${k}=${formatDotEnvScalar(v)}`;
-        }
-      }
-      return line;
-    });
-    for (const [k, v] of Object.entries(updates)) {
-      if (!seen.has(k) && v !== '') {
-        nextLines.push(`${k}=${formatDotEnvScalar(v)}`);
-      }
-    }
-    fs.writeFileSync(envPath, `${nextLines.join('\n').replace(/\n+$/, '')}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
-    try {
-      fs.chmodSync(envPath, 0o600);
-    } catch {
-      // Ignore chmod error on Windows
-    }
+    writeOwnerOnlyFile(envPath, upsertEnvLines(raw, updates));
+
+    const secretsDir = path.resolve(process.cwd(), '.apexrust');
+    fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    const secretsPath = path.join(secretsDir, 'secrets.env');
+    const secretsRaw = fs.existsSync(secretsPath) ? fs.readFileSync(secretsPath, 'utf8') : '';
+    writeOwnerOnlyFile(
+      secretsPath,
+      upsertEnvLines(secretsRaw, {
+        BINANCE_API_KEY: vault.apiKey,
+        BINANCE_API_SECRET: vault.authMethod === 'HMAC-SHA256' ? vault.apiSecret : '',
+        BINANCE_ED25519_PRIVATE_KEY: vault.authMethod === 'Ed25519' ? vault.apiSecret : '',
+      })
+    );
     return true;
   } catch (err) {
-    console.warn('[server] Failed to persist vault to .env:', err instanceof Error ? err.message : String(err));
+    console.warn('[server] Failed to persist vault:', err instanceof Error ? err.message : String(err));
     return false;
   }
 }
@@ -1342,19 +1505,19 @@ async function bootstrapServer() {
   app.use(express.json({ limit: '256kb' }));
 
   function resolveClientIp(req: http.IncomingMessage & { ip?: string }): string {
-    const remoteAddr = String(req.socket.remoteAddress ?? '').trim();
-    const isLoopbackPeer =
-      remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
+    const remoteAddr = normalizeClientIp(String(req.socket.remoteAddress ?? ''));
+    const isLoopbackPeer = remoteAddr === '::1' || remoteAddr.startsWith('127.');
     const hasCloudflareProxyHeader =
       Boolean(req.headers['cf-ray']) || Boolean(req.headers['cf-access-authenticated-user-email']);
     const cfConnectingIp =
       typeof req.headers['cf-connecting-ip'] === 'string'
-        ? req.headers['cf-connecting-ip'].trim()
+        ? normalizeClientIp(req.headers['cf-connecting-ip'])
         : '';
     if ((isLoopbackPeer || trustProxyRaw === 'true' || trustProxyRaw === '1') && hasCloudflareProxyHeader && cfConnectingIp) {
       return cfConnectingIp;
     }
-    return String(req.ip || remoteAddr || 'unknown');
+    // Normalize IPv4-mapped IPv6 so the same client always maps to one lockout key.
+    return normalizeClientIp(String(req.ip ?? '')) || remoteAddr || 'unknown';
   }
 
   const asyncRoute =
@@ -1374,7 +1537,12 @@ async function bootstrapServer() {
       (origin.toLowerCase() === `http://${hostHeader}` ||
         origin.toLowerCase() === `https://${hostHeader}`);
     if (origin && (isSelfOrigin || isOriginAllowed(origin, allowedOrigins))) {
-      res.setHeader('Access-Control-Allow-Origin', allowedOrigins.includes('*') ? '*' : origin);
+      // A wildcard origin plus an access token lets any site drive the API; echo the origin instead.
+      const proxyTokenConfigured = Boolean((process.env.APEXRUST_PROXY_TOKEN ?? '').trim());
+      res.setHeader(
+        'Access-Control-Allow-Origin',
+        allowedOrigins.includes('*') && !proxyTokenConfigured ? '*' : origin
+      );
       res.setHeader('Vary', 'Origin');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
       res.setHeader(
@@ -1392,39 +1560,46 @@ async function bootstrapServer() {
     next();
   });
 
-  function isRequestTokenAuthorized(req: express.Request): {
+  type TokenAuthResult = {
     ok: boolean;
     status?: number;
     error?: string;
-  } {
+    retryAfterSeconds?: number;
+  };
+
+  function isRequestTokenAuthorized(
+    req: express.Request,
+    opts?: { probe?: boolean }
+  ): TokenAuthResult {
     const configuredToken = (process.env.APEXRUST_PROXY_TOKEN ?? '').trim();
     if (!configuredToken) {
       return { ok: true };
     }
     const clientIp = resolveClientIp(req);
-    if (authFailureLimiter.isLocked(clientIp)) {
-      return {
-        ok: false,
-        status: 429,
-        error: 'Too many failed token attempts from this IP. Try again in 5 minutes.',
-      };
-    }
-    const headerToken = String(req.headers['x-apexrust-token'] ?? '').trim();
     const authHeader = String(req.headers.authorization ?? '').trim();
-    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-    if (
-      !safeTokenMatch(headerToken, configuredToken) &&
-      !safeTokenMatch(bearerToken, configuredToken)
-    ) {
-      authFailureLimiter.recordFailure(clientIp);
-      return {
-        ok: false,
-        status: 401,
-        error: 'Unauthorized: missing or invalid Access Token (APEXRUST_PROXY_TOKEN).',
-      };
+    const decision = decideTokenAuth({
+      configuredToken,
+      candidates: [
+        String(req.headers['x-apexrust-token'] ?? '').trim(),
+        authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '',
+      ],
+      locked: authFailureLimiter.isLocked(clientIp),
+      retryAfterSeconds: authFailureLimiter.retryAfterSeconds(clientIp),
+      isProbe: opts?.probe,
+    });
+    if (decision.ok) {
+      authFailureLimiter.recordSuccess(clientIp);
+      return { ok: true };
     }
-    authFailureLimiter.recordSuccess(clientIp);
-    return { ok: true };
+    if (decision.recordFailure) {
+      authFailureLimiter.recordFailure(clientIp);
+    }
+    return {
+      ok: false,
+      status: decision.status,
+      error: decision.error,
+      retryAfterSeconds: decision.retryAfterSeconds,
+    };
   }
 
   // Reject unapproved cross-origin browser requests (both reads & writes) and enforce optional APEXRUST_PROXY_TOKEN
@@ -1452,10 +1627,22 @@ async function bootstrapServer() {
     }
     const authCheck = isRequestTokenAuthorized(req);
     if (!authCheck.ok) {
-      res.status(authCheck.status ?? 401).json({ error: authCheck.error });
+      if (authCheck.status === 429 && authCheck.retryAfterSeconds) {
+        res.setHeader('Retry-After', String(authCheck.retryAfterSeconds));
+      }
+      res.status(authCheck.status ?? 401).json({
+        error: authCheck.error,
+        ...(authCheck.retryAfterSeconds ? { retryAfterSeconds: authCheck.retryAfterSeconds } : {}),
+      });
       return;
     }
     next();
+  });
+
+  // Issues a single-use ticket for the WebSocket handshake (token never enters the URL).
+  app.post('/api/ws-ticket', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ok: true, ...issueWsTicket() });
   });
 
   app.get(['/api/health', '/_ah/health'], (_req, res) => {
@@ -1471,7 +1658,7 @@ async function bootstrapServer() {
 
   app.get('/api/connection/info', asyncRoute(async (req, res) => {
     const configuredToken = (process.env.APEXRUST_PROXY_TOKEN ?? '').trim();
-    const authCheck = isRequestTokenAuthorized(req);
+    const authCheck = isRequestTokenAuthorized(req, { probe: true });
     const zeroTrustEmail =
       typeof req.headers['cf-access-authenticated-user-email'] === 'string'
         ? req.headers['cf-access-authenticated-user-email'].trim()
@@ -1484,6 +1671,7 @@ async function bootstrapServer() {
         apiVersion: API_VERSION,
         authRequired: configuredToken.length > 0,
         error: authCheck.error,
+        ...(authCheck.retryAfterSeconds ? { retryAfterSeconds: authCheck.retryAfterSeconds } : {}),
       });
       return;
     }
@@ -2246,6 +2434,11 @@ async function bootstrapServer() {
         res.status(400).json({ error: `Price ${formattedPrice} exceeds Binance maxPrice (${filters.maxPrice}).` });
         return;
       }
+      const percentPriceError = validatePercentPrice(filters, priceNum, refPrice, side);
+      if (percentPriceError) {
+        res.status(400).json({ error: percentPriceError });
+        return;
+      }
       if (filters.minQty > 0 && qtyNum < filters.minQty) {
         res.status(400).json({ error: `Quantity ${formattedQty} below Binance minQty (${filters.minQty}).` });
         return;
@@ -2273,6 +2466,19 @@ async function bootstrapServer() {
       } else if (baseEntryType === 'LIMIT') {
         orderParams.timeInForce = tif;
       }
+    }
+
+    // Refuse before the exchange counts this order against a 10s/1m ban threshold.
+    const orderRate = orderCountTracker.check(authSnap.environment, venue);
+    if (orderRate.constrained) {
+      if (orderRate.retryAfterSeconds) {
+        res.setHeader('Retry-After', String(orderRate.retryAfterSeconds));
+      }
+      res.status(429).json({
+        error: orderRate.reason,
+        retryAfterSeconds: orderRate.retryAfterSeconds,
+      });
+      return;
     }
 
     const orderEndpoint = venue === 'Futures' ? '/fapi/v1/order' : '/api/v3/order';
@@ -4499,7 +4705,8 @@ async function bootstrapServer() {
     if (!cleanUrl || !isValidGitRemote(cleanUrl)) {
       res.status(400).json({
         ok: false,
-        error: 'Provide a valid HTTPS or SSH git remote URL (e.g., https://github.com/user/apexrust-backup.git).',
+        error:
+          'Provide a valid HTTPS or SSH git remote URL without embedded credentials (e.g., git@github.com:user/apexrust-backup.git). Use SSH keys or a git credential helper for authentication.',
       });
       return;
     }
@@ -4771,7 +4978,7 @@ async function bootstrapServer() {
     getDefaultEnv: () => vault.environment,
     getEngineBaseUrl,
     getEngineAuthToken,
-    authorizeUpgrade: (req, tokenFromQuery) => {
+    authorizeUpgrade: (req, tokenFromQuery, ticketFromQuery) => {
       const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
       const allowedOrigins = parseAllowedOrigins(process.env.APEXRUST_ALLOWED_ORIGINS);
       const hostHeader = typeof req.headers.host === 'string' ? req.headers.host.trim().toLowerCase() : '';
@@ -4783,26 +4990,41 @@ async function bootstrapServer() {
       if (origin && !isSelfOrigin && !isOriginAllowed(origin, allowedOrigins)) {
         return { ok: false, status: 403, reason: 'WebSocket origin blocked' };
       }
+      if (ticketFromQuery) {
+        return redeemWsTicket(ticketFromQuery)
+          ? { ok: true }
+          : { ok: false, status: 401, reason: 'Invalid or expired WebSocket ticket' };
+      }
       if (!configuredToken) {
         return { ok: true };
       }
       const clientIp = resolveClientIp(req);
-      if (authFailureLimiter.isLocked(clientIp)) {
-        return { ok: false, status: 429, reason: 'Too many failed token attempts' };
-      }
-      const headerToken = String(req.headers['x-apexrust-token'] ?? '').trim();
       const authHeader = String(req.headers.authorization ?? '').trim();
-      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-      if (
-        safeTokenMatch(tokenFromQuery, configuredToken) ||
-        safeTokenMatch(headerToken, configuredToken) ||
-        safeTokenMatch(bearerToken, configuredToken)
-      ) {
+      const decision = decideTokenAuth({
+        configuredToken,
+        candidates: [
+          tokenFromQuery,
+          String(req.headers['x-apexrust-token'] ?? '').trim(),
+          authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '',
+        ],
+        locked: authFailureLimiter.isLocked(clientIp),
+        retryAfterSeconds: authFailureLimiter.retryAfterSeconds(clientIp),
+      });
+      if (decision.ok) {
         authFailureLimiter.recordSuccess(clientIp);
         return { ok: true };
       }
-      authFailureLimiter.recordFailure(clientIp);
-      return { ok: false, status: 401, reason: 'Unauthorized WebSocket token' };
+      if (decision.recordFailure) {
+        authFailureLimiter.recordFailure(clientIp);
+      }
+      return {
+        ok: false,
+        status: decision.status,
+        reason:
+          decision.status === 429
+            ? 'Too many failed token attempts'
+            : 'Unauthorized WebSocket token',
+      };
     },
   });
 

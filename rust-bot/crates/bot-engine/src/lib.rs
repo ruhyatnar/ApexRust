@@ -15,7 +15,10 @@ use bot_core::{
     TradingConfig, TrendingCategory, TrendingRankingSource, VolatilitySpikeAlert,
     WatchlistDwellState,
 };
-use bot_exchange::{CancelOrderOutcome, FailoverGateway, LiveOrderAck, LiveOrderRequest, WsStreamEvent};
+use bot_exchange::{
+    CancelOrderOutcome, FailoverGateway, LiveOrderAck, LiveOrderRequest, UserDataStream,
+    UserStreamEvent, WsStreamEvent,
+};
 use bot_indicators::IndicatorPipeline;
 use bot_risk::{
     compute_expectancy_and_profit_factor, compute_kelly_fraction, compute_log_growth_rate,
@@ -1263,6 +1266,15 @@ impl TradingEngine {
         let (mkt_tx, mut mkt_rx) = mpsc::channel::<WsStreamEvent>(1024);
         Arc::clone(&self.gateway).spawn_with_events(mkt_tx, trading_cfg.ranking_source);
 
+        // Account/order push events: let fills and cancels wake reconciliation
+        // immediately instead of waiting for the next 3s REST polling tick.
+        let (user_evt_tx, mut user_evt_rx) = mpsc::channel::<UserStreamEvent>(256);
+        if !self.cfg.exchange.paper_trading {
+            UserDataStream::new(self.cfg.exchange.clone()).spawn(user_evt_tx);
+        } else {
+            drop(user_evt_tx);
+        }
+
         let mut reconcile_tick = tokio::time::interval(Duration::from_secs(3));
         reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchlist_tick = tokio::time::interval(Duration::from_secs(30));
@@ -2104,6 +2116,31 @@ impl TradingEngine {
                     }
                     if changed {
                         self.publish_snapshot(running, &risk, &last_prices, &pipelines, &open_positions, &pending_orders, &bar_index, &recent_trades, &recent_volatility_alerts).await;
+                    }
+                }
+                Some(user_ev) = user_evt_rx.recv() => {
+                    match user_ev {
+                        UserStreamEvent::OrderUpdate(update) => {
+                            if pending_orders.contains_key(&update.symbol) {
+                                info!(
+                                    symbol = %update.symbol,
+                                    status = %update.status,
+                                    filled_qty = update.executed_qty,
+                                    avg_price = update.avg_price,
+                                    reduce_only = update.reduce_only,
+                                    "User data stream order update"
+                                );
+                                if self.is_live_armed() {
+                                    // Trigger the pending-order reconciler now rather than
+                                    // waiting up to one polling interval for the fill.
+                                    reconcile_tick.reset();
+                                }
+                            }
+                        }
+                        UserStreamEvent::ListenKeyExpired => {
+                            warn!("Binance user data stream key expired; driver is reconnecting");
+                        }
+                        UserStreamEvent::AccountUpdate | UserStreamEvent::Other => {}
                     }
                 }
                 Some(ws_ev) = mkt_rx.recv() => {

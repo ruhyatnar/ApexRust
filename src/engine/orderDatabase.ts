@@ -51,6 +51,13 @@ interface OrderDatabaseOptions {
   maxLiveQuota?: number;
   maxPaperQuota?: number;
   seedInitialPaperLogs?: () => OrderExecutionLog[];
+  /** Drop previously seeded demo rows (default: false so the caller stays explicit). */
+  purgeDemoLogs?: boolean;
+}
+
+/** Seeded showcase rows are identified by the flag or their legacy id prefix. */
+export function isDemoOrderLog(log: OrderExecutionLog): boolean {
+  return log.demo === true || log.id.startsWith('paper-seed-');
 }
 
 function normalizeLog(item: OrderExecutionLog): OrderExecutionLog {
@@ -253,8 +260,36 @@ export class OrderHistoryDatabase {
       }
     }
 
+    if (options.purgeDemoLogs) {
+      this.purgeDemoLogs();
+    }
+
+    // Demo rows are opt-in only; they must never be fabricated in a live ledger.
     if (this.logs.length === 0 && options.seedInitialPaperLogs) {
       this.upsertLogs(options.seedInitialPaperLogs());
+    }
+  }
+
+  private purgeDemoLogs(): void {
+    const demoIds = this.logs.filter(isDemoOrderLog).map((log) => log.id);
+    if (demoIds.length === 0) return;
+    this.logs = this.logs.filter((log) => !isDemoOrderLog(log));
+    this.lastUpdatedAtMs = Date.now();
+    if (!this.sqlite) {
+      this.persistAll();
+      return;
+    }
+    try {
+      this.sqlite.exec('BEGIN IMMEDIATE TRANSACTION;');
+      const stmt = this.sqlite.prepare('DELETE FROM order_history WHERE id = ?');
+      for (const id of demoIds) stmt.run(id);
+      this.sqlite.exec('COMMIT;');
+    } catch {
+      try {
+        this.sqlite.exec('ROLLBACK;');
+      } catch {
+        // Ignore rollback error
+      }
     }
   }
 
