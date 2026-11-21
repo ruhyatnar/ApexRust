@@ -506,6 +506,7 @@ test('setVenue switches Spot/Futures endpoints and Futures leverage scales locke
     trading: {
       ...DEFAULT_BOT_CONFIG.trading,
       venue: 'Futures' as const,
+      maxLeverage: 5,
       leverage: 5,
       marginType: 'ISOLATED' as const,
     },

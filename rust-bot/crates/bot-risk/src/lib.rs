@@ -7,6 +7,10 @@
 //! - Max consecutive win streak & lose streak cooldown/halt
 //! - Global emergency circuit breaker
 
+mod btc_guard;
+
+pub use btc_guard::BtcRegimeGuard;
+
 use bot_core::{
     BotError, CircuitBreakerState, Result, RiskConfig, RiskStatus, TradingConfig,
 };
@@ -27,6 +31,7 @@ pub struct RiskManager {
     state: CircuitBreakerState,
     halt_reason: Option<String>,
     cooldown_until: Option<DateTime<Utc>>,
+    btc_guard: BtcRegimeGuard,
 }
 
 impl RiskManager {
@@ -45,7 +50,23 @@ impl RiskManager {
             state: CircuitBreakerState::Active,
             halt_reason: None,
             cooldown_until: None,
+            btc_guard: BtcRegimeGuard::new(),
         }
+    }
+
+    /// Feeds a BTCUSDT reference price into the crash guard.
+    pub fn observe_btc_price(&mut self, price: f64, now: DateTime<Utc>) {
+        self.btc_guard.observe(price, now, &self.risk_cfg);
+    }
+
+    /// BTC move (%) across the guard window, or `None` when stale/absent.
+    pub fn btc_change_pct(&self, now: DateTime<Utc>) -> Option<f64> {
+        self.btc_guard.change_pct(now, &self.risk_cfg)
+    }
+
+    /// True when the BTC crash guard is currently blocking new entries.
+    pub fn btc_guard_blocking(&self, now: DateTime<Utc>) -> bool {
+        self.btc_guard.is_blocking(now, &self.risk_cfg)
     }
 
     /// Reset daily drawdown/profit/quarantine counters when UTC midnight passes.
@@ -101,6 +122,19 @@ impl RiskManager {
                 "{symbol} reached max per-pair daily drawdown"
             )));
         }
+
+        if self.btc_guard.is_blocking(now, &self.risk_cfg) {
+            let change_pct = self.btc_guard.change_pct(now, &self.risk_cfg).unwrap_or(0.0);
+            let reason = format!(
+                "BTC crash guard: BTC {:.2}% in {}m (limit -{:.2}%)",
+                change_pct,
+                self.risk_cfg.btc_crash_window_minutes.max(1),
+                self.risk_cfg.btc_crash_threshold_pct.abs()
+            );
+            self.btc_guard.set_block_reason(Some(reason.clone()));
+            return Err(BotError::RiskRejected(reason));
+        }
+        self.btc_guard.clear();
 
         if open_positions_count >= self.trading_cfg.max_concurrent_positions {
             return Err(BotError::RiskRejected(
@@ -206,6 +240,7 @@ impl RiskManager {
         self.lose_streak = 0;
         self.win_streak = 0;
         self.quarantined_pairs.clear();
+        self.btc_guard.clear();
     }
 
     pub fn current_equity(&self) -> f64 {
@@ -234,6 +269,9 @@ impl RiskManager {
             win_streak: self.win_streak,
             lose_streak: self.lose_streak,
             quarantined_pairs: self.quarantined_pairs.iter().cloned().collect(),
+            btc_change_pct_window: self.btc_guard.change_pct(Utc::now(), &self.risk_cfg),
+            btc_window_minutes: self.risk_cfg.btc_crash_window_minutes.max(1),
+            btc_guard_blocking: self.btc_guard.is_blocking(Utc::now(), &self.risk_cfg),
         }
     }
 }
@@ -322,6 +360,10 @@ mod tests {
             max_lose_streak: 5,
             streak_cooldown_minutes: 30,
             flatten_on_circuit_breaker: true,
+            btc_crash_guard_enabled: false,
+            btc_crash_threshold_pct: 1.5,
+            btc_crash_window_minutes: 15,
+            btc_crash_max_staleness_sec: 120,
         };
         let trading_cfg = TradingConfig {
             mode: StrategyMode::Scalping,
@@ -352,6 +394,10 @@ mod tests {
             max_lose_streak: 0,
             streak_cooldown_minutes: 30,
             flatten_on_circuit_breaker: true,
+            btc_crash_guard_enabled: false,
+            btc_crash_threshold_pct: 1.5,
+            btc_crash_window_minutes: 15,
+            btc_crash_max_staleness_sec: 120,
         };
         let trading_cfg = TradingConfig {
             mode: StrategyMode::Scalping,

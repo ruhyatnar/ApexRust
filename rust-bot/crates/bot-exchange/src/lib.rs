@@ -9,12 +9,14 @@ pub mod binance_rest;
 pub mod binance_ws;
 pub mod failover;
 pub mod user_stream;
+pub mod ws_api;
 
 pub use binance_futures::BinanceFuturesClient;
 pub use binance_rest::BinanceRestClient;
 pub use binance_ws::{BinanceWsDriver, WsStreamEvent};
 pub use user_stream::{OrderUpdate, UserDataStream, UserStreamEvent};
 pub use failover::{FailoverGateway, FailoverHealth};
+pub use ws_api::{WsApiClient, WsApiCredentials};
 
 use binance_sdk::config::{ConfigurationRestApi, PrivateKey};
 use bot_core::{
@@ -433,6 +435,9 @@ pub(crate) fn parse_ticker_24h_array(
             in_watchlist: false,
             source_tag: None,
             updated_at_ms: r.get("closeTime").and_then(|v| v.as_i64()).unwrap_or(now_ms),
+            rvol_1h: None,
+            momentum_1h_pct: None,
+            cts_score: None,
         });
     }
     out

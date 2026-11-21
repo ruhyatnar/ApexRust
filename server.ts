@@ -1093,6 +1093,8 @@ const DEFAULT_FEATURE_TOGGLES: Record<string, boolean> = {
   adx_strength_filter: true,
   vwap_bias_filter: true,
   volume_confirmation_filter: false,
+  htf_trend_filter: false,
+  obi_entry_filter: false,
   session_window_filter: false,
   atr_dynamic_exits: true,
   take_profit_ladder: true,
@@ -1154,9 +1156,14 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
   const trendingCatLower =
     trendingCatRaw === 'top_gainers' ||
     trendingCatRaw === 'top_losers' ||
-    trendingCatRaw === 'volatility_leaders'
+    trendingCatRaw === 'volatility_leaders' ||
+    trendingCatRaw === 'cts_momentum'
       ? trendingCatRaw
       : 'hot_volume';
+  const maxLeverage = Math.min(
+    20,
+    Math.max(1, Math.round(tomlNum(trading.maxLeverage, 3)))
+  );
   const rankingSourceRaw = String(trading.rankingSource ?? trading.trendingRankingSource ?? 'auto').toLowerCase();
   const rankingSourceLower =
     rankingSourceRaw === 'production' || rankingSourceRaw === 'environment'
@@ -1200,11 +1207,13 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     '[exchange]',
     `environment = "${tomlStr(envLower)}"`,
     `venue = "${tomlStr(venueLower)}"`,
-    `leverage = ${Math.min(20, Math.max(1, Math.round(tomlNum(trading.leverage, vault.leverage))))}`,
+    `leverage = ${Math.min(maxLeverage, Math.max(1, Math.round(tomlNum(trading.leverage, vault.leverage))))}`,
+    `max_leverage = ${maxLeverage}`,
     `margin_type = "${marginUpper}"`,
     `paper_trading = ${!vault.armedForLiveOrders}`,
     `ws_stream_url = "${wsStreamUrl}"`,
     `ws_api_url = "${wsApiUrl}"`,
+    `use_ws_api_orders = ${Boolean(body.useWsApiOrders ?? false)}`,
     `rest_base_url = "${restBaseUrl}"`,
     'ws_heartbeat_timeout_ms = 4500',
     'rest_poll_interval_ms = 1500',
@@ -1231,6 +1240,11 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     `trending_hysteresis_rank_buffer = ${Math.min(10, Math.max(0, Math.round(tomlNum(trading.trendingHysteresisRankBuffer, 3))))}`,
     `ranking_source = "${rankingSourceLower}"`,
     `max_same_direction_positions = ${Math.min(20, Math.max(0, Math.round(tomlNum(trading.maxSameDirectionPositions, 2))))}`,
+    `cts_screener_enabled = ${Boolean(trading.ctsScreenerEnabled ?? false)}`,
+    `cts_rvol_weight = ${Math.max(0, tomlNum(trading.ctsRvolWeight, 0.4))}`,
+    `cts_momentum_weight = ${Math.max(0, tomlNum(trading.ctsMomentumWeight, 0.4))}`,
+    `cts_volume_weight = ${Math.max(0, tomlNum(trading.ctsVolumeWeight, 0.2))}`,
+    `cts_min_rvol = ${Math.max(0, tomlNum(trading.ctsMinRvol, 1.2))}`,
     '',
     '[automation]',
     `enabled = ${Boolean(automation.enabled ?? true)}`,
@@ -1292,6 +1306,12 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     `min_di_spread = ${Math.max(0, tomlNum(indicators.minDiSpread, 3.0))}`,
     `require_macro_ema_in_scalping = ${Boolean(indicators.requireMacroEmaInScalping ?? true)}`,
     `max_spread_bps = ${Math.max(0, tomlNum(indicators.maxSpreadBps, 20.0))}`,
+    `donchian_lookback = ${Math.min(200, Math.max(3, Math.round(tomlNum(indicators.donchianLookback, 20))))}`,
+    `atr_expansion_filter_enabled = ${Boolean(indicators.atrExpansionFilterEnabled ?? false)}`,
+    `atr_expansion_min_ratio = ${Math.max(0.5, tomlNum(indicators.atrExpansionMinRatio, 1.15))}`,
+    `htf_ema_period = ${Math.min(500, Math.max(20, Math.round(tomlNum(indicators.htfEmaPeriod, 200))))}`,
+    `obi_levels = ${Math.min(50, Math.max(1, Math.round(tomlNum(indicators.obiLevels, 10))))}`,
+    `obi_min_imbalance = ${Math.min(1, Math.max(0, tomlNum(indicators.obiMinImbalance, 0.35)))}`,
     '',
     '[exits]',
     `atr_sl_multiplier = ${Math.max(0.1, tomlNum(exits.atrSlMultiplier, 1.5))}`,
@@ -1311,6 +1331,10 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     `max_lose_streak = ${Math.max(0, Math.round(tomlNum(risk.maxLoseStreak, 3)))}`,
     `streak_cooldown_minutes = ${Math.max(1, Math.round(tomlNum(risk.streakCooldownMinutes, 30)))}`,
     `flatten_on_circuit_breaker = ${Boolean(risk.flattenOnCircuitBreaker ?? true)}`,
+    `btc_crash_guard_enabled = ${Boolean(risk.btcCrashGuardEnabled ?? true)}`,
+    `btc_crash_threshold_pct = ${Math.max(0.1, tomlNum(risk.btcCrashThresholdPct, 1.5))}`,
+    `btc_crash_window_minutes = ${Math.min(240, Math.max(1, Math.round(tomlNum(risk.btcCrashWindowMinutes, 15))))}`,
+    `btc_crash_max_staleness_sec = ${Math.min(3600, Math.max(5, Math.round(tomlNum(risk.btcCrashMaxStalenessSec, 120))))}`,
     '',
     '[features]',
     ...Object.entries(normalizedFeatures).map(([k, v]) => `${k} = ${v}`),
@@ -1855,7 +1879,10 @@ async function bootstrapServer() {
           : vault.environment;
     const catRaw = String(req.query.category ?? 'hot_volume');
     const category: TrendingCategory =
-      catRaw === 'top_gainers' || catRaw === 'top_losers' || catRaw === 'volatility_leaders'
+      catRaw === 'top_gainers' ||
+      catRaw === 'top_losers' ||
+      catRaw === 'volatility_leaders' ||
+      catRaw === 'cts_momentum'
         ? catRaw
         : 'hot_volume';
     const rsRaw = String(req.query.rankingSource ?? 'auto');
@@ -1880,6 +1907,12 @@ async function bootstrapServer() {
       limit: Math.min(200, Math.max(1, Number(req.query.limit ?? 50) || 50)),
       searchQuery: typeof req.query.q === 'string' ? req.query.q : undefined,
       activeWatchlist,
+      ctsMinRvol: Math.max(0, Number(req.query.ctsMinRvol ?? 0) || 0),
+      ctsWeights: {
+        rvol: Math.max(0, Number(req.query.ctsRvolWeight ?? 0.4) || 0.4),
+        momentum: Math.max(0, Number(req.query.ctsMomentumWeight ?? 0.4) || 0.4),
+        volume: Math.max(0, Number(req.query.ctsVolumeWeight ?? 0.2) || 0.2),
+      },
     });
     res.json({ ok: true, ...payload });
   }));
@@ -1894,6 +1927,65 @@ async function bootstrapServer() {
       return;
     }
     res.json({ ok: true, symbol, venue, environment: env, ...ticker });
+  }));
+
+  /**
+   * Generates an Ed25519 keypair for Binance WebSocket API `session.logon`.
+   * The private key is written once to `.apexrust/keys/` (0600) and never returned.
+   */
+  app.post('/api/live/ed25519-keygen', asyncRoute(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const environment: BinanceEnv = body.environment === 'Production' ? 'Production' : 'Testnet';
+    const label = String(body.label ?? '')
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]/g, '')
+      .slice(0, 32);
+    const overwrite = body.overwrite === true;
+
+    const keysDir = path.resolve(process.cwd(), '.apexrust', 'keys');
+    fs.mkdirSync(keysDir, { recursive: true, mode: 0o700 });
+    const suffix = label ? `-${label}` : '';
+    const privatePath = path.join(keysDir, `ed25519-${environment.toLowerCase()}${suffix}.pem`);
+    const publicPath = `${privatePath}.pub.pem`;
+
+    if (!overwrite && fs.existsSync(privatePath)) {
+      res.status(409).json({
+        ok: false,
+        error: `Key already exists at ${privatePath}. Pass overwrite: true to rotate it.`,
+      });
+      return;
+    }
+
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('ed25519');
+    const privatePem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+    const publicPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+
+    fs.writeFileSync(privatePath, privatePem, { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(publicPath, publicPem, { encoding: 'utf8', mode: 0o644 });
+
+    const rawPublic = publicKey.export({ type: 'spki', format: 'der' });
+    const rawKeyBytes = rawPublic.subarray(rawPublic.length - 32);
+    const base64Key = rawKeyBytes.toString('base64');
+    const fingerprint = crypto.createHash('sha256').update(rawPublic).digest('hex').slice(0, 16);
+
+    console.log(
+      `[audit]POST /api/live/ed25519-keygen env=${environment} privatePath=${privatePath} overwrite=${overwrite}`
+    );
+    res.json({
+      ok: true,
+      environment,
+      privateKeyPath: privatePath,
+      publicKeyPath: publicPath,
+      publicKeyPem: publicPem,
+      /** Paste this into Binance API Management when registering an Ed25519 key. */
+      publicKeyBase64: base64Key,
+      fingerprint,
+      nextSteps: [
+        'Register the public key in Binance API Management and enable Futures/Spot trading.',
+        'Set exchange.use_ws_api_orders = true and exchange.credentials.ed25519_key_path in bot.toml.',
+        'Keep the private key file owner-readable only; it is gitignored.',
+      ],
+    });
   }));
 
   app.get('/api/live/config', (_req, res) => {
@@ -2007,7 +2099,10 @@ async function bootstrapServer() {
     vault.marginType = nextMargin;
     vault.authMethod = nextAuth;
     if (typeof body.leverage === 'number' && Number.isFinite(body.leverage)) {
-      vault.leverage = Math.min(20, Math.max(1, Math.round(body.leverage)));
+      vault.leverage = Math.min(
+        Math.max(1, Math.min(20, Math.round(Number(process.env.APEXRUST_MAX_LEVERAGE ?? 3)))),
+        Math.max(1, Math.round(body.leverage))
+      );
     }
     vault.apiKey = resultingKey;
     vault.apiSecret = resultingSecret;
@@ -2276,7 +2371,14 @@ async function bootstrapServer() {
     const requestedQty = Number(body.quantity ?? 0);
     const requestedPrice = Number(body.price ?? 0);
     const requestedNotional = Number(body.quoteOrderQty ?? 0);
-    const desiredLeverage = Math.min(20, Math.max(1, Math.round(Number(body.leverage ?? vault.leverage))));
+    const leverageCeiling = Math.max(
+      1,
+      Math.min(20, Math.round(Number(process.env.APEXRUST_MAX_LEVERAGE ?? 3)))
+    );
+    const desiredLeverage = Math.min(
+      leverageCeiling,
+      Math.max(1, Math.round(Number(body.leverage ?? vault.leverage)))
+    );
 
     if (venue === 'Spot' && side === 'SELL' && !body.reduceOnly) {
       res.status(400).json({

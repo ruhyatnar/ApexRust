@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import {
+  Activity,
   ArrowUpRight,
   CheckCircle2,
   Flame,
@@ -63,6 +64,7 @@ const SCREENER_CATEGORIES: Array<{
   { id: 'top_gainers', label: 'Top Gainers', icon: TrendingUp },
   { id: 'top_losers', label: 'Top Losers (Shorts)', icon: TrendingDown },
   { id: 'volatility_leaders', label: 'Volatility Leaders', icon: Zap },
+  { id: 'cts_momentum', label: 'CTS Momentum', icon: Activity },
 ];
 
 function renderSourceTagBadge(tag?: PairSourceTag) {

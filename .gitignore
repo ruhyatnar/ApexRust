@@ -20,3 +20,6 @@ rust-bot/target/
 .apexrust-orders.sqlite-*
 .apexrust-orders.sqlite.json
 rust-bot/config/bot.toml
+
+# Generated Ed25519 keys (never commit)
+rust-bot/keys/

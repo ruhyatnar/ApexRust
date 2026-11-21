@@ -22,6 +22,8 @@ import type {
 interface LiveCredentialsViewProps {
   liveStatus: LiveCredentialStatus;
   accountMode: ExecutionAccountMode;
+  /** Hard ceiling from `trading.maxLeverage`; UI never offers more. */
+  maxLeverage?: number;
   serverTargetLabel?: string;
   isRemoteVps?: boolean;
   onSaveCredentials: (payload: {
@@ -46,6 +48,7 @@ interface LiveCredentialsViewProps {
 export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
   liveStatus,
   accountMode,
+  maxLeverage = 3,
   serverTargetLabel = '🖥️ This Computer',
   isRemoteVps = false,
   onSaveCredentials,
@@ -335,9 +338,11 @@ export const LiveCredentialsView: React.FC<LiveCredentialsViewProps> = ({
                   onChange={(e) => setLeverage(Number(e.target.value))}
                   className="mt-1.5 w-full rounded-lg border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs text-amber-300 focus:border-[#7DF2AD] focus:outline-none"
                 >
-                  {[1, 2, 3, 5, 10, 15, 20].map((lv) => (
-                    <option key={lv} value={lv}>{lv}x</option>
-                  ))}
+                  {[1, 2, 3, 5, 10, 15, 20]
+                    .filter((lv) => lv <= Math.max(1, Math.min(20, Math.round(maxLeverage))))
+                    .map((lv) => (
+                      <option key={lv} value={lv}>{lv}x</option>
+                    ))}
                 </select>
               </div>
               <div>

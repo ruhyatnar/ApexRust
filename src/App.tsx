@@ -1248,15 +1248,23 @@ export default function App() {
       .slice(0, 60);
 
     const initialStreams: string[] = [];
+    const seenStreams = new Set<string>();
+    const pushStream = (stream: string) => {
+      if (seenStreams.has(stream)) return;
+      seenStreams.add(stream);
+      initialStreams.push(stream);
+    };
     for (const sym of initialSymbols) {
       const lower = sym.toLowerCase();
-      initialStreams.push(`${lower}@kline_${config.trading.timeframe}`);
-      initialStreams.push(`${lower}@bookTicker`);
+      pushStream(`${lower}@kline_${config.trading.timeframe}`);
+      pushStream(`${lower}@bookTicker`);
+      // Top-10 partial book depth: no snapshot/diff sequencing required.
+      pushStream(`${lower}@depth10@100ms`);
     }
-    const safeInitialStreams =
-      initialStreams.length > 0
-        ? initialStreams
-        : [`btcusdt@kline_${config.trading.timeframe}`, 'btcusdt@bookTicker'];
+    // Always keep a BTC reference feed for the crash guard, even when BTC is not traded.
+    pushStream(`btcusdt@kline_${config.trading.timeframe}`);
+    pushStream('btcusdt@bookTicker');
+    const safeInitialStreams = initialStreams;
     const wsUrl = `${wsBase}?streams=${safeInitialStreams.join('/')}`;
 
     const pollRestFallback = async () => {
@@ -1374,9 +1382,27 @@ export default function App() {
               isClosed: Boolean(k.x),
             };
             rt.stepBar(Date.now(), { symbol: payload.s, candle });
+            if (String(payload.s).toUpperCase() === 'BTCUSDT') {
+              rt.setBtcReferencePrice(candle.close, Date.now());
+            }
             syncSnapshots();
             if (rt.snapshot.accountMode === 'Live') {
               void drainLiveIntents();
+            }
+          } else if (Array.isArray(payload.b) && Array.isArray(payload.a)) {
+            const streamName = typeof msg?.stream === 'string' ? msg.stream : '';
+            const sym = String(payload.s ?? streamName.split('@')[0] ?? '').toUpperCase();
+            if (sym) {
+              const sumQty = (levels: unknown[]) =>
+                levels.reduce<number>((acc, lvl) => {
+                  const qty = Array.isArray(lvl) ? Number(lvl[1]) : 0;
+                  return Number.isFinite(qty) ? acc + Math.max(0, qty) : acc;
+                }, 0);
+              const bidQty = sumQty(payload.b);
+              const askQty = sumQty(payload.a);
+              if (bidQty + askQty > 0) {
+                rt.updateOrderBookImbalance(sym, (bidQty - askQty) / (bidQty + askQty));
+              }
             }
           } else if (payload.b && payload.a && payload.s) {
             const sym = String(payload.s).toUpperCase();
@@ -1467,6 +1493,59 @@ export default function App() {
     binanceWsEpoch,
   ]);
 
+  // Closed 1h HTF trend cache for the EMA gate (refreshed every 5 minutes).
+  useEffect(() => {
+    if (snapshot.transport.feedSource !== 'BinanceLive') return;
+    let cancelled = false;
+    const htfPeriod = Math.max(20, Math.min(500, Math.round(config.indicators.htfEmaPeriod ?? 200)));
+
+    const refreshHtfTrends = async () => {
+      const rt = activeRuntimeRef.current;
+      if (!rt) return;
+      const symbols = rt.snapshot.pairs.map((p) => p.symbol).slice(0, 12);
+      for (const symbol of symbols) {
+        if (cancelled) return;
+        try {
+          const resp = await apiFetch(
+            `/api/market/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&venue=${encodeURIComponent(config.trading.venue)}&environment=${encodeURIComponent(snapshot.transport.environment)}&limit=${htfPeriod + 5}`
+          );
+          if (!resp.ok) continue;
+          const payload = (await resp.json()) as { rows?: Array<Array<string | number>> };
+          const rows = Array.isArray(payload.rows) ? payload.rows : [];
+          const nowTs = Date.now();
+          const closes = rows
+            .filter((r) => Number(r[6] ?? 0) > 0 && Number(r[6]) <= nowTs)
+            .map((r) => Number(r[4]));
+          if (closes.length < 2) continue;
+          const multiplier = 2 / (htfPeriod + 1);
+          let ema = closes.slice(0, Math.min(htfPeriod, closes.length)).reduce((s, v) => s + v, 0) /
+            Math.min(htfPeriod, closes.length);
+          for (let i = Math.min(htfPeriod, closes.length); i < closes.length; i += 1) {
+            ema = (closes[i] - ema) * multiplier + ema;
+          }
+          rt.setHtfTrend(symbol, closes[closes.length - 1], ema);
+        } catch {
+          // Fail open: the HTF gate is skipped until fresh 1h data arrives.
+        }
+      }
+      if (!cancelled) syncSnapshots();
+    };
+
+    void refreshHtfTrends();
+    const timer = window.setInterval(refreshHtfTrends, 5 * 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    snapshot.transport.feedSource,
+    snapshot.transport.environment,
+    config.trading.venue,
+    config.indicators.htfEmaPeriod,
+    activeRuntimeRef,
+    syncSnapshots,
+  ]);
+
   // Debounced in-place SUBSCRIBE / UNSUBSCRIBE diffs when watchlist rotates (< 5 msgs/sec Spot, < 10 msgs/sec Futures)
   useEffect(() => {
     if (snapshot.transport.feedSource !== 'BinanceLive') return;
@@ -1482,7 +1561,10 @@ export default function App() {
         const lower = s.toLowerCase();
         desired.add(`${lower}@kline_${config.trading.timeframe}`);
         desired.add(`${lower}@bookTicker`);
+        desired.add(`${lower}@depth10@100ms`);
       }
+      desired.add(`btcusdt@kline_${config.trading.timeframe}`);
+      desired.add('btcusdt@bookTicker');
 
       const current = subscribedBinanceStreamsRef.current;
       const toSubscribe: string[] = [];
@@ -2011,7 +2093,8 @@ export default function App() {
 
   const handleUpdateFuturesSettings = (leverage: number, marginType: MarginType) => {
     if (!config.features.futuresMarket) return;
-    const safeLeverage = Math.min(20, Math.max(1, leverage));
+    const leverageCeiling = Math.max(1, Math.min(20, Math.round(config.trading.maxLeverage ?? 3)));
+    const safeLeverage = Math.min(leverageCeiling, Math.max(1, leverage));
     const nextConfig: BotConfig = {
       ...config,
       trading: {
@@ -2926,7 +3009,8 @@ export default function App() {
         return { ok: false, message: data.error ?? 'Failed to save credentials' };
       }
       // Keep active venue, leverage, marginType, and directionPolicy aligned atomically
-      const safeLeverage = Math.min(20, Math.max(1, payload.leverage));
+      const leverageCeiling = Math.max(1, Math.min(20, Math.round(config.trading.maxLeverage ?? 3)));
+      const safeLeverage = Math.min(leverageCeiling, Math.max(1, payload.leverage));
       const nextVenue = payload.venue;
       const nextDirection =
         nextVenue === 'Spot'
@@ -3639,6 +3723,7 @@ export default function App() {
                 <LiveCredentialsView
                   liveStatus={liveStatus}
                   accountMode={accountMode}
+                  maxLeverage={config.trading.maxLeverage}
                   serverTargetLabel={serverTargetLabel}
                   isRemoteVps={connectionProfile.kind === 'remote'}
                   onSaveCredentials={handleSaveCredentials}

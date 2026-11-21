@@ -5,7 +5,7 @@ import type {
   TrendingCategory,
   TrendingRankingSource,
 } from '../engine/types';
-import { rankScreenerTickers } from '../engine/watchlist';
+import { computeCtsScore, rankScreenerTickers } from '../engine/watchlist';
 
 export type BinanceEnv = 'Testnet' | 'Production';
 
@@ -21,6 +21,67 @@ export interface ScreenerQueryOptions {
   searchQuery?: string;
   activeWatchlist?: string[];
   sourceTagsBySymbol?: Record<string, 'pinned' | 'trending' | 'protected_position'>;
+  ctsWeights?: { rvol?: number; momentum?: number; volume?: number };
+  ctsMinRvol?: number;
+}
+
+interface CtsCacheEntry {
+  fetchedAtMs: number;
+  metrics: Map<string, { rvol1h: number; momentum1hPct: number; ctsScore: number }>;
+}
+
+const CTS_CACHE_TTL_MS = 5 * 60 * 1000;
+const CTS_MAX_SYMBOLS = 30;
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+/**
+ * Derives 1h RVOL and 1h momentum from Binance kline rows, then blends them
+ * into a CTS score with cross-sectionally normalized volume.
+ */
+export function buildCtsMetrics(
+  tickers: MarketTicker24h[],
+  klinesBySymbol: Map<string, Array<Array<string | number>>>,
+  weights?: { rvol?: number; momentum?: number; volume?: number }
+): Map<string, { rvol1h: number; momentum1hPct: number; ctsScore: number }> {
+  const now = Date.now();
+  const medianVolume = median(tickers.map((t) => t.quoteVolume).filter((v) => v > 0));
+  const out = new Map<string, { rvol1h: number; momentum1hPct: number; ctsScore: number }>();
+
+  for (const ticker of tickers) {
+    const rows = klinesBySymbol.get(ticker.symbol);
+    if (!rows || rows.length < 6) continue;
+    const closed = rows.filter((r) => Number(r[6] ?? 0) > 0 && Number(r[6]) <= now);
+    if (closed.length < 6) continue;
+    const last = closed[closed.length - 1];
+    const baselineBars = closed.slice(Math.max(0, closed.length - 25), closed.length - 1);
+    const volumes = baselineBars.map((r) => Number(r[5] ?? 0)).filter((v) => v > 0);
+    if (volumes.length < 3) continue;
+    const baseline = volumes.reduce((s, v) => s + v, 0) / volumes.length;
+    const lastVolume = Number(last[5] ?? 0);
+    if (baseline <= 0 || lastVolume <= 0) continue;
+    const rvol1h = lastVolume / baseline;
+    const anchor = closed[Math.max(0, closed.length - 25)];
+    const anchorClose = Number(anchor[4] ?? 0);
+    const lastClose = Number(last[4] ?? 0);
+    if (anchorClose <= 0 || lastClose <= 0) continue;
+    const momentum1hPct = ((lastClose - anchorClose) / anchorClose) * 100;
+    const ctsScore = computeCtsScore({
+      rvol1h,
+      momentum1hPct,
+      quoteVolume: ticker.quoteVolume,
+      medianQuoteVolume: medianVolume,
+      weights,
+    });
+    if (ctsScore === null) continue;
+    out.set(ticker.symbol, { rvol1h, momentum1hPct, ctsScore });
+  }
+  return out;
 }
 
 interface StreamBucket {
@@ -113,6 +174,8 @@ export class BinanceScreenerHub {
   private readonly exchangeInfoCache = new Map<string, ExchangeInfoCacheEntry>();
   private readonly rateBudgets = new Map<string, RateBudgetEntry>();
   private readonly listeners = new Set<(env: BinanceEnv, venue: ExchangeVenue) => void>();
+  private readonly ctsCache = new Map<string, CtsCacheEntry>();
+  private readonly ctsInFlight = new Map<string, Promise<void>>();
   private idleTimer: ReturnType<typeof setInterval> | null = null;
   private lastEmitAtMs = new Map<string, number>();
 
@@ -542,13 +605,19 @@ export class BinanceScreenerHub {
       });
     }
 
+    const category = options.category ?? 'hot_volume';
+    if (category === 'cts_momentum') {
+      await this.enrichCtsMetrics(bucket, enriched, options);
+    }
+
     const ranked = rankScreenerTickers(enriched, {
-      category: options.category ?? 'hot_volume',
+      category,
       quoteAsset: options.quoteAsset ?? 'USDT',
       minQuoteVolumeUsdt: options.minQuoteVolumeUsdt ?? 0,
       onlyTradable: options.onlyTradable ?? true,
       limit: options.limit ?? 50,
       searchQuery: options.searchQuery,
+      ctsMinRvol: options.ctsMinRvol,
     });
 
     return {
@@ -561,6 +630,101 @@ export class BinanceScreenerHub {
       rateWeightUsed1m: this.getRateWeightUsed(options.environment, options.venue),
       tickers: ranked,
     };
+  }
+
+  /**
+   * Fetches 1h klines for the most liquid candidates and stamps CTS metrics onto
+   * the tickers. Cached for 5 minutes per env/venue to stay far below weight limits.
+   */
+  private async enrichCtsMetrics(
+    bucket: StreamBucket,
+    tickers: MarketTicker24h[],
+    options: ScreenerQueryOptions
+  ): Promise<void> {
+    const key = bucket.key;
+    const cached = this.ctsCache.get(key);
+    const now = Date.now();
+    if (cached && now - cached.fetchedAtMs < CTS_CACHE_TTL_MS) {
+      this.applyCtsMetrics(tickers, cached.metrics);
+      return;
+    }
+    const inFlight = this.ctsInFlight.get(key);
+    if (inFlight) {
+      await inFlight;
+      const refreshed = this.ctsCache.get(key);
+      if (refreshed) this.applyCtsMetrics(tickers, refreshed.metrics);
+      return;
+    }
+
+    const task = (async () => {
+      const candidates = [...tickers]
+        .filter((t) => t.lastPrice > 0 && t.quoteVolume > 0)
+        .sort((a, b) => b.quoteVolume - a.quoteVolume)
+        .slice(0, CTS_MAX_SYMBOLS);
+      const klinesBySymbol = new Map<string, Array<Array<string | number>>>();
+      const concurrency = 4;
+      for (let i = 0; i < candidates.length; i += concurrency) {
+        if (this.isRateBudgetConstrained(bucket.env, bucket.venue)) break;
+        const batch = candidates.slice(i, i + concurrency);
+        await Promise.all(
+          batch.map(async (t) => {
+            try {
+              const rows = await this.fetchKlines1h(bucket.env, bucket.venue, t.symbol);
+              if (rows.length > 0) klinesBySymbol.set(t.symbol, rows);
+            } catch {
+              // Skip symbol on failure; ranking simply omits it.
+            }
+          })
+        );
+      }
+      const metrics = buildCtsMetrics(tickers, klinesBySymbol, options.ctsWeights);
+      this.ctsCache.set(key, { fetchedAtMs: Date.now(), metrics });
+    })();
+
+    this.ctsInFlight.set(key, task);
+    try {
+      await task;
+    } finally {
+      this.ctsInFlight.delete(key);
+    }
+    const refreshed = this.ctsCache.get(key);
+    if (refreshed) this.applyCtsMetrics(tickers, refreshed.metrics);
+  }
+
+  private applyCtsMetrics(
+    tickers: MarketTicker24h[],
+    metrics: Map<string, { rvol1h: number; momentum1hPct: number; ctsScore: number }>
+  ): void {
+    for (const ticker of tickers) {
+      const m = metrics.get(ticker.symbol);
+      if (!m) continue;
+      ticker.rvol1h = m.rvol1h;
+      ticker.momentum1hPct = m.momentum1hPct;
+      ticker.ctsScore = m.ctsScore;
+    }
+  }
+
+  private async fetchKlines1h(
+    env: BinanceEnv,
+    venue: ExchangeVenue,
+    symbol: string
+  ): Promise<Array<Array<string | number>>> {
+    const baseUrl = getScreenerRestBaseUrl(env, venue);
+    const path =
+      venue === 'Futures'
+        ? `${baseUrl}/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=26`
+        : `${baseUrl}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=1h&limit=26`;
+    const resp = await fetch(path, { signal: AbortSignal.timeout(8000) });
+    this.reportRestHeaders(
+      env,
+      venue,
+      resp.status,
+      resp.headers.get('x-mbx-used-weight-1m'),
+      resp.headers.get('retry-after')
+    );
+    if (!resp.ok) return [];
+    const rows = (await resp.json()) as unknown;
+    return Array.isArray(rows) ? (rows as Array<Array<string | number>>) : [];
   }
 
   private checkStaleSockets(): void {

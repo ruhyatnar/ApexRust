@@ -683,6 +683,7 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
               <option value="top_gainers">top_gainers (24h Breakout)</option>
               <option value="top_losers">top_losers (Futures Shorts)</option>
               <option value="volatility_leaders">volatility_leaders (High Range)</option>
+              <option value="cts_momentum">cts_momentum (RVOL + 1h Momentum)</option>
             </select>
           </div>
           <div>
@@ -1255,6 +1256,149 @@ export const StrategyConfigView: React.FC<StrategyConfigViewProps> = ({
                   />
                 </label>
               </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Screener & Regime Gates */}
+        <div className="rounded-lg border border-white/[0.06] bg-[#141820] p-5 space-y-4">
+          <h3 className="text-sm font-semibold text-slate-100">Screener & Regime Gates</h3>
+          <p className="text-[11px] leading-snug text-slate-500">
+            Spec-aligned filters from the architecture document. Each gate is off by default so existing
+            behaviour does not change silently.
+          </p>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="cfg-donchian" className="block text-xs font-medium text-slate-400">
+                Donchian Lookback (bars)
+              </label>
+              <input
+                id="cfg-donchian"
+                type="number"
+                min="3"
+                max="200"
+                value={config.indicators.donchianLookback ?? 20}
+                onChange={(e) =>
+                  updateIndicators('donchianLookback', Math.max(3, Number(e.target.value) || 20))
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+            <div>
+              <label htmlFor="cfg-htf-ema" className="block text-xs font-medium text-slate-400">
+                HTF EMA Period (1h)
+              </label>
+              <input
+                id="cfg-htf-ema"
+                type="number"
+                min="20"
+                max="500"
+                value={config.indicators.htfEmaPeriod ?? 200}
+                onChange={(e) =>
+                  updateIndicators('htfEmaPeriod', Math.max(20, Number(e.target.value) || 200))
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label htmlFor="cfg-atr-expansion" className="block text-xs font-medium text-slate-400">
+                ATR Expansion Ratio (vs SMA50)
+              </label>
+              <input
+                id="cfg-atr-expansion"
+                type="number"
+                step="0.05"
+                min="0.5"
+                max="5"
+                value={config.indicators.atrExpansionMinRatio ?? 1.15}
+                onChange={(e) =>
+                  updateIndicators(
+                    'atrExpansionMinRatio',
+                    Math.max(0.5, Number(e.target.value) || 1.15)
+                  )
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+              <label className="mt-2 flex items-center gap-2 text-[11px] text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={config.indicators.atrExpansionFilterEnabled === true}
+                  onChange={(e) =>
+                    updateIndicators('atrExpansionFilterEnabled', e.target.checked)
+                  }
+                  className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-[#7DF2AD]"
+                />
+                Require expanding ATR
+              </label>
+            </div>
+            <div>
+              <label htmlFor="cfg-obi-min" className="block text-xs font-medium text-slate-400">
+                Min |OBI| (0–1)
+              </label>
+              <input
+                id="cfg-obi-min"
+                type="number"
+                step="0.05"
+                min="0"
+                max="1"
+                value={config.indicators.obiMinImbalance ?? 0.35}
+                onChange={(e) =>
+                  updateIndicators(
+                    'obiMinImbalance',
+                    Math.min(1, Math.max(0, Number(e.target.value) || 0.35))
+                  )
+                }
+                className="mt-1.5 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-2 font-mono text-xs tabular-nums text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+              />
+              <p className="mt-1 text-[10px] leading-snug text-slate-500">
+                Applied only when the Order-Book Imbalance toggle is enabled.
+              </p>
+            </div>
+          </div>
+
+          <div className="rounded-md border border-white/[0.06] bg-[#0D1015] p-3">
+            <label className="flex items-center justify-between text-xs text-slate-300">
+              <span>CTS Screener (RVOL + 1h Momentum)</span>
+              <input
+                type="checkbox"
+                checked={config.trading.ctsScreenerEnabled === true}
+                onChange={(e) =>
+                  updateTrading('ctsScreenerEnabled', e.target.checked)
+                }
+                className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-[#7DF2AD]"
+              />
+            </label>
+            <p className="mt-1 text-[10px] leading-snug text-slate-500">
+              Enables the <code>cts_momentum</code> screener category: 1h RVOL, 1h momentum and
+              cross-sectionally normalized volume. Select it under Trending Category.
+            </p>
+            <div className="mt-3 grid grid-cols-3 gap-2">
+              {(
+                [
+                  ['ctsRvolWeight', 'RVOL wt', 0.4],
+                  ['ctsMomentumWeight', 'Mom wt', 0.4],
+                  ['ctsVolumeWeight', 'Vol wt', 0.2],
+                ] as const
+              ).map(([key, label, fallback]) => (
+                <div key={key}>
+                  <label className="block text-[10px] text-slate-500">{label}</label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max="1"
+                    value={config.trading[key] ?? fallback}
+                    onChange={(e) =>
+                      updateTrading(key, Math.min(1, Math.max(0, Number(e.target.value) || fallback)))
+                    }
+                    className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#141820] px-2 py-1 font-mono text-[11px] text-slate-100 focus:border-[#7DF2AD] focus:outline-none"
+                  />
+                </div>
+              ))}
             </div>
           </div>
         </div>

@@ -235,6 +235,69 @@ impl BinanceRestClient {
     }
 
     /// Execute a live Spot order (and optional `/api/v3/orderList/oco` exit bracket) via `binance-sdk`.
+    /// Builds `order.place` params for the WebSocket API with Spot filters applied.
+    pub(crate) async fn build_ws_order_params(
+        &self,
+        req: &LiveOrderRequest,
+    ) -> Result<serde_json::Value> {
+        let sym = req.symbol.trim().to_uppercase();
+        let ref_px = req.limit_price.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(1.0);
+        let filters = get_or_fetch_symbol_filters(
+            &self.http,
+            &self.filter_cache,
+            self.effective_base_url(),
+            ExchangeVenue::Spot,
+            &sym,
+            ref_px,
+            &self.rate_budget,
+        )
+        .await;
+        let is_market = matches!(
+            req.order_method,
+            OrderExecutionMethod::Market | OrderExecutionMethod::Oco
+        );
+        let (step, dec) = if is_market {
+            (filters.market_step_size, filters.market_step_decimals)
+        } else {
+            (filters.step_size, filters.step_decimals)
+        };
+        let qty_dec = to_binance_step_decimal(req.quantity, step, dec)?;
+        let qty_num = qty_dec.to_string().parse::<f64>().unwrap_or(req.quantity);
+        let limit_px_num = if is_market {
+            None
+        } else {
+            Some(
+                req.limit_price
+                    .filter(|&p| p.is_finite() && p > 0.0)
+                    .ok_or_else(|| {
+                        BotError::RestApi("Spot WS LIMIT order missing positive price".into())
+                    })?,
+            )
+        };
+        validate_exchange_filters(
+            &sym,
+            &filters,
+            limit_px_num,
+            Some(qty_num),
+            qty_num * limit_px_num.unwrap_or(ref_px),
+            is_market,
+            req.reduce_only,
+        )?;
+        let side = match req.side {
+            Side::Long => "BUY",
+            Side::Short => "SELL",
+        };
+        crate::ws_api::build_order_place_params(
+            &sym,
+            side,
+            if is_market { "MARKET" } else { "LIMIT" },
+            qty_num,
+            limit_px_num.map(|px| (px, Some(req.time_in_force.as_str()))),
+            req.reduce_only,
+            None,
+        )
+    }
+
     pub async fn execute_spot_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
         let sym = req.symbol.to_uppercase();
         let ref_px = if let Some(px) = req.limit_price.filter(|&p| p.is_finite() && p > 0.0) {

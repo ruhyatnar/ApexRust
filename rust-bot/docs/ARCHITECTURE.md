@@ -1,7 +1,7 @@
 # System Architecture
 
 ApexRust Quant spans two parity-aligned runtimes sharing an identical domain model:
-1. **Rust Workspace (`rust-bot/`)**: Native 8-crate Tokio engine (`bot-desktop`, `bot-web`, `bot-engine`, `bot-exchange`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-core`) built on `binance-sdk 78.3.0`.
+1. **Rust Workspace (`rust-bot/`)**: Native 9-crate Tokio engine (`bot-desktop`, `bot-web`, `bot-engine`, `bot-exchange`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-core`, `bot-keygen`) built on `binance-sdk 78.3.0`.
 2. **Web Command Center & Server Proxy (`/src`, `server.ts`, `vite.config.ts`)**: Installable Desktop/Mobile PWA + TypeScript `SimulationRuntime` + Express server-side signing & Git backup proxy on port `3000`.
 
 ---
@@ -33,7 +33,7 @@ ApexRust Quant spans two parity-aligned runtimes sharing an identical domain mod
                                               |
                                     +---------v---------+
                                     |     bot-core      |  Shared Models, UtcSessionWindow,
-                                    +-------------------+  19 FeatureToggles, BotConfig
+                                    +-------------------+  21 FeatureToggles, BotConfig
 ```
 
 ---

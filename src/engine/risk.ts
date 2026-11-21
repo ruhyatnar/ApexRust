@@ -13,6 +13,8 @@ export class RiskManager {
   private state: CircuitBreakerState = 'Active';
   private haltReason: string | null = null;
   private cooldownUntilMs: number | null = null;
+  private btcSamples: Array<{ tsMs: number; price: number }> = [];
+  private lastBtcBlockReason: string | null = null;
 
   constructor(riskCfg: RiskConfig, tradingCfg: TradingConfig, nowMs: number) {
     this.riskCfg = { ...riskCfg };
@@ -48,6 +50,49 @@ export class RiskManager {
     }
   }
 
+  /**
+   * Feeds a BTCUSDT reference price used by the crash guard. Samples are kept for
+   * two guard windows so a stalled feed can be detected independently of the move.
+   */
+  observeBtcPrice(price: number, nowMs: number): void {
+    if (!Number.isFinite(price) || price <= 0) return;
+    const last = this.btcSamples[this.btcSamples.length - 1];
+    if (last && nowMs < last.tsMs) return;
+    if (last && last.tsMs === nowMs) {
+      last.price = price;
+    } else {
+      this.btcSamples.push({ tsMs: nowMs, price });
+    }
+    const keepMs = Math.max(1, this.riskCfg.btcCrashWindowMinutes ?? 15) * 60_000 * 2;
+    while (this.btcSamples.length > 0 && nowMs - this.btcSamples[0].tsMs > keepMs) {
+      this.btcSamples.shift();
+    }
+  }
+
+  /** BTC move (%) across the guard window, or null when data is missing/stale. */
+  btcChangePct(nowMs: number): number | null {
+    const windowMs = Math.max(1, this.riskCfg.btcCrashWindowMinutes ?? 15) * 60_000;
+    const maxAgeMs = Math.max(1, this.riskCfg.btcCrashMaxStalenessSec ?? 120) * 1000;
+    const latest = this.btcSamples[this.btcSamples.length - 1];
+    if (!latest || nowMs - latest.tsMs > maxAgeMs) return null;
+    // Anchor at the OLDEST sample still inside the window (excluding the latest one).
+    for (const sample of this.btcSamples) {
+      if (sample.tsMs >= latest.tsMs) break;
+      if (latest.tsMs - sample.tsMs <= windowMs && sample.price > 0) {
+        return ((latest.price - sample.price) / sample.price) * 100;
+      }
+    }
+    return 0;
+  }
+
+  /** True when the BTC guard is enabled and its threshold is currently breached. */
+  isBtcCrashBlocking(nowMs: number): boolean {
+    if (this.riskCfg.btcCrashGuardEnabled === false) return false;
+    const changePct = this.btcChangePct(nowMs);
+    if (changePct === null) return false;
+    return changePct <= -Math.abs(this.riskCfg.btcCrashThresholdPct ?? 1.5);
+  }
+
   authorizeEntry(
     symbol: string,
     entryPrice: number,
@@ -75,6 +120,16 @@ export class RiskManager {
     if (this.quarantinedPairs.has(symbol)) {
       return { ok: false, reason: `${symbol} quarantined after per-pair daily drawdown breach` };
     }
+
+    if (this.isBtcCrashBlocking(nowMs)) {
+      const changePct = this.btcChangePct(nowMs) ?? 0;
+      const reason = `BTC crash guard: BTC ${changePct.toFixed(2)}% in ${this.riskCfg.btcCrashWindowMinutes ?? 15}m (limit -${Math.abs(
+        this.riskCfg.btcCrashThresholdPct ?? 1.5
+      ).toFixed(2)}%)`;
+      this.lastBtcBlockReason = reason;
+      return { ok: false, reason };
+    }
+    this.lastBtcBlockReason = null;
 
     if (openPositionsCount >= this.tradingCfg.maxConcurrentPositions) {
       return { ok: false, reason: 'Max concurrent positions reached' };
@@ -155,6 +210,11 @@ export class RiskManager {
     this.winStreak = 0;
     this.loseStreak = 0;
     this.quarantinedPairs.clear();
+    this.lastBtcBlockReason = null;
+  }
+
+  btcGuardBlockReason(): string | null {
+    return this.lastBtcBlockReason;
   }
 
   getPairDailyPnl(symbol: string): number {
@@ -175,6 +235,9 @@ export class RiskManager {
       winStreak: this.winStreak,
       loseStreak: this.loseStreak,
       quarantinedPairs: Array.from(this.quarantinedPairs),
+      btcChangePctWindow: this.btcChangePct(Date.now()),
+      btcWindowMinutes: this.riskCfg.btcCrashWindowMinutes ?? 15,
+      btcGuardBlocking: this.isBtcCrashBlocking(Date.now()),
     };
   }
 }

@@ -362,6 +362,108 @@ export const RiskCircuitBreakerView: React.FC<RiskCircuitBreakerViewProps> = ({
               />
             </div>
 
+            <div>
+              <label htmlFor="risk-btc-guard" className="block text-xs font-medium text-slate-400">
+                BTC Crash Guard (block new entries)
+              </label>
+              <label className="mt-2 flex items-center gap-2 text-xs text-slate-300">
+                <input
+                  id="risk-btc-guard"
+                  type="checkbox"
+                  checked={config.risk.btcCrashGuardEnabled !== false}
+                  onChange={(e) => updateRisk('btcCrashGuardEnabled', e.target.checked)}
+                  className="h-4 w-4 rounded border-white/[0.08] bg-[#0D1015] text-blue-600 focus:ring-blue-500"
+                />
+                Enabled
+              </label>
+              <p className="mt-1 text-[10px] leading-snug text-slate-500">
+                Open-position exits keep running 24/7; only new entries pause. Fails open when BTC data is stale.
+              </p>
+            </div>
+
+            <div>
+              <label htmlFor="risk-btc-threshold" className="block text-xs font-medium text-slate-400">
+                BTC Drop Threshold (%)
+              </label>
+              <input
+                id="risk-btc-threshold"
+                type="number"
+                step="0.1"
+                min="0.1"
+                max="20"
+                value={config.risk.btcCrashThresholdPct ?? 1.5}
+                onChange={(e) =>
+                  updateRisk('btcCrashThresholdPct', Math.max(0.1, Number(e.target.value) || 1.5))
+                }
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="risk-btc-window" className="block text-xs font-medium text-slate-400">
+                BTC Guard Window (min)
+              </label>
+              <input
+                id="risk-btc-window"
+                type="number"
+                min="1"
+                max="240"
+                value={config.risk.btcCrashWindowMinutes ?? 15}
+                onChange={(e) =>
+                  updateRisk('btcCrashWindowMinutes', Math.max(1, Number(e.target.value) || 15))
+                }
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="risk-btc-stale" className="block text-xs font-medium text-slate-400">
+                BTC Max Staleness (sec)
+              </label>
+              <input
+                id="risk-btc-stale"
+                type="number"
+                min="5"
+                max="3600"
+                value={config.risk.btcCrashMaxStalenessSec ?? 120}
+                onChange={(e) =>
+                  updateRisk('btcCrashMaxStalenessSec', Math.max(5, Number(e.target.value) || 120))
+                }
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="risk-max-leverage" className="block text-xs font-medium text-slate-400">
+                Max Leverage Ceiling (x)
+              </label>
+              <input
+                id="risk-max-leverage"
+                type="number"
+                min="1"
+                max="20"
+                value={config.trading.maxLeverage ?? 3}
+                onChange={(e) => {
+                  const ceiling = Math.max(1, Math.min(20, Number(e.target.value) || 3));
+                  onUpdateConfig({
+                    ...config,
+                    trading: {
+                      ...config.trading,
+                      maxLeverage: ceiling,
+                      leverage: Math.min(config.trading.leverage, ceiling),
+                    },
+                  });
+                }}
+                className="mt-1 w-full rounded-md border border-white/[0.08] bg-[#0D1015] px-3 py-1.5 font-mono text-xs tabular-nums text-slate-100 focus:border-blue-500 focus:outline-none"
+              />
+              <p className="mt-1 text-[10px] leading-snug text-slate-500">
+                Applied to every config, TOML and order path. Current effective: {Math.min(
+                  config.trading.maxLeverage ?? 3,
+                  config.trading.leverage
+                )}x
+              </p>
+            </div>
+
             <div className="flex items-center justify-between pt-4 sm:col-span-2">
               <label htmlFor="risk-flatten" className="text-xs font-medium text-slate-300">
                 Flatten Open Positions on CB

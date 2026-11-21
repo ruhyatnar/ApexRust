@@ -306,6 +306,9 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
     return usdtAmount;
   }, [amountUnit, allocPct, usdtAmount, snapshot.availableBalanceUsdt]);
 
+  const leverageCeiling = Math.max(1, Math.min(20, Math.round(config.trading.maxLeverage ?? 3)));
+  const effectiveLeverage = Math.min(leverageCeiling, Math.max(1, config.trading.leverage));
+
   const quantPositionSize = useMemo(
     () =>
       calculateQuantitativePositionSizeUsdt({
@@ -318,7 +321,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
         stopLossPrice: computedStopLossPrice,
         kelly: kellyStats,
         venue: config.trading.venue,
-        leverage: config.trading.leverage,
+        leverage: effectiveLeverage,
         diversificationMultiplier: portfolioCorr.diversificationMultiplier,
       }),
     [
@@ -331,7 +334,7 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
       computedStopLossPrice,
       kellyStats,
       config.trading.venue,
-      config.trading.leverage,
+      effectiveLeverage,
       portfolioCorr.diversificationMultiplier,
     ]
   );
@@ -578,11 +581,13 @@ export const OrderTicketPanel: React.FC<OrderTicketPanelProps> = ({
                   onChange={(e) => onUpdateFuturesSettings(Number(e.target.value), marginType)}
                   className="bg-transparent font-mono text-xs font-semibold text-amber-300 focus:outline-none disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {[1, 2, 3, 5, 10, 15, 20].map((lv) => (
-                    <option key={lv} value={lv} className="bg-[#141820]">
-                      {lv}x
-                    </option>
-                  ))}
+                  {[1, 2, 3, 5, 10, 15, 20]
+                    .filter((lv) => lv <= leverageCeiling)
+                    .map((lv) => (
+                      <option key={lv} value={lv} className="bg-[#141820]">
+                        {lv}x
+                      </option>
+                    ))}
                 </select>
               </div>
               <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-[#0D1015] px-2.5 py-1.5">

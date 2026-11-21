@@ -368,7 +368,12 @@ export function attachWebSocketRelay(server: http.Server, ctx: WsRelayContext): 
       const envParam: BinanceEnv = sp.get('environment') === 'Production' ? 'Production' : sp.get('environment') === 'Testnet' ? 'Testnet' : ctx.getDefaultEnv();
       const catRaw = sp.get('category') ?? 'hot_volume';
       const category: TrendingCategory =
-        catRaw === 'top_gainers' || catRaw === 'top_losers' || catRaw === 'volatility_leaders' ? catRaw : 'hot_volume';
+        catRaw === 'top_gainers' ||
+        catRaw === 'top_losers' ||
+        catRaw === 'volatility_leaders' ||
+        catRaw === 'cts_momentum'
+          ? catRaw
+          : 'hot_volume';
       const rsRaw = sp.get('rankingSource') ?? 'auto';
       const rankingSource: TrendingRankingSource =
         rsRaw === 'production' || rsRaw === 'environment' ? rsRaw : 'auto';
@@ -402,7 +407,8 @@ export function attachWebSocketRelay(server: http.Server, ctx: WsRelayContext): 
             msg.category === 'hot_volume' ||
             msg.category === 'top_gainers' ||
             msg.category === 'top_losers' ||
-            msg.category === 'volatility_leaders'
+            msg.category === 'volatility_leaders' ||
+            msg.category === 'cts_momentum'
           ) {
             entry.query.category = msg.category;
           }

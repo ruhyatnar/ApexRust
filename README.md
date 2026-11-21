@@ -1,561 +1,354 @@
-# ApexRust Quant — Binance Multi-Pair Trading Bot & Web Command Center
+# ApexRust Quant
 
-A full-stack quantitative cryptocurrency trading platform combining an interactive **React 19 + TypeScript Web & Desktop PWA Command Center**, a local **Express Binance Signing, Order Ledger & Git Backup Proxy (`server.ts`)**, and a modular **8-crate Rust trading engine (`rust-bot/`)** built on the official **Binance Rust SDK (`binance-sdk 78.3.0`)** for **Binance Spot** and **Binance USD-M Futures**.
+Platform trading kuantitatif Binance dengan dua runtime yang dijaga **parity** satu sama lain:
 
----
+1. **WebApp / Desktop PWA** — React 19 + TypeScript + Tailwind v4, mesin simulasi `SimulationRuntime`, dan proxy Express (`server.ts`) untuk signing order, ledger SQLite, backup Git, serta relay WebSocket.
+2. **Rust Workspace** (`rust-bot/`) — 9 crate Tokio di atas `binance-sdk 78.3.0` untuk Spot & USD-M Futures, dapat dijalankan sebagai daemon 24/7 di VPS atau CLI desktop.
 
-## Table of Contents
+Setiap field konfigurasi, toggle fitur, aturan risiko, dan jalur eksekusi diimplementasikan di kedua runtime dengan unit test masing-masing (lihat `AGENTS.md`).
 
-1. [Installation](#installation)
-2. [System Architecture](#system-architecture)
-3. [Project Structure](#project-structure)
-4. [Core Trading & Quantitative Capabilities](#core-trading--quantitative-capabilities)
-5. [Web Command Center & Desktop PWA](#web-command-center--desktop-pwa)
-6. [Backend Proxy API (`server.ts`)](#backend-proxy-api-serverts)
-7. [Configuration, Persistence & Secret Hygiene](#configuration-persistence--secret-hygiene)
-8. [Rust Workspace (`rust-bot/`) & Headless Deployment](#rust-workspace-rust-bot--headless-deployment)
-9. [Environment Variables (`server.ts`)](#environment-variables-serverts)
-10. [Verification & Test Suite](#verification--test-suite)
-11. [Additional Documentation](#additional-documentation)
+> **Peringatan:** perangkat lunak ini dapat mengirim order nyata. Gunakan Testnet, `paper_trading = true`, dan `armed_for_live_orders = false` sampai strategi tervalidasi. Tidak ada jaminan profit; kerugian sepenuhnya tanggung jawab pengguna.
 
 ---
 
-## Installation
+## Daftar Isi
 
-### Quick Guided Installer (Recommended — Linux, macOS, Windows)
+1. [Fitur Utama](#fitur-utama)
+2. [Instalasi Cepat](#instalasi-cepat)
+3. [Menjalankan](#menjalankan)
+4. [Struktur Proyek](#struktur-proyek)
+5. [Kredensial, Ed25519 & WebSocket API](#kredensial-ed25519--websocket-api)
+6. [Konfigurasi (`bot.toml`)](#konfigurasi-bottoml)
+7. [Gate Entry & Screener](#gate-entry--screener)
+8. [Manajemen Risiko & Exit](#manajemen-risiko--exit)
+9. [Arsitektur Runtime](#arsitektur-runtime)
+10. [Environment Variables](#environment-variables)
+11. [Verifikasi & Pengujian](#verifikasi--pengujian)
+12. [Dokumentasi Lain](#dokumentasi-lain)
 
-Clone the repository and run the cross-platform installer. It checks/installs missing prerequisites (`Node.js ^20.19.0 || >=22.12.0`, Rust `>= 1.85.0`, and C/OpenSSL build headers) using user-local toolchains by default (prompting before any `sudo` call), builds the WebApp and/or Rust daemon, writes `.env` and a safe `paper_trading = true` `rust-bot/config/bot.toml`, and optionally registers auto-start services.
+---
+
+## Fitur Utama
+
+**Screening & pemilihan pair**
+
+- `static`, `hybrid`, dan `dynamic` watchlist dengan hysteresis ranking + dwell time untuk mencegah churn.
+- Kategori trending: `hot_volume`, `top_gainers`, `top_losers`, `volatility_leaders`, dan `cts_momentum`.
+- **CTS score** = RVOL 1 jam + momentum 1 jam + volume, masing-masing dinormalisasi ke `[0,1]` agar pair bervolume besar tidak otomatis menang. Metrik dihitung dari kandil 1 jam dan di-refresh tiap 5 menit di kedua runtime, dengan konkurensi fetch dibatasi.
+- Filter minat: quote volume minimum, RVOL minimum (`cts_min_rvol`), spread maksimum.
+
+**Gate entry (semua opsional dan dapat dimatikan)**
+
+| Gate | Field | Default |
+| :--- | :--- | :--- |
+| Tren EMA (fast/mid/slow/macro) | `ema_trend_filter` + `require_macro_ema_in_scalping` | aktif |
+| Momentum RSI pullback | `rsi_momentum_filter` | aktif |
+| Kekuatan ADX / DI spread / rising ADX | `adx_strength_filter` | aktif |
+| Bias VWAP | `vwap_bias_filter` | aktif |
+| Konfirmasi volume | `volume_confirmation_filter` | nonaktif |
+| **Tren HTF (EMA 1 jam)** | `htf_trend_filter`, `htf_ema_period` | nonaktif |
+| **Order Book Imbalance** | `obi_entry_filter`, `obi_levels`, `obi_min_imbalance` | nonaktif |
+| **Ekspansi ATR** | `atr_expansion_filter_enabled`, `atr_expansion_min_ratio` | nonaktif |
+| Donchian breakout | `donchian_lookback` (default **20**) | dipakai profil `ema_breakout` |
+| Sesi UTC | `session_window_filter` + `[[automation.session_windows]]` | nonaktif |
+
+**Eksekusi**
+
+- Order MARKET / LIMIT / LIMIT_MAKER, TP/SL bracket, dan OCO Spot sesuai aturan Binance.
+- USD-M Futures memakai `newOrderRespType=RESULT`; TP/SL kondisional dirutekan ke `POST /fapi/v1/algoOrder` dan direkonsiliasi lewat `GET /fapi/v1/openAlgoOrders`.
+- Exit `reduceOnly` melewati `marginType`/`leverage` agar error `-4048` tidak memblokir proteksi.
+- Rekonsiliasi order menggantung memverifikasi status exchange sebelum menghapus order lokal, dan mempromosikan `FILLED` menjadi posisi.
+- Failover WS → REST dengan watchdog heartbeat, backoff reconnect, dan batas kegagalan REST.
+- **WebSocket API** (`session.logon`) untuk entry tanpa bracket, dengan fallback REST otomatis.
+
+**Manajemen posisi**
+
+- Exit plan ATR: SL, TP1 (partial), TP2, break-even, trailing stop monoton.
+- Break-even dan trailing dievaluasi **sebelum** partial close TP1 sehingga runner tetap terlindungi.
+- Dynamic cancel pending order (runaway ATR, exhaustion, reversal), opsi flip posisi.
+- Exit berjalan 24/7; filter sesi hanya membatasi entry otomatis baru.
+
+**Risiko**
+
+- Circuit breaker harian: drawdown harian/pair, target profit harian, win/lose streak + cooldown, karantina pair.
+- **BTC crash guard**: memblokir entry baru saat BTC turun melewati ambang dalam jendela waktu tertentu. Feed basi (> `btc_crash_max_staleness_sec`) = fail-open; exit tidak pernah diblokir.
+- **Cap leverage**: `max_leverage` (default **3**) di-clamp pada config, TOML tersinkron, dan setiap jalur order.
+- Position sizing: fixed USDT, fixed risk %, dan Kelly (quarter/half/full) dengan blok expectancy negatif.
+- Volatility spike alert (ATR) + notifikasi Web Notification API.
+
+---
+
+## Instalasi Cepat
+
+Prasyarat: Node.js `^20.19.0 || >=22.12.0`, Rust `>= 1.85.0`, header build C/OpenSSL.
 
 ```bash
-git clone <your-repo-url> ApexRust
+git clone <repo-url> ApexRust
 cd ApexRust
 
-# Linux / macOS:
-./install.sh
-
-# Windows (PowerShell — or double-click install.cmd):
-.\install.ps1
+./install.sh          # Linux / macOS
+.\install.ps1         # Windows PowerShell (atau install.cmd)
 ```
 
-Once installed, manage everything with the bundled CLI (`./apexrust` on Linux/macOS, `.\apexrust.cmd` on Windows):
+Installer memeriksa/memasang toolchain user-local, membangun WebApp dan/atau daemon Rust, menulis `.env` serta `rust-bot/config/bot.toml` dengan `paper_trading = true`, dan opsional mendaftarkan service auto-start.
+
+Setup non-interaktif:
+
+```bash
+./install.sh --yes --non-interactive --components both \
+  --env testnet --venue spot --pair-mode hybrid \
+  --trending-category hot_volume --no-service
+```
+
+### Instalasi manual
+
+```bash
+npm install
+cp .env.example .env
+cp rust-bot/config/bot.example.toml rust-bot/config/bot.toml
+npm run build
+cd rust-bot && cargo build --release --workspace
+```
+
+---
+
+## Menjalankan
 
 ```bash
 ./apexrust start | stop | restart | status | logs -f | doctor | update
 ./apexrust token [status|show|generate|rotate|clear]
-./apexrust remote status | connect | use-local | use-vps
-./apexrust service install   # systemd --user (with optional --linger) / launchd / Scheduled Tasks
-./apexrust uninstall         # add --purge to remove .env, bot.toml, node_modules, dist & rust-bot/target
+./apexrust remote [status|connect|use-local|use-vps]
+./apexrust service install     # systemd --user, launchd, atau Scheduled Tasks
+./apexrust uninstall [--purge]
 ```
 
-For unattended CI / server setup (Linux, macOS, Windows):
+Pengembangan WebApp (Vite middleware + Express pada port `3000`):
 
 ```bash
-./install.sh --yes --non-interactive --components both --env testnet --venue spot --pair-mode hybrid --trending-category hot_volume --no-service
+npm run dev        # tsx server.ts
+npm run lint
+npm run build
 ```
 
-*(Windows equivalent: `.\install.ps1 --yes --non-interactive --components web --env testnet --venue spot --pair-mode hybrid --no-service`, or double-click `install.cmd` for interactive setup.)*
-
----
-
-### Manual Installation
-
-#### Prerequisites
-
-| Component | Requirement | Notes |
-| :--- | :--- | :--- |
-| **Node.js & npm** | Node `^20.19.0 \|\| >=22.12.0` & `npm` | Required for Web Command Center, Vite build & Express proxy |
-| **Rust Toolchain** | Rust `1.85+` (`cargo`, `rustc`) | Required for `rust-bot/` native trading daemon (install via [rustup.rs](https://rustup.rs)) |
-| **Linux Build Deps** | `build-essential`, `pkg-config`, `libssl-dev` | Required on Debian/Ubuntu when compiling Rust `openssl-sys` |
-| **Git** | `git 2.30+` | Used for repository cloning and sanitized Git config backups |
-
-### Step 1 — Clone the Repository
-
-```bash
-git clone <your-repo-url> ApexRust
-cd ApexRust
-```
-
-### Step 2 — Install WebApp & Proxy Dependencies
-
-```bash
-npm install
-```
-
-*(For production-only servers where you only need to serve a prebuilt `dist/` via `npm start`, `tsx` is included in `dependencies`, so `npm install --omit=dev` also works after `dist/` is built.)*
-
-### Step 3 — Configure & Build the Rust Desktop Engine (`rust-bot/`)
+Daemon Rust:
 
 ```bash
 cd rust-bot
-cp config/bot.example.toml config/bot.toml
-cargo build --release -p bot-desktop
-cd ..
+cargo run --release -p bot-desktop -- --config config/bot.toml
+cargo run --release -p bot-desktop -- --config config/bot.toml --web-port 8080
 ```
 
-*(The compiled binary is output to `rust-bot/target/release/bot-desktop`. Keep `rust-bot/config/bot.toml` local—it is gitignored.)*
-
-### Step 4 — Configure API Credentials (Optional Pre-Load)
-
-You can configure Binance Spot / USD-M Futures credentials directly in the UI (**Bot → Live Credentials**), or pre-load them via a root `.env` file (gitignored) or shell environment variables:
-
-```bash
-# Example .env at repository root (optional; Paper Sandbox works with zero keys)
-PORT=3000
-BINANCE_ENVIRONMENT=Testnet
-BINANCE_VENUE=Spot
-BINANCE_AUTH_METHOD=HMAC-SHA256
-BINANCE_API_KEY=your_api_key
-BINANCE_API_SECRET=your_api_secret
-# Optional >= 32-char Access Token guarding /api/* reads & writes (required when HOST=0.0.0.0; manage via `./apexrust token`)
-# APEXRUST_PROXY_TOKEN=your_32_plus_char_secret_token
-```
-
-### Step 5 — Run the Application
-
-#### Option A: Development Mode (Express + Vite Middleware)
-
-```bash
-npm run dev
-# Serves WebApp & Proxy at http://localhost:3000
-```
-
-#### Option B: Production Mode (Built `dist/` + Express Proxy)
-
-```bash
-npm run lint
-npm run build
-npm start
-# Serves production bundle + PWA at http://localhost:3000
-```
-
-#### Option C: Native Rust Desktop / Headless Daemon
-
-```bash
-# Run from repo root or rust-bot/
-./rust-bot/target/release/bot-desktop --config rust-bot/config/bot.toml --web-port 8080
-# Serves Rust Axum telemetry API & WebSocket at http://127.0.0.1:8080
-```
-
-#### Verify Running Services
-
-```bash
-curl -s http://127.0.0.1:3000/api/health
-curl -s http://127.0.0.1:8080/api/health
-```
-
-#### Optional: Install Desktop PWA & OS Auto-Start Service
-
-- **Desktop App (PWA)**: Open `http://localhost:3000` in Chromium/Chrome/Edge and click **Install Desktop App** in the header bar.
-- **Auto-Start OS Service** (`systemd --user` on Linux with optional `loginctl enable-linger`, `launchd` LaunchAgent on macOS, or per-user Scheduled Task on Windows):
-  ```bash
-  ./apexrust service install        # user-local auto-start (add --system on Linux for /etc/systemd/system)
-  ./apexrust service uninstall      # remove registered auto-start services
-  ```
-
-### 24/7 VPS Deployment (Cloudflare One Zero Trust) & Cross-Platform Desktop Connection
-
-You can run the 24/7 Rust Trading Daemon (`bot-desktop --daemon`) and Express Gateway (`server.ts`) continuously on a VPS over your **Cloudflare One Client (Zero Trust WARP Mesh `100.96.0.0/12` or `cloudflared` private tunnel)**, while monitoring, configuring API keys, viewing SQLite Order History, and placing manual orders from your **Windows, macOS, or Linux** computer—with instant switching between **`🖥️ This Computer`** and **`☁️ Remote VPS`**:
-
-1. **On the 24/7 VPS** (auto-detects your Cloudflare One WARP virtual IP and binds `bot-web` strictly to `127.0.0.1:8080`):
-   ```bash
-   ./install.sh --role vps --service
-   # Sets APEXRUST_ENGINE_AUTHORITY=daemon, APEXRUST_PERSIST_VAULT=true, and starts both `web` and `bot`
-   # UI-saved API keys land in `.apexrust/secrets.env` (0600, gitignored), never in `.env` or logs
-   ```
-   - Whitelist your VPS outbound IP in Binance API Management and keep public ports `3000`/`8080` blocked on public `ufw`/`eth0`.
-
-2. **On Your Desktop (Windows / macOS / Linux)**:
-   ```bash
-   # Linux / macOS:
-   ./install.sh --role client --remote-url http://100.96.x.y:3000 --remote-name "Tokyo VPS"
-   # Windows PowerShell:
-   .\install.ps1 -PassThruArgs --role client --remote-url http://100.96.x.y:3000 --remote-name "Tokyo VPS"
-   ```
-   - Open your local Desktop PWA at `http://localhost:3000` and click **`🖥️ This Computer`** / **`☁️ Remote VPS`** in the top header bar (or **`Bot → VPS & Server Connection`**) to switch between local simulation and your 24/7 VPS at any time.
-   - Use the cross-platform CLI on Windows (`apexrust.cmd` / `bot-desktop.exe`), macOS, or Linux:
-     ```bash
-     ./apexrust remote status
-     ./apexrust remote use-local     # switch Desktop PWA + bot-desktop back to This Computer
-     ./apexrust remote use-vps       # switch back to 24/7 Remote VPS
-
-     # Native Rust CLI remote monitor & controls:
-     ./rust-bot/target/release/bot-desktop connect --url http://100.96.x.y:3000 --name "Tokyo VPS"
-     ./rust-bot/target/release/bot-desktop remote watch
-     ./rust-bot/target/release/bot-desktop remote pause
-     ./rust-bot/target/release/bot-desktop remote manual-order --symbol BTCUSDT --side long --notional 150 --yes
-     ```
+Subcommand `bot-desktop` mencakup `connect` (profil VPS remote), `snapshot`, `watch`, `orders`, `trending`, `manual-order`, `trip-cb`/`reset-cb`, `flatten-all`, dan utilitas operasional lain; jalankan `cargo run -p bot-desktop -- --help`.
 
 ---
 
-## System Architecture
-
-ApexRust Quant maintains parity across two runtimes sharing an identical domain model (`BotConfig`, 19 `FeatureToggles`, streaming technical indicators, multi-profile strategies, ATR exit lifecycles, UTC session windows, and circuit-breaker risk rules):
-
-```text
-+-----------------------------------------------------------------------------+
-| Browser / Installable Desktop PWA (React 19 + Tailwind v4 + Workbox)        |
-|  - Isolated Paper SimulationRuntime ($10k virtual equity, localStorage)     |
-|  - Isolated Live SimulationRuntime (Binance WS + verified proxy execution)  |
-|  - Order History & Performance Analytics, Kelly Sizing & MTF 9-Step Audit   |
-|  - Web Notifications (ATR Volatility Spike Alerts & Live Fill Alerts)       |
-+------------------------------+--------------------------+-------------------+
-                               | /api/market/*,           | /api/git/*
-                               | /api/live/*, /api/orders/*
-                               v                          v
-+-----------------------------------------------------------------------------+
-| Express Control Proxy (server.ts :3000)                                     |
-|  - In-memory API Vault (HMAC-SHA256 / Ed25519 signing, zero disk secrets)   |
-|  - Exchange filter rounding (tickSize / stepSize) & max notional safety cap |
-|  - Order execution SQLite WAL DB (.apexrust-orders.sqlite) + allOrders sync   |
-|  - Sanitized Git backup writer (backups/bot-config-backup.json + TOML)      |
-+------------------------------+----------------------------------------------+
-                               |
-                               v
-+-----------------------------------------------------------------------------+
-| Binance Spot (/api/v3/*) & USD-M Futures (/fapi/v1/*, /fapi/v3/*)           |
-|  - Testnet & Production REST + WebSocket Streams                            |
-+------------------------------^----------------------------------------------+
-                               | (Native 24/7 Alternative / Parity Engine)
-+------------------------------+----------------------------------------------+
-| Rust 8-Crate Workspace (rust-bot/, Tokio + binance-sdk 78.3.0)              |
-|  - bot-desktop CLI / systemd daemon + bot-web Axum telemetry bridge (:8080) |
-|  - WebSocket primary feed with automatic REST fallback & exponential backoff|
-+-----------------------------------------------------------------------------+
-```
-
----
-
-## Project Structure
+## Struktur Proyek
 
 ```text
 .
-├── index.html                        # HTML shell, PWA icons/meta, dark theme bootstrap
-├── package.json                      # Node scripts (dev, build, start, preview, clean, lint)
-├── tsconfig.json                     # TypeScript compiler configuration
-├── vite.config.ts                    # Vite + Tailwind CSS v4 + VitePWA (Workbox offline cache)
-├── server.ts                         # Express server: market proxy, Live Vault, order logs, Git backup, Vite/dist
-├── .gitignore                        # Excludes node_modules, dist, .env*, *.pem, .apexrust-order-logs.json
-├── public/                           # App icons (icon.svg, favicon.ico, apple-touch-icon, pwa-192/512/maskable)
-├── backups/
-│   └── bot-config-backup.json        # Sanitized config snapshot written by Git backup sync
-├── src/
-│   ├── main.tsx                      # React 19 entry point
-│   ├── App.tsx                       # Root shell, Paper/Live runtime isolation, WS/REST feed loop, alerts
-│   ├── index.css                     # Tailwind CSS v4 global theme
-│   ├── hooks/
-│   │   ├── useOnlineStatus.ts        # Browser navigator.onLine status hook for OfflineIndicator
-│   │   └── usePWAInstall.ts          # beforeinstallprompt & standalone display-mode detection hook
-│   ├── engine/
-│   │   ├── types.ts                  # Shared domain types (BotConfig, FeatureToggles, OrderExecutionLog, etc.)
-│   │   ├── indicators.ts             # Streaming EMA(9/21/50/200), Wilder RSI(14), ADX(14)+DI, ATR(14), VWAP, Vol Ratio
-│   │   ├── strategy.ts               # Strategy profiles (trend_pullback, ema_breakout, vwap_reversion) & ATR exits
-│   │   ├── risk.ts                   # Daily drawdown caps, per-pair quarantine, profit lock, streak cooldowns, CB
-│   │   ├── quantAnalytics.ts         # Expectancy E(R), Profit Factor regimes, Kelly G(f), C^-1 covariance, 9-step audit
-│   │   ├── sessionWindows.ts         # Daily UTC market liquidity window parser, overnight wrap & presets
-│   │   ├── orderHistoryAnalytics.ts  # Order filtering, UTC date bounds, equity curve, drawdown, metrics & CSV export
-│   │   ├── liveFillNotifications.ts  # Live fill deduplication & desktop Web Notification dispatcher
-│   │   ├── configStorage.ts          # Schema-safe deep-merge & localStorage persistence for config & UI state
-│   │   ├── simulator.ts              # Deterministic multi-pair SimulationRuntime & DEFAULT_BOT_CONFIG
-│   │   ├── indicators.test.ts        # Streaming indicator unit tests
-│   │   ├── riskAndStrategy.test.ts   # Strategy profile, ATR exit & circuit-breaker unit tests
-│   │   ├── configStorage.test.ts     # Config persistence & backward-compatibility merge tests
-│   │   ├── sessionWindows.test.ts    # UTC session window & overnight wrap tests
-│   │   ├── orderHistoryAnalytics.test.ts # Order filtering, UTC date range, metrics & CSV export tests
-│   │   └── liveFillNotifications.test.ts # Live execution notification deduplication & formatting tests
-│   └── components/
-│       ├── TradingDeskView.tsx       # Primary trading desk: Auto-Trading strip, chart, ticket, positions & ledgers
-│       ├── CandlestickChart.tsx      # Interactive SVG candlestick/line chart with EMA, VWAP & SL/BE/TP overlays
-│       ├── OrderTicketPanel.tsx      # Manual Spot/Futures ticket, OCO brackets, Kelly sizing & 9-step checklist
-│       ├── SummaryCardsRow.tsx       # Equity, win/loss donut, daily PnL sparkline & transport telemetry cards
-│       ├── MarketsAndSignalsView.tsx # Multi-pair scanner table, WS/REST failover controls & MTF signal cards
-│       ├── OrderHistoryView.tsx      # Unified Paper/Live order history, performance analytics, CSV export & Binance sync
-│       ├── DateRangePicker.tsx       # UTC date range calendar picker with Today / 7D / 30D presets
-│       ├── TradeHistoryView.tsx      # Binance-schema execution history (myTrades / userTrades), JSON inspect & sync
-│       ├── StrategyConfigView.tsx    # Strategy profiles, order methods, ATR exits & ATR Volatility Spike Alerts
-│       ├── FeatureTogglesView.tsx    # 19 modular feature switches + Daily High-Liquidity UTC Session Windows editor
-│       ├── RiskCircuitBreakerView.tsx# Drawdown/profit gauges, quarantine table, Kelly G(f) curve & covariance matrix
-│       ├── LiveCredentialsView.tsx   # Server-side HMAC-SHA256 / Ed25519 key vault, Testnet/Prod & Live arming gate
-│       ├── GitBackupView.tsx         # Sanitized Git init, remote config, commit & push UI
-│       ├── RustCodebaseView.tsx      # In-app browser for rust-bot/ crates, docs, TOML configs & systemd scripts
-│       └── PWAInstallButton.tsx      # Desktop PWA installer button, setup dialog & OfflineIndicator banner
-└── rust-bot/                         # 8-crate Rust Cargo workspace (see rust-bot/README.md)
-    ├── Cargo.toml
-    ├── README.md
-    ├── config/
-    │   ├── bot.example.toml          # Reference Spot/Futures, Automation, Session Windows, Features & Risk config
-    │   └── bot.synced.toml           # Auto-generated sanitized snapshot synced from Web Command Center
-    ├── deploy/
-    │   └── git-backup.sh             # Sanitized Git commit & push helper
-    ├── docs/
-    │   ├── ARCHITECTURE.md
-    │   ├── STRATEGY_GUIDE.md
-    │   └── AI_HANDOFF.md
-    └── crates/
-        ├── bot-core/                 # Shared types, BotConfig, UtcSessionWindow, FeatureToggles, VolatilitySpikeAlert
-        ├── bot-indicators/           # Streaming EMA(9/21/50/200), Wilder RSI(14), ADX(14), ATR(14), VWAP, Vol Avg(20)
-        ├── bot-strategy/             # Multi-profile entry evaluators & ATR exit lifecycle manager
-        ├── bot-risk/                 # Pair & cumulative drawdown, profit lock, streak cooldown & Circuit Breaker
-        ├── bot-exchange/             # binance-sdk Spot + USD-M Futures REST/WS clients & FailoverGateway
-        ├── bot-engine/               # Tokio multi-pair orchestrator, UTC window gating, vol alerts & git_sync
-        ├── bot-web/                  # Embedded Axum HTTP + WebSocket telemetry server (:8080)
-        └── bot-desktop/              # Linux Desktop CLI & systemd daemon binary
+├── src/                     # React PWA: engine TS, komponen UI, adapter
+│   ├── engine/              # SimulationRuntime, indikator, strategi, risiko, storage
+│   ├── server/              # Screener hub, order ledger, relay WS
+│   └── components/          # Command Center
+├── server.ts                # Express: signing, /api/live/*, /api/market/*, /api/git/*
+├── rust-bot/
+│   ├── crates/
+│   │   ├── bot-core/        # BotConfig, 21 FeatureToggles, tipe domain, watchlist/CTS
+│   │   ├── bot-indicators/  # EMA, RSI, ADX, ATR, VWAP, Donchian, SMA50(ATR), OBI
+│   │   ├── bot-strategy/    # 3 profil + gate entry + exit plan
+│   │   ├── bot-risk/        # Circuit breaker, sizing, BTC guard
+│   │   ├── bot-exchange/    # binance-sdk, WS market, WS API, failover, depth
+│   │   ├── bot-engine/      # Orkestrasi Tokio, HTF/CTS refresh, paper/live
+│   │   ├── bot-web/         # Axum REST + WS telemetry
+│   │   ├── bot-desktop/     # CLI & daemon 24/7
+│   │   └── bot-keygen/      # Generator kunci Ed25519
+│   ├── config/bot.example.toml
+│   └── docs/ARCHITECTURE.md
+├── arsitektur-trading-bot-rust.md   # Spesifikasi + status implementasi (§9)
+└── AGENTS.md                        # Aturan parity & verifikasi
 ```
 
 ---
 
-## Core Trading & Quantitative Capabilities
+## Kredensial, Ed25519 & WebSocket API
 
-### 1. Multi-Venue Execution (Binance Spot & USD-M Futures)
+### Penyimpanan kredensial
 
-- **Venues, Modes & Environments**: Supports **Binance Spot** (`/api/v3/*`) and **Binance USD-M Futures** (`/fapi/v1/*`, `/fapi/v3/*` with automatic `/fapi/v2/*` fallback) in One-Way (`BOTH` + `reduceOnly`) or Hedge Mode (`LONG`/`SHORT`) across **Testnet** and **Production**. Spot strictly enforces `long_only` (rejects Spot short-open attempts and disables `autoFlipOnReversal`).
-- **3 Watchlist & Pair Discovery Modes**:
-  - `static` (*Static Only*): Trades exclusively your pinned watchlist pairs.
-  - `hybrid` (*Pinned + Auto-Trending*, default): Monitors your pinned watchlist alongside auto-rotating trending pairs (`trendingTopN`) up to `maxWatchlistPairs`.
-  - `dynamic` (*Full Auto-Trending*): Continuously rotates active watchlist pairs via Binance's live `!miniTicker@arr` WebSocket screener (`hot_volume`, `top_gainers`, `top_losers` for Futures shorts, `volatility_leaders`) with **Zero Orphan Protection** (open positions and pending orders are never dropped), rank hysteresis buffer (`N + 3`), `15m` minimum dwell, and `exchangeInfo` venue/environment validation.
-- **WebSocket-First & Binance Rate-Limit Compliant**: Combined `<sym>@kline_<tf>` + `<sym>@bookTicker` streams plus `!miniTicker@arr` screener WS use debounced in-place `SUBSCRIBE`/`UNSUBSCRIBE` diffs (respecting Spot `<= 5 msg/s`, Futures `<= 10 msg/s`, `<= 1024 streams/conn`, and `< 23h` reconnect), 30-minute `exchangeInfo` TTL cache, staggered 220-bar warmup, and `X-MBX-USED-WEIGHT-1M >= 70%` + `429`/`418 Retry-After` throttling.
-- **User Data Stream Reconciliation**: The Rust daemon keeps a per-account `listenKey` (Spot `POST /api/v3/userDataStream`, Futures `POST /fapi/v1/listenKey`) with 30-minute keepalive, automatic key recreation, and reconnects. `executionReport` / `ORDER_TRADE_UPDATE` events wake the order reconciler immediately instead of waiting for the next 3s poll; `X-MBX-ORDER-COUNT-10S/1M` headers gate new orders before Binance returns a ban-triggering 429.
-- **11-Layer Anti-False-Signal Mitigation Matrix**: Enforces EMA `9/21/50/200` alignment (`requireMacroEmaInScalping`), distance caps (`maxEmaMidExtensionAtr`, `maxVwapExtensionAtr`), candle close strength & body ratio anti-wick gates, ADX + `minDiSpread` (+ optional rising ADX), volume expansion multiplier, live `@bookTicker` spread guard (`maxSpreadBps`), `minWarmupBars`, and per-direction concurrency limits (`maxSameDirectionPositions`).
-- **Dynamic Pending Auto-Cancel & Early Reversal Protection**: Auto-cancels resting auto limits when signals reverse (`SignalReversed` + cooldown bypass for fast opposite entries), momentum exhausts (`MomentumExhaustion`), price runs away (`PriceRunaway`), or TTL bars expire (`ExpiredBars`). Uses `POST /api/live/cancel-order` so Binance `-2011` (`Unknown order sent`) verifies order status and promotes already-`FILLED` limits instead of dropping them. Early open-position management supports `SignalReversal` exits (Spot safe close; optional Futures `autoFlipOnReversal`) and `0.55×` ATR trailing tightening (`tightenTrailingOnExhaustion`).
-- **Futures Controls**: Configurable leverage (`1x–20x`), `ISOLATED` or `CROSSED` margin alignment (`/fapi/v1/marginType`, `/fapi/v1/leverage`), skipping margin/leverage calls on `reduceOnly` exits so Binance error `-4048` never blocks protective closes.
-- **Order Types & Safeguards**:
-  - `MARKET` (Spot `quoteOrderQty` on buys or filter-rounded `quantity` on sells/Futures)
-  - `LIMIT` with configurable `timeInForce` (`GTC`, `IOC`, `FOK`) and `limitOffsetBps`
-  - Post-Only Maker (`LIMIT_MAKER` on Spot; `LIMIT` + `GTX` on USD-M Futures)
-  - `ATR SCALP` and **OCO Brackets** (Spot `/api/v3/orderList/oco`; Futures conditional `/fapi/v1/algoOrder` `TAKE_PROFIT_MARKET` + `STOP_MARKET` on `MARK_PRICE` with `priceProtect = "true"`)
-  - Optional preflight validation (`/api/v3/order/test` or `/fapi/v1/order/test`) and server-enforced `maxOrderNotionalUsdt` cap (`$250` default).
+- Kunci yang disimpan dari UI ditulis ke `.apexrust/secrets.env` (mode `0600`, gitignored) bila `APEXRUST_PERSIST_VAULT=true`; selain itu hanya di memori proses.
+- Variabel environment proses selalu menang atas file.
+- Jangan pernah commit `.env*`, `*.pem`, `*.key`, `rust-bot/config/bot.toml`, `rust-bot/keys/`, atau `.apexrust-order-logs.json`.
 
-### 2. Strict Paper Sandbox vs Live Execution Isolation
+### Generate kunci Ed25519
 
-- `App.tsx` maintains two completely isolated `SimulationRuntime` instances (`paperRuntimeRef` and `liveRuntimeRef`) toggled from the header (`Paper` vs `Live`):
-  - **Paper Sandbox**: Virtual `$10,000` initial equity, deterministic simulated klines or public Binance WebSocket feed, local fill simulation, and zero authenticated order requests.
-  - **Live Execution**: Prohibits synthetic simulation feeds, synchronizes real account balances from `/api/live/verify`, and dispatches signed orders only after credentials are configured and Live Execution is explicitly armed. New live fills (`FILLED` / `PARTIALLY_FILLED`) emit deduplicated desktop Web Notifications via `liveFillNotifications.ts`.
-
-### 3. Streaming Technical Indicators (`indicators.ts` / `bot-indicators`)
-
-| Indicator | Period | Purpose |
-| :--- | :--- | :--- |
-| **EMA Stack** | `9 / 21 / 50 / 200` | Short/mid trend stack & intraday macro trend filter |
-| **Wilder RSI** | `14` | Pullback zone detection (`42–58` default) & directional momentum curl |
-| **ADX + DI** | `14` | Trend strength filter (`>= 25` default) & `+DI / -DI` directional bias |
-| **ATR** | `14` | Volatility normalization for SL/TP/trailing distances & spike alerts |
-| **Session VWAP** | `00:00 UTC` reset | Institutional intraday fair-value alignment |
-| **Volume Baseline** | `20` bars | Volume expansion confirmation (`volume / avg_vol_20`) |
-
-### 4. Strategy Profiles, Volume Gate & UTC Liquidity Windows
-
-- **`trend_pullback`** (Default): EMA `9/21/50` stack (plus `Close > EMA 200` in `intraday` mode) + `ADX >= adxMinTrend` with `+DI > -DI` (or `-DI > +DI` for shorts) + `RSI(14)` curl inside pullback bounds + optional Session VWAP alignment.
-- **`ema_breakout`**: 10-bar Donchian high/low breakout confirmed by stacked EMAs, `ADX(14)`, and `>= 1.1x` recent volume surge.
-- **`vwap_reversion`**: Fades `>= 1.1x ATR` stretches away from Session VWAP (or `EMA 21` when VWAP filter is off) when RSI curls from oversold/overbought (`<= 38` / `>= 62`) under bounded ADX.
-- **Volume Expansion Gate** (`volumeConfirmationFilter`): Enforces bar volume `>= minVolumeExpansionMult` (`1.5x` default) × 20-bar mean volume.
-- **Daily High-Liquidity Market Sessions (UTC)** (`sessionWindowFilter`): When enabled, restricts **new automated entries** to active `[[automation.session_windows]]` UTC intervals (default presets: `London Open` `07:00–11:00`, `London / NY Overlap` `12:30–16:30`, `US Equities Close` `19:00–21:00` disabled; additional presets include `Tokyo / Asia Open` and `NY Cash Open`; supports overnight wrap such as `22:00–02:00`). Open position exit management continues **24/7** regardless of session windows.
-
-### 5. ATR Exit Lifecycle & Volatility Spike Alerts
-
-- **Initial Stop Loss ($SL_0$)**: `Entry ± (atrSlMultiplier × ATR)` (`1.5x` default, defining `1R`).
-- **Partial Take Profit ($TP_1$)**: `atrTp1Multiplier × ATR` (`2.25x` = `1.5R`), closing `tp1CloseRatio` (`50%` default).
-- **Automatic Break-Even**: Moves SL to `Entry ± breakEvenFeeBufferBps` (`25 bps` TS default / `12 bps` `bot.example.toml`) once gain reaches `breakEvenTriggerR` (`1.0R`).
-- **Monotonic ATR Trailing Stop**: Ratchets SL strictly in the profitable direction once `trailingActivationR` (`1.2R`) is reached (`atrTrailingMultiplier = 1.4x`).
-- **Final Runner Target ($TP_2$)**: `atrTp2Multiplier × ATR` (`3.75x` = `2.5R`).
-- **ATR Volatility Spike Alerts**: Monitors closed-candle `ATR(14) / Price` (`atrSpikePctThreshold = 0.45%`) and TR/ATR expansion vs rolling 10-bar baseline (`atrExpansionRatioThreshold = 1.25x`) with per-pair cooldown (`volatilityAlertCooldownSec = 60s`), dispatching in-app banners and browser Web Notifications.
-
-### 6. Quantitative Sizing, Risk Circuit Breaker & Order Analytics
-
-- **Position Sizing Modes**: `fixed_usdt`, `fixed_risk_pct`, `quarter_kelly` (`0.25 f*`), `half_kelly` (`0.50 f*`), and `full_kelly` (`1.00 f*`) using expected log utility $G(f)$ and portfolio inverse-covariance diversification $C^{-1}\mu$, halting automated Kelly entries when $f^* \le 0$.
-- **Quantitative Analytics (`quantAnalytics.ts`)**: Expectancy $E(R)$, Profit Factor regimes (`NetLosing`, `SubThreshold`, `ViableEdge`, `StrongEdge`, `OverfitWarning`), Multi-Timeframe alignment (`D1/H4/H1/M5`), and 9-Step Pre-Trade Validation.
-- **Risk & Circuit Breaker (`risk.ts` / `bot-risk`)**: Cumulative daily drawdown cap (`3.0%`), per-pair daily drawdown quarantine (`1.25%`), daily profit target lock (`5.0%`), win/lose streak cooldowns (`5` wins / `3` losses → `30m`), and emergency Flatten All.
-- **Order History & Performance Analytics (`orderHistoryAnalytics.ts`)**: Filterable by account mode, venue, status, symbol, search query, and UTC date range (`Today`, `7D`, `30D`, or custom calendar bounds), computing fill rate, maker/taker ratio, net realized PnL, profit factor, average R-multiple, P95 latency, cumulative equity curve, max drawdown, and RFC-4180 CSV export.
-
-### 7. Granular Feature Toggles (19 Independent Switches)
-
-Configurable in **Bot → Feature Toggles** and `[features]` in Rust TOML:
-
-| Category | Feature Flags |
-| :--- | :--- |
-| **Execution & Signal Core** | `automatedTrading`, `sessionWindowFilter`, `manualTrading`, `signalGenerator` |
-| **Binance Market Venues** | `spotMarket`, `futuresMarket` |
-| **Connectivity & Failover** | `wsPrimaryFeed`, `restFallback` |
-| **Technical Indicator Filters** | `emaTrendFilter`, `rsiMomentumFilter`, `adxStrengthFilter`, `vwapBiasFilter`, `volumeConfirmationFilter` |
-| **ATR Exits & Protection** | `atrDynamicExits`, `takeProfitLadder`, `breakEvenStop`, `trailingStop` |
-| **Risk Guard & Backup** | `circuitBreaker`, `gitAutoBackup` |
-
----
-
-## Web Command Center & Desktop PWA
-
-### Navigation & Views
-
-- **Trade (`TradingDeskView.tsx`)**: Auto-Trading header strip, summary KPI cards, interactive SVG candlestick chart (EMA `9/21/50/200`, VWAP, SL/BE/TP overlays), manual Spot/Futures order ticket with Kelly sizing & 9-step audit, and open positions/pending/closed trade ledgers.
-- **Markets (`MarketsAndSignalsView.tsx`)**: Multi-pair live scanner (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`, `BNBUSDT`, `AVAXUSDT`), WebSocket/REST transport failover telemetry, and per-pair inspection.
-- **Orders (`OrderHistoryView.tsx`)**: Unified Paper/Live order execution ledger, UTC `DateRangePicker`, equity/drawdown analytics, JSON inspector, CSV export, and Binance `allOrders` sync.
-- **Bot**:
-  - **Strategy (`StrategyConfigView.tsx`)**: Strategy profiles, order execution methods, ATR exit multipliers, and ATR Volatility Spike Alerts console.
-  - **Features (`FeatureTogglesView.tsx`)**: 19 modular feature switches and Daily High-Liquidity UTC Session Windows editor.
-  - **Risk (`RiskCircuitBreakerView.tsx`)**: Daily drawdown/profit gauges, per-pair quarantine controls, Kelly $G(f)$ utility curve, and $C^{-1}$ covariance matrix.
-  - **Credentials (`LiveCredentialsView.tsx`)**: Server-side `HMAC-SHA256` / `Ed25519` vault, Testnet/Production & Spot/Futures selector, balance verification, and Live Arming gate.
-  - **Git Backup (`GitBackupView.tsx`)**: Sanitized Git repository initialization, remote setup, snapshot commit, and push controls.
-- **Signal (`MarketsAndSignalsView.tsx`)**: Multi-timeframe (`D1/H4/H1/M5`) signal matrix and per-pair indicator checklist.
-- **Rust (`RustCodebaseView.tsx`)**: In-app explorer for the `rust-bot/` crates, TOML config templates, `systemd` service, and architecture docs.
-
-### Desktop & Mobile PWA Support
-
-Configured in `vite.config.ts` via `vite-plugin-pwa`:
-- Installable standalone window (`display: "standalone"`) via the **Install Desktop App** header button (`PWAInstallButton.tsx`) or browser prompt.
-- Workbox precaches static assets (`js`, `css`, `html`, `ico`, `png`, `svg`, `woff`, `woff2`) and Google Fonts while excluding `/api/*` and `/_ah/*` via `navigateFallbackDenylist` so API requests always hit Express.
-- `OfflineIndicator` surfaces network status while keeping the Paper Sandbox operational offline.
-
----
-
-## Backend Proxy API (`server.ts`)
-
-Express runs on port `3000` (`0.0.0.0:3000`), mounting Vite middleware in development or serving `dist/` in production. Mutating requests to `/api/live/*`, `/api/git/*`, and `/api/orders/*` reject `sec-fetch-site: cross-site` headers.
-
-| Method & Path | Purpose |
-| :--- | :--- |
-| `GET /api/health`, `/_ah/health` | Health check returning active environment and venue |
-| `GET /api/market/screener` | Live Binance `!miniTicker@arr` WebSocket screener snapshot (`hot_volume`, `top_gainers`, `top_losers`, `volatility_leaders`) filtered by active venue/env `exchangeInfo` |
-| `POST /api/ws-ticket` | Issues a single-use 30-second ticket for `WS /ws/telemetry` and `WS /ws/screener` (tokens stay out of URLs); `?token=` remains as a deprecated fallback |
-| `WS /ws/screener` | Pushes real-time `screener_snapshot` updates and accepts live JSON filter updates without polling |
-| `WS /ws/telemetry` | Streams real-time Rust daemon telemetry snapshots to the Web UI and `bot-desktop` CLI |
-| `GET /api/market/klines` | Public Binance Spot/Futures kline proxy (avoids browser CORS on Futures/Testnet) |
-| `GET /api/market/ticker` | Public Binance Spot/Futures ticker proxy |
-| `GET /api/live/config` | Masked vault status (`apiKeyMasked`, venue, environment, leverage, balances; secrets never returned) |
-| `POST /api/live/config` | Stores Binance Spot/Futures credentials (`HMAC-SHA256` or `Ed25519`), venue, leverage, margin & notional cap in server memory |
-| `POST /api/live/verify` | Executes signed `/api/v3/account` or `/fapi/v3/account` (with `/fapi/v2/account` fallback) check & syncs wallet balances |
-| `POST /api/live/arm` | Arms or disarms live order execution (requires explicit confirmation in `Production`) |
-| `POST /api/live/order` | Runs optional `/order/test` preflight and executes `MARKET`, `LIMIT`, `LIMIT_MAKER`/`GTX`, or `OCO`/bracket orders with filter rounding & `maxOrderNotionalUsdt` cap |
-| `GET /api/live/open-orders` | Queries open Binance Spot/Futures orders (`/api/v3/openOrders` or `/fapi/v1/openOrders` + `GET /fapi/v1/openAlgoOrders`) |
-| `GET /api/live/order-status` | Queries single order status (`/api/v3/order` or `/fapi/v1/order`) to reconcile filled vs canceled resting limit orders |
-| `POST /api/live/cancel-open-brackets` | Cancels open Spot OCO order lists or Futures algo orders for a symbol |
-| `POST /api/live/cancel-order` / `DELETE /api/live/order` | Cancels an open Spot/Futures order, OCO list, or Futures algo order (`-2011` checks status, promotes fills, and updates SQLite `NEW -> CANCELED`) |
-| `GET /api/live/trades` | Pulls signed account trade fills (`/api/v3/myTrades` or `/fapi/v1/userTrades`) |
-| `DELETE /api/live/config` | Clears credentials from server memory and disarms live execution |
-| `GET /api/orders/history` | Queries persisted SQLite WAL DB (`.apexrust-orders.sqlite`), merging incremental `allOrders` sync across active + historical DB pairs |
-| `POST /api/orders/history` | Upserts paper or live order execution logs |
-| `DELETE /api/orders/history` | Clears order execution logs (`Paper`, `Live`, or `ALL`) |
-| `GET /api/git/status` | Returns Git initialization state, branch, sanitized remote URL, dirty files, and recent commits |
-| `POST /api/git/init` | Ensures secret-safe `.gitignore` and initializes local Git repository |
-| `POST /api/git/remote` | Validates and configures `origin` HTTPS/SSH remote URL |
-| `POST /api/git/backup` | Writes `backups/bot-config-backup.json` & `rust-bot/config/bot.synced.toml` and commits (with optional push) |
-
----
-
-## Configuration, Persistence & Secret Hygiene
-
-- **Browser `localStorage` (`src/engine/configStorage.ts`)**:
-  - `apexrust_bot_config_v1`: Persists `BotConfig` via `mergeBotConfigWithDefaults` so older saved configs safely backfill newly added schema fields.
-  - `apexrust_ui_state_v1`: Persists `accountMode` (`Paper`/`Live`), active navigation tab/sub-tab, `selectedSymbol`, `environment`, and `paperFeedSource`.
-- **Sanitized Config Sync**:
-  - Triggering Git Backup writes `backups/bot-config-backup.json` and `rust-bot/config/bot.synced.toml` with zero API keys or private keys.
-- **Secret Hygiene**:
-  - API keys and signing secrets remain strictly in server process memory (`server.ts`) or environment variables / local `bot.toml` (gitignored). `.gitignore` excludes `.env`, `.env.*`, `*.pem`, and `.apexrust-order-logs.json` (and `git-backup.sh` also ensures `*.key`, `config/bot.toml`, and `backups/*.secret*` are ignored).
-
-### Managing the Access Token (`APEXRUST_PROXY_TOKEN`)
-
-When binding `server.ts` on `0.0.0.0` or a public IP (`HOST=0.0.0.0` or `./apexrust start --host 0.0.0.0`), `APEXRUST_PROXY_TOKEN` (**minimum 32 characters**) is required unless running over a loopback (`127.0.0.1`), RFC1918 LAN, or Cloudflare One Zero Trust WARP (`100.64.0.0/10`) IP. When set, every `/api/*` endpoint (except `/api/health` and the unauthenticated check of `/api/connection/info`) requires the token via `Authorization: Bearer <token>` or `X-ApexRust-Token`.
-
-Use the built-in CLI helper on Linux, macOS (`./apexrust`), or Windows (`.\apexrust.cmd`):
-
-| Action | Command | Behavior |
-| :--- | :--- | :--- |
-| **Inspect masked status** | `./apexrust token` | Displays bind host, masked `APEXRUST_PROXY_TOKEN` / `APEXRUST_WEB_TOKEN`, and length |
-| **View full token** | `./apexrust token show` | Prints the current `APEXRUST_PROXY_TOKEN` from `.env` ready to copy |
-| **Generate without saving** | `./apexrust token generate` | Generates a random 48-char hex token (`--bytes 32` for 64 chars) |
-| **Rotate / set & apply** | `./apexrust token rotate` | Generates a fresh 48-char token (or pass `--token <32+-char>`), backs up `.env` -> `.env.bak`, writes `.env` (`chmod 600`), and restarts `web` |
-| **Disable token safely** | `./apexrust token clear --host 127.0.0.1` | Clears `APEXRUST_PROXY_TOKEN` (blocks unsafe removal while `HOST=0.0.0.0`; pass a Cloudflare WARP/loopback `--host`) |
-
-**Unlocking in the WebApp & Desktop Clients:**
-- **Direct browser access (`http://<vps-ip>:3000` or `http://100.96.x.y:3000`)**: An inline **Access Token Unlock** bar appears automatically at the top of the UI when the server requires a token — paste it once to unlock your browser session (`sessionStorage` only).
-- **Local PWA → Remote VPS**: Open **Bot → VPS & Server Connection** and enter the VPS URL and Access Token.
-- **Rust CLI / `bot-desktop`**: Pass `--remote-token <token>` when linking:
-  ```bash
-  ./apexrust remote connect --remote-url http://<vps-ip>:3000 --remote-token "<token>"
-  ```
-
----
-
-## Rust Workspace (`rust-bot/`) & Headless Deployment
-
-The `rust-bot/` workspace implements the full trading engine in Rust (`edition = "2021"`, `binance-sdk 78.3.0`, `tokio 1.47`, `axum 0.8`):
-
-| Crate | Responsibility |
-| :--- | :--- |
-| `bot-core` | Shared models, Spot/Futures `BotConfig`, `UtcSessionWindow`, `FeatureToggles`, `VolatilitySpikeAlert` |
-| `bot-indicators` | Streaming `EMA(9/21/50/200)`, `Wilder RSI(14)`, `ADX(14) + DI`, `ATR(14)`, `Session VWAP`, `Vol Avg(20)` |
-| `bot-strategy` | `trend_pullback`, `ema_breakout`, `vwap_reversion` evaluators & ATR exit lifecycle manager |
-| `bot-risk` | Pair & cumulative daily drawdown limits, profit lock, streak cooldowns & Circuit Breaker |
-| `bot-exchange` | `binance-sdk` Spot + USD-M Futures REST/WS clients, `MARKET`/`LIMIT`/`GTX`/`OCO`, and `FailoverGateway` |
-| `bot-engine` | Tokio multi-pair orchestrator, UTC session window gating, volatility spike monitor & `git_sync` |
-| `bot-web` | Embedded Axum HTTP + WebSocket telemetry bridge (`:8080`): `GET /api/health`, `/api/config`, `/api/snapshot`, `GET /api/market/screener`, `POST /api/watchlist`, `POST /api/control`, `WS /ws/telemetry`, `WS /ws/screener` |
-| `bot-desktop` | Cross-platform Desktop CLI & daemon (`Linux`/`macOS`/`Windows`): local/VPS engine plus `remote watch` (`/ws/telemetry` WS + HTTP fallback), `remote trending`, `remote watchlist`, `remote orders`, and `remote manual-order` |
-
-### Linux `systemd` & Sanitized Git Backup
+Dua jalur, keduanya menulis private key PKCS#8 (mode `0600`) dan public key:
 
 ```bash
+# Rust (butuh cargo)
 cd rust-bot
-cp config/bot.example.toml config/bot.toml
-cargo build --release -p bot-desktop
-
-# Optional OS auto-start service install & sanitized Git snapshot
-../apexrust service install bot --linger
-./deploy/git-backup.sh
+cargo run -p bot-keygen -- --environment testnet --out-dir keys --label main
+# -> keys/ed25519-testnet-main.pem, keys/ed25519-testnet-main.pub.pem
 ```
 
+```bash
+# WebApp proxy (menulis ke .apexrust/keys/, mode 0700)
+curl -X POST http://127.0.0.1:3000/api/live/ed25519-keygen \
+  -H 'Content-Type: application/json' \
+  -d '{"environment":"Testnet","label":"main","overwrite":false}'
+```
+
+Respons berisi `privateKeyPath`, `publicKeyPath`, `publicKeyPem`, `publicKeyBase64`, dan `fingerprint`. Daftarkan **public key** di Binance API Management, lalu set:
+
+```toml
+[exchange]
+use_ws_api_orders = true
+
+[exchange.credentials]
+auth_method = "ed25519"
+ed25519_key_path = "keys/ed25519-testnet-main.pem"
+```
+
+`.gitignore` sudah mengecualikan `rust-bot/keys/`; `.apexrust/` juga gitignored.
+
+### Cara kerja WS API
+
+- `session.logon` hanya berlaku untuk kunci **Ed25519**. Kunci HMAC tidak memakai sesi; setiap request ditandatangani (`sign_request_params`, query string terurut).
+- Hanya **entry tanpa bracket** yang dirutekan ke `order.place` melalui WS. Entry ber-bracket dan semua order protektif/exit tetap REST agar SL/TP tidak pernah hilang bila sesi WS terputus.
+- Kegagalan WS apa pun (logon, timeout, error ack) otomatis jatuh ke REST.
+- URL default: Futures testnet `wss://testnet.binancefuture.com/ws-fapi/v1`, Spot testnet `wss://ws-api.testnet.binance.vision/ws-api/v3`; ubah lewat `exchange.ws_api_url`.
+- Gunakan `use_ws_api_orders = false` untuk memaksa seluruh jalur lewat REST.
+
 ---
 
-## Environment Variables (`server.ts`)
+## Konfigurasi (`bot.toml`)
 
-| Variable | Default | Description |
+Sumber contoh lengkap: `rust-bot/config/bot.example.toml`. WebApp menyimpan konfigurasi setara di `localStorage` dan menulis TOML tersanitasi ke `rust-bot/config/bot.synced.toml` lewat `POST /api/git/backup` (payload `config`).
+
+### Field baru / penting
+
+| Section | Field | Arti |
 | :--- | :--- | :--- |
-| `PORT` | `3000` | HTTP port for Express + Vite / `dist/` server |
-| `HOST` | `127.0.0.1` (`0.0.0.0` on Cloud Run via `K_SERVICE`) | HTTP bind address (`./apexrust setup` defaults to `127.0.0.1`; override with `--lan` or `--host <ip>`) |
-| `BINANCE_ENVIRONMENT` | `Testnet` | `Testnet` or `Production` |
-| `BINANCE_VENUE` | `Spot` | `Spot` or `Futures` |
-| `BINANCE_AUTH_METHOD` | `HMAC-SHA256` | `HMAC-SHA256` or `Ed25519` |
-| `BINANCE_API_KEY` | `""` | Optional pre-loaded Binance API key |
-| `BINANCE_API_SECRET` | `""` | Optional pre-loaded `HMAC-SHA256` secret |
-| `BINANCE_ED25519_PRIVATE_KEY` | `""` | Optional inline `Ed25519` PEM private key |
-| `BINANCE_PRIVATE_KEY_PATH` | `""` | Optional path to `Ed25519` PEM private key file |
-| `BINANCE_FUTURES_TESTNET_REST` | `""` | Optional override URL for Futures Testnet REST |
-| `APEXRUST_PROXY_TOKEN` | `""` | `>= 32`-char Access Token required on `0.0.0.0`/public binds (optional on loopback / Cloudflare One WARP mesh); guards `/api/*` reads & writes via `Authorization: Bearer` or `X-ApexRust-Token` (`./apexrust token`) |
-| `APEXRUST_WEB_TOKEN` | `""` | Optional Bearer/`X-ApexRust-Token` protecting direct Rust `bot-web` (`:8080`) connections (required on non-private `bot-web` binds) |
-| `APEXRUST_ENGINE_AUTHORITY` | `browser` | `browser` (Desktop executes Live orders) or `daemon` (24/7 Rust daemon owns Live auto/manual entries; browser new-entry `/api/live/order` returns `409`) |
-| `DISABLE_HMR` | `false` | Set `true` to disable Vite HMR & file watching |
+| `[exchange]` | `max_leverage` | Batas keras leverage (1..=20), default 3. `leverage` di-clamp ke nilai ini. |
+| `[exchange]` | `use_ws_api_orders` | Aktifkan jalur WebSocket API untuk entry tanpa bracket. |
+| `[exchange]` | `ws_api_url` | Endpoint WS API (testnet/production). |
+| `[exchange.credentials]` | `ed25519_key_path` | Path PKCS#8 PEM untuk `session.logon`. |
+| `[trading]` | `trending_category` | Termasuk `cts_momentum`. |
+| `[trading]` | `cts_screener_enabled`, `cts_rvol_weight`, `cts_momentum_weight`, `cts_volume_weight`, `cts_min_rvol` | Bobot & ambang CTS (total bobot dinormalisasi saat runtime). |
+| `[indicators]` | `donchian_lookback` | Window breakout Donchian, default 20. |
+| `[indicators]` | `atr_expansion_filter_enabled`, `atr_expansion_min_ratio` | Gate ekspansi volatilitas (ATR vs SMA50 ATR), default nonaktif. |
+| `[indicators]` | `htf_ema_period`, `obi_levels`, `obi_min_imbalance` | Parameter gate HTF dan OBI. |
+| `[features]` | `htf_trend_filter`, `obi_entry_filter` | Dua toggle baru (total **21**). Default `false`. |
+| `[risk]` | `btc_crash_guard_enabled`, `btc_crash_threshold_pct`, `btc_crash_window_minutes`, `btc_crash_max_staleness_sec` | Guard korelasi BTC; hanya memblokir entry. |
+| `[risk]` | `flatten_on_circuit_breaker` | Tutup semua posisi saat breaker aktif. |
+
+Semua field divalidasi di Rust (`BotConfig::validate`) dan di-clamp ulang saat load/save di TypeScript, sehingga nilai manual yang tidak masuk akal tidak lolos ke jalur order.
 
 ---
 
-## Verification & Test Suite
+## Gate Entry & Screener
 
-### TypeScript Engine & Analytics Unit Tests
+Alur keputusan satu bar tertutup:
 
-Run all TypeScript engine, database, and remote-access test suites using Node's built-in test runner via `tsx` (after `npm install`):
+1. **Warmup & kualitas data** — minimal `min_warmup_bars`, tanpa gap kandil, spread ≤ `max_spread_bps`.
+2. **Regime** — tren EMA + macro, ADX/DI, RSI pullback, VWAP, volume; opsional HTF 1 jam, OBI, dan ekspansi ATR.
+3. **Struktur** — Donchian breakout (`ema_breakout`) atau pullback ke EMA mid (`trend_pullback`) / reversion VWAP (`vwap_reversion`).
+4. **Sesi** — `session_window_filter` hanya untuk entry otomatis.
+5. **Risiko** — circuit breaker, BTC guard, streak/quarantine, sizing, notional cap, preflight test order.
+6. **Eksekusi** — WS API (bila aktif dan tanpa bracket) atau REST dengan bracket.
+
+Diagnostik setiap gate tersedia di `evaluateSignalDiagnostics` (TS) dan padanannya di Rust, sehingga UI dapat menampilkan alasan penolakan sinyal.
+
+---
+
+## Manajemen Risiko & Exit
+
+- **Exit plan**: SL `atr_sl_multiplier`, TP1 `atr_tp1_multiplier` (partial `tp1_close_ratio`), TP2 `atr_tp2_multiplier`.
+- **Break-even** pada `break_even_trigger_r` plus buffer fee; **trailing** aktif pada `trailing_activation_r` dengan `atr_trailing_multiplier`, hanya bergerak searah profit.
+- **Urutan evaluasi**: break-even → trailing → partial TP1 → full exit, sehingga posisi yang langsung menyentuh TP1 tetap memiliki proteksi runner.
+- **Circuit breaker**: drawdown harian & per pair, target profit, streak, karantina pair; `reset` membersihkan `quarantined_pairs` di kedua runtime.
+- **BTC guard**: sampel harga BTC disimpan dalam jendela; anchor adalah sampel tertua yang masih dalam jendela. Data lebih tua dari `btc_crash_max_staleness_sec` dianggap tidak ada (fail-open).
+
+---
+
+## Arsitektur Runtime
+
+```text
+                    +-----------------------------+
+                    |  Web Command Center (PWA)   |
+                    |  Paper / Live Simulation    |
+                    +--------------+--------------+
+                                   | /api/live/*, /api/market/*, /api/git/*
+                    +--------------v--------------+
+                    |  Express Proxy (server.ts)  |  signing, ledger, Git backup, WS relay
+                    +--------------+--------------+
+                                   | HTTP / WS (opsional, VPS)
+                    +--------------v--------------+
+                    |  bot-web (Axum)  <->  bot-engine (Tokio)
+                    +--------------+--------------+
+              +--------------------+--------------------+
+              |                    |                    |
+      bot-exchange          bot-indicators        bot-strategy
+      (Spot/Futures,        (EMA/RSI/ADX/ATR/    (profil + gate +
+       WS market, WS API,    VWAP/Donchian/OBI)   exit plan)
+       failover, depth)             |
+              +---------------------+--------------------+
+                                    |
+                              bot-risk (CB, sizing, BTC guard)
+                                    |
+                              bot-core (config, tipe, watchlist/CTS)
+```
+
+- **Paper mode** berjalan penuh di memori tanpa kredensial; **Live mode** memerlukan kredensial + `armed_for_live_orders = true` + preflight.
+- **Single-writer authority**: `APEXRUST_ENGINE_AUTHORITY=browser` (default) atau `daemon`; hanya satu yang boleh mengirim order.
+- **Remote VPS**: WebApp dapat bertindak sebagai gateway ke daemon Rust (`APEXRUST_ENGINE_URL`), termasuk di belakang Cloudflare One / Zero Trust (`APEXRUST_TRUST_ZERO_TRUST_MESH`, `APEXRUST_PROXY_TOKEN`).
+- **Rate limiting & token**: token ≥32 karakter wajib saat bind `0.0.0.0`; klien WS mengambil tiket sekali pakai dari `POST /api/ws-ticket`.
+
+---
+
+## Environment Variables
+
+Lihat `.env.example` untuk daftar lengkap. Yang paling sering dipakai:
+
+| Variabel | Default | Fungsi |
+| :--- | :--- | :--- |
+| `PORT` / `HOST` | `3000` / `127.0.0.1` | Bind Express. |
+| `BINANCE_ENVIRONMENT` | `Testnet` | `Testnet` atau `Production`. |
+| `BINANCE_VENUE` | `Spot` | `Spot` atau `Futures`. |
+| `BINANCE_AUTH_METHOD` | `HMAC-SHA256` | `HMAC-SHA256` atau `Ed25519`. |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Kredensial HMAC. |
+| `BINANCE_PRIVATE_KEY_PATH` | — | Path/inline PEM Ed25519. |
+| `APEXRUST_MAX_ORDER_NOTIONAL_USDT` | `250` | Cap notional per order. |
+| `APEXRUST_REQUIRE_PREFLIGHT` | `true` | Wajib test order sebelum live. |
+| `APEXRUST_ORDER_DB_PATH` | `.apexrust-orders.sqlite` | Ledger SQLite. |
+| `APEXRUST_ENGINE_AUTHORITY` | `browser` | `browser` atau `daemon`. |
+| `APEXRUST_ENGINE_URL` | — | Upstream daemon Rust. |
+| `APEXRUST_PROXY_TOKEN` | — | Token akses proxy (wajib di `0.0.0.0`). |
+| `APEXRUST_PERSIST_VAULT` | `false` | Simpan kunci UI ke `.apexrust/secrets.env`. |
+| `APEXRUST_TRUST_PROXY` | — | `loopback`/`true` di belakang reverse proxy. |
+
+---
+
+## Verifikasi & Pengujian
+
+Wajib dijalankan sebelum menyelesaikan perubahan (lihat `AGENTS.md`):
 
 ```bash
+# Rust
+cd rust-bot
+cargo test --workspace
+cargo clippy --workspace
+
+# WebApp / TypeScript
+npm run lint
+npm run build
 npx --yes tsx --test src/engine/*.test.ts
 ```
 
-### Installer & Lifecycle CLI Tests
-
-```bash
-npm run test:installer
-```
-
-### Type-Check & Production Build
-
-```bash
-npm run lint && npm run build
-```
-
-### Rust Workspace Tests
-
-```bash
-cd rust-bot && cargo test --workspace
-```
+Cakupan test engine TS mencakup parity config storage, gate strategi, exit lifecycle, BTC guard, cap leverage, CTS ranking, ledger SQLite, dan adapter snapshot. Sisi Rust mencakup `bot-core` (config/watchlist), `bot-risk` (breaker + BTC guard), `bot-strategy`, `bot-indicators`, `bot-exchange` (WS market/WS API/depth/failover), serta smoke test `bot-engine`/`bot-web`.
 
 ---
 
-## Additional Documentation
+## Dokumentasi Lain
 
-- [`rust-bot/README.md`](rust-bot/README.md) — Rust workspace overview & Linux desktop quick start
-- [`rust-bot/docs/ARCHITECTURE.md`](rust-bot/docs/ARCHITECTURE.md) — Crate dependency graph, Binance endpoints, WS/REST failover state machine & PWA boundaries
-- [`rust-bot/docs/STRATEGY_GUIDE.md`](rust-bot/docs/STRATEGY_GUIDE.md) — Mathematical definitions for indicators, strategy profiles, ATR exits, volatility alerts & Kelly sizing
-- [`rust-bot/docs/AI_HANDOFF.md`](rust-bot/docs/AI_HANDOFF.md) — Non-negotiable invariants, TypeScript ↔ Rust parity map & extension checklists
+- `AGENTS.md` — aturan parity WebApp ↔ Rust dan perintah verifikasi.
+- `rust-bot/docs/ARCHITECTURE.md` — graf dependency crate dan alur runtime.
+- `arsitektur-trading-bot-rust.md` — spesifikasi lengkap; **§9 berisi tabel status Implemented/Partial/Not planned** dan catatan penyimpangan yang disengaja.

@@ -48,6 +48,7 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
   trading: {
     venue: 'Spot',
     leverage: 3,
+    maxLeverage: 3,
     marginType: 'ISOLATED',
     mode: 'scalping',
     timeframe: '5m',
@@ -67,6 +68,11 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     trendingHysteresisRankBuffer: 3,
     rankingSource: 'auto',
     maxSameDirectionPositions: 2,
+    ctsScreenerEnabled: false,
+    ctsRvolWeight: 0.4,
+    ctsMomentumWeight: 0.4,
+    ctsVolumeWeight: 0.2,
+    ctsMinRvol: 1.2,
   },
   indicators: {
     emaFast: 9,
@@ -96,6 +102,12 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     minDiSpread: 3.0,
     requireMacroEmaInScalping: true,
     maxSpreadBps: 20.0,
+    donchianLookback: 20,
+    atrExpansionFilterEnabled: false,
+    atrExpansionMinRatio: 1.15,
+    htfEmaPeriod: 200,
+    obiLevels: 10,
+    obiMinImbalance: 0.35,
   },
   exits: {
     atrSlMultiplier: 1.5,
@@ -115,6 +127,10 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     maxLoseStreak: 3,
     streakCooldownMinutes: 30,
     flattenOnCircuitBreaker: true,
+    btcCrashGuardEnabled: true,
+    btcCrashThresholdPct: 1.5,
+    btcCrashWindowMinutes: 15,
+    btcCrashMaxStalenessSec: 120,
   },
   automation: {
     enabled: true,
@@ -151,6 +167,8 @@ export const DEFAULT_BOT_CONFIG: BotConfig = {
     adxStrengthFilter: true,
     vwapBiasFilter: true,
     volumeConfirmationFilter: false,
+    htfTrendFilter: false,
+    obiEntryFilter: false,
     sessionWindowFilter: false,
     atrDynamicExits: true,
     takeProfitLadder: true,
@@ -228,6 +246,8 @@ export class SimulationRuntime {
   private trailingTightenFactor = new Map<string, number>();
   private reversalBypassCooldownSide = new Map<string, Side>();
   private watchlistDwellState: WatchlistDwellState = { enteredAtMs: new Map() };
+  private htfTrends = new Map<string, { close: number; emaMacro: number; updatedAtMs: number }>();
+  private obiBySymbol = new Map<string, number>();
   private lastScreenerTickers: MarketTicker24h[] = [];
   private tradableSymbolsSet = new Set<string>();
   private pendingLiveIntents: LiveAutoIntent[] = [];
@@ -352,7 +372,7 @@ export class SimulationRuntime {
             commission: quoteQty * feeRate,
             commissionAsset: 'USDT',
             isMaker: false,
-            leverage: this.config.trading.leverage,
+            leverage: this.effectiveLeverage(),
             marginType: this.config.trading.marginType,
             realizedPnlUsdt: null,
             rMultiple: null,
@@ -423,7 +443,7 @@ export class SimulationRuntime {
           commission: exitQuote * (t.reason === 'TakeProfit2' ? feeRate * 0.5 : feeRate),
           commissionAsset: 'USDT',
           isMaker: t.reason === 'TakeProfit2',
-          leverage: this.config.trading.leverage,
+          leverage: this.effectiveLeverage(),
           marginType: this.config.trading.marginType,
           realizedPnlUsdt: t.pnl,
           rMultiple: t.r,
@@ -462,7 +482,7 @@ export class SimulationRuntime {
           commission: entQuote * feeRate,
           commissionAsset: 'USDT',
           isMaker: false,
-          leverage: this.config.trading.leverage,
+          leverage: this.effectiveLeverage(),
           marginType: this.config.trading.marginType,
           realizedPnlUsdt: null,
           rMultiple: null,
@@ -641,7 +661,7 @@ export class SimulationRuntime {
       commission,
       commissionAsset: 'USDT',
       isMaker,
-      leverage: venue === 'Futures' ? this.config.trading.leverage : 1,
+      leverage: venue === 'Futures' ? this.effectiveLeverage() : 1,
       marginType: this.config.trading.marginType,
       realizedPnlUsdt: null,
       rMultiple: null,
@@ -723,7 +743,7 @@ export class SimulationRuntime {
       commission,
       commissionAsset: 'USDT',
       isMaker,
-      leverage: venue === 'Futures' ? this.config.trading.leverage : 1,
+      leverage: venue === 'Futures' ? this.effectiveLeverage() : 1,
       marginType: this.config.trading.marginType,
       realizedPnlUsdt: params.pnlUsdt,
       rMultiple: params.rMultiple,
@@ -776,7 +796,7 @@ export class SimulationRuntime {
       commission: 0,
       commissionAsset: 'USDT',
       isMaker: pending.orderMethod === 'LIMIT_MAKER',
-      leverage: venue === 'Futures' ? this.config.trading.leverage : 1,
+      leverage: venue === 'Futures' ? this.effectiveLeverage() : 1,
       marginType: this.config.trading.marginType,
       realizedPnlUsdt: null,
       rMultiple: null,
@@ -899,7 +919,7 @@ export class SimulationRuntime {
       remainingQuantity,
       lockedMarginUsdt:
         this.config.trading.venue === 'Futures'
-          ? (entryPrice * qty) / Math.max(1, this.config.trading.leverage)
+          ? (entryPrice * qty) / this.effectiveLeverage()
           : entryPrice * remainingQuantity,
       unrealizedPnlUsdt: 0,
       realizedPnlUsdt: 0,
@@ -1050,7 +1070,7 @@ export class SimulationRuntime {
     }
     this.pushLog(
       'info',
-      `Switched execution venue to Binance ${venue}${venue === 'Futures' ? ` (${this.config.trading.leverage}x ${this.config.trading.marginType})` : ' (Long-Only Enforced)'}`
+      `Switched execution venue to Binance ${venue}${venue === 'Futures' ? ` (${this.effectiveLeverage()}x ${this.config.trading.marginType})` : ' (Long-Only Enforced)'}`
     );
   }
 
@@ -1471,7 +1491,7 @@ export class SimulationRuntime {
       }
     }
 
-    const leverage = activeVenue === 'Futures' ? Math.max(1, this.config.trading.leverage) : 1;
+    const leverage = activeVenue === 'Futures' ? this.effectiveLeverage() : 1;
     const maxNotionalAllowed = this.snapshot.availableBalanceUsdt * leverage;
     const cappedUsdt = Math.min(input.usdtAmount, maxNotionalAllowed);
     if (cappedUsdt <= 1) {
@@ -1576,7 +1596,7 @@ export class SimulationRuntime {
       cleanTargets[cleanTargets.length - 1]?.targetPrice ??
       (input.side === 'Long' ? entryPrice + slDist * 2.5 : entryPrice - slDist * 2.5);
 
-    const rationale = `${this.config.trading.venue === 'Futures' ? `FUTURES ${this.config.trading.leverage}x · ` : ''}${input.orderType} · $${cappedUsdt.toFixed(2)} · ${cleanTargets.length || 2} TP targets`;
+    const rationale = `${this.config.trading.venue === 'Futures' ? `FUTURES ${this.effectiveLeverage()}x · ` : ''}${input.orderType} · $${cappedUsdt.toFixed(2)} · ${cleanTargets.length || 2} TP targets`;
     const entryRec = this.recordEntryExecution({
       symbol: input.symbol,
       side: input.side,
@@ -1598,7 +1618,7 @@ export class SimulationRuntime {
       remainingQuantity: quantity,
       lockedMarginUsdt:
         this.config.trading.venue === 'Futures'
-          ? cappedUsdt / Math.max(1, this.config.trading.leverage)
+          ? cappedUsdt / this.effectiveLeverage()
           : cappedUsdt,
       unrealizedPnlUsdt: 0,
       realizedPnlUsdt: 0,
@@ -1648,6 +1668,53 @@ export class SimulationRuntime {
     });
     this.pushLog('info', `Closed ${symbol} manually (${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)})`);
     this.syncRiskToSnapshot();
+  }
+
+  /** Leverage after the configurable hard ceiling; never exceeds 20. */
+  effectiveLeverage(): number {
+    const ceiling = Math.max(1, Math.min(20, Math.round(this.config.trading.maxLeverage ?? 3)));
+    const requested = Math.max(1, Math.round(Number(this.config.trading.leverage) || 1));
+    return Math.min(ceiling, requested);
+  }
+
+  /** Stores the latest closed 1h trend read used by the HTF entry gate. */
+  setHtfTrend(symbol: string, close: number, emaMacro: number, updatedAtMs = Date.now()): void {
+    const clean = symbol.trim().toUpperCase();
+    if (!clean || !Number.isFinite(close) || !Number.isFinite(emaMacro) || close <= 0 || emaMacro <= 0) {
+      return;
+    }
+    this.htfTrends.set(clean, { close, emaMacro, updatedAtMs });
+  }
+
+  getHtfTrend(symbol: string): { close: number; emaMacro: number; updatedAtMs: number } | null {
+    return this.htfTrends.get(symbol.trim().toUpperCase()) ?? null;
+  }
+
+  /** Stores the latest depth-10 order-book imbalance in [-1, 1]. */
+  updateOrderBookImbalance(symbol: string, obi: number): void {
+    const clean = symbol.trim().toUpperCase();
+    if (!clean || !Number.isFinite(obi)) return;
+    const pair = this.snapshot.pairs.find((p) => p.symbol === clean);
+    const bounded = Math.max(-1, Math.min(1, obi));
+    this.obiBySymbol.set(clean, bounded);
+    if (pair) {
+      pair.indicators = { ...pair.indicators, obi: bounded };
+    }
+  }
+
+  /** Feeds a BTCUSDT reference price into the risk crash guard. */
+  setBtcReferencePrice(price: number, nowMs = Date.now()): void {
+    this.riskManager.observeBtcPrice(price, nowMs);
+  }
+
+  private decorateIndicators(symbol: string, ind: PairRuntimeState['indicators']): PairRuntimeState['indicators'] {
+    const htf = this.htfTrends.get(symbol);
+    return {
+      ...ind,
+      htfClose: htf?.close ?? null,
+      htfEmaMacro: htf?.emaMacro ?? null,
+      obi: this.obiBySymbol.get(symbol) ?? null,
+    };
   }
 
   updatePairBookTicker(symbol: string, bestBid: number, bestAsk: number): void {
@@ -2043,9 +2110,13 @@ export class SimulationRuntime {
         this.closedBarCounts.set(pair.symbol, (this.closedBarCounts.get(pair.symbol) ?? 0) + 1);
       }
 
+      ind = this.decorateIndicators(pair.symbol, ind);
       pair.indicators = ind;
       pair.barsWarmedUp = ind.warmupBarsCount ?? pair.barsWarmedUp ?? pair.candles.length;
       pair.lastPrice = nextCandle.close;
+      if (pair.symbol.startsWith('BTC')) {
+        this.riskManager.observeBtcPrice(nextCandle.close, nowMs);
+      }
       const firstClose = pair.candles[0]?.close ?? nextCandle.close;
       pair.change24hPct = ((nextCandle.close - firstClose) / firstClose) * 100;
 
@@ -2546,7 +2617,7 @@ export class SimulationRuntime {
       }
     }
 
-    const leverage = activeVenue === 'Futures' ? Math.max(1, this.config.trading.leverage) : 1;
+    const leverage = activeVenue === 'Futures' ? this.effectiveLeverage() : 1;
     const sizingMode = this.config.trading.positionSizingMode ?? 'fixed_usdt';
     const stopDistFrac =
       sig.entryPrice > 0
@@ -2800,7 +2871,7 @@ export class SimulationRuntime {
         0
       );
       const leverage =
-        this.config.trading.venue === 'Futures' ? Math.max(1, this.config.trading.leverage) : 1;
+        this.config.trading.venue === 'Futures' ? this.effectiveLeverage() : 1;
       const pendingLocked = this.snapshot.pendingOrders.reduce(
         (sum, o) => sum + o.usdtAmount / leverage,
         0

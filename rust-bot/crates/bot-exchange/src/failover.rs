@@ -1,7 +1,7 @@
 use crate::{
     BinanceFuturesClient, BinanceRestClient, BinanceWsDriver, CancelOrderOutcome,
     ExchangeOpenPosition, ExchangeOrderStatus, LiveOrderAck, LiveOrderRequest, RestRateBudget,
-    WsStreamEvent,
+    WsApiClient, WsStreamEvent,
 };
 use bot_core::{
     Candle, ExchangeConfig, ExchangeEnvironment, ExchangeVenue, MarketEvent, MarketTicker24h,
@@ -15,6 +15,40 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{error, info, warn};
 
 const EXCHANGE_INFO_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+fn parse_ws_api_ack(result: &serde_json::Value, req: &LiveOrderRequest) -> LiveOrderAck {
+    let status = result
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("NEW")
+        .to_string();
+    let parse_num = |key: &str| -> f64 {
+        result
+            .get(key)
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| Some(v.to_string())))
+            .and_then(|s| s.trim_matches('"').parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let executed_qty = parse_num("executedQty");
+    let avg_price = {
+        let reported = parse_num("avgPrice");
+        if reported > 0.0 {
+            reported
+        } else {
+            req.limit_price.unwrap_or(0.0)
+        }
+    };
+    LiveOrderAck {
+        order_id: result.get("orderId").map(|v| v.to_string()),
+        order_list_id: result.get("orderListId").and_then(|v| v.as_i64()),
+        algo_order_ids: Vec::new(),
+        bracket_warning: None,
+        filled: status == "FILLED",
+        executed_qty: if executed_qty > 0.0 { executed_qty } else { req.quantity },
+        avg_price,
+        status,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FailoverHealth {
@@ -42,6 +76,7 @@ pub struct FailoverGateway {
     failover_count: Arc<AtomicU64>,
     last_ws_epoch_ms: Arc<AtomicU64>,
     screener_stream_connected: Arc<AtomicBool>,
+    ws_api: Option<Arc<WsApiClient>>,
 }
 
 impl FailoverGateway {
@@ -68,6 +103,7 @@ impl FailoverGateway {
         } else {
             TransportMode::Reconnecting
         };
+        let ws_api = WsApiClient::from_config(&cfg)?.map(Arc::new);
         let norm_pairs: Vec<String> = pairs
             .into_iter()
             .map(|p| p.trim().to_uppercase())
@@ -89,6 +125,7 @@ impl FailoverGateway {
             failover_count: Arc::new(AtomicU64::new(0)),
             last_ws_epoch_ms: Arc::new(AtomicU64::new(0)),
             screener_stream_connected: Arc::new(AtomicBool::new(false)),
+            ws_api,
         })
     }
 
@@ -139,6 +176,33 @@ impl FailoverGateway {
     }
 
     pub async fn execute_live_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
+        // WebSocket API entry path: only bare entries without bracket legs, so a
+        // protective SL/TP is never silently dropped. Any failure falls back to REST.
+        if let Some(ws_api) = self.ws_api.as_ref() {
+            if !req.reduce_only
+                && req.take_profit_price.is_none()
+                && req.stop_loss_price.is_none()
+            {
+                let params = match self.cfg.venue {
+                    ExchangeVenue::Futures => self.futures.build_ws_order_params(req).await,
+                    ExchangeVenue::Spot => self.rest.build_ws_order_params(req).await,
+                };
+                match params {
+                    Ok(params) => match ws_api.place_order(params).await {
+                        Ok(result) => {
+                            info!(symbol = %req.symbol, "Order placed via Binance WebSocket API");
+                            return Ok(parse_ws_api_ack(&result, req));
+                        }
+                        Err(err) => {
+                            warn!(symbol = %req.symbol, %err, "WS API order failed; falling back to REST");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(symbol = %req.symbol, %err, "WS API param build failed; using REST");
+                    }
+                }
+            }
+        }
         match self.cfg.venue {
             ExchangeVenue::Futures => self.futures.execute_futures_order(req).await,
             ExchangeVenue::Spot => self.rest.execute_spot_order(req).await,

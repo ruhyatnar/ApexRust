@@ -85,6 +85,44 @@ export function hasCandleSequenceGap(
   return nextOpenTimeMs - prevOpenTimeMs > stepMs * 1.5;
 }
 
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0));
+}
+
+export interface CtsScoreInput {
+  rvol1h: number;
+  momentum1hPct: number;
+  quoteVolume: number;
+  /** Cross-sectional median quote volume of the candidate pool. */
+  medianQuoteVolume: number;
+  weights?: { rvol?: number; momentum?: number; volume?: number };
+}
+
+/**
+ * Composite Trend Score (CTS) used by the screener.
+ *
+ * Every component is normalized into [0, 1] before weighting so a single
+ * unbounded term (BTC-style raw USDT volume) can never dominate the ranking.
+ * Returns null when RVOL is unavailable (e.g. listings younger than 24h).
+ */
+export function computeCtsScore(input: CtsScoreInput): number | null {
+  const { rvol1h, momentum1hPct, quoteVolume, medianQuoteVolume } = input;
+  if (!Number.isFinite(rvol1h) || rvol1h <= 0) return null;
+
+  const wRvol = Math.max(0, input.weights?.rvol ?? 0.4);
+  const wMomentum = Math.max(0, input.weights?.momentum ?? 0.4);
+  const wVolume = Math.max(0, input.weights?.volume ?? 0.2);
+  const totalW = wRvol + wMomentum + wVolume;
+  if (totalW <= 0) return null;
+
+  const rvolScore = clamp01(rvol1h / 3);
+  const momentumScore = clamp01((Number.isFinite(momentum1hPct) ? momentum1hPct : 0) / 5 * 0.5 + 0.5);
+  const relVolume = medianQuoteVolume > 0 ? quoteVolume / medianQuoteVolume : 0;
+  const volumeScore = clamp01(relVolume / 10);
+
+  return (rvolScore * wRvol + momentumScore * wMomentum + volumeScore * wVolume) / totalW;
+}
+
 /**
  * Ranks live Binance 24h market tickers by requested screener category
  * while enforcing quote-asset suffix and minimum 24h USDT liquidity filters.
@@ -98,18 +136,24 @@ export function rankScreenerTickers(
     onlyTradable?: boolean;
     limit?: number;
     searchQuery?: string;
+    ctsMinRvol?: number;
   }
 ): MarketTicker24h[] {
   const quote = (options.quoteAsset ?? 'USDT').trim().toUpperCase() || 'USDT';
   const minVol = Math.max(0, options.minQuoteVolumeUsdt ?? 0);
   const query = sanitizeTradingSymbol(options.searchQuery ?? '');
   const limit = Math.max(1, Math.min(200, options.limit ?? 50));
+  const ctsMinRvol = Math.max(0, options.ctsMinRvol ?? 0);
 
   const filtered = tickers.filter((t) => {
     if (!t.symbol.endsWith(quote)) return false;
     if (options.onlyTradable && !t.tradableOnActiveEnv) return false;
     if (t.quoteVolume < minVol) return false;
     if (query && !t.symbol.includes(query)) return false;
+    if (options.category === 'cts_momentum') {
+      if (t.ctsScore === undefined || !Number.isFinite(t.ctsScore)) return false;
+      if ((t.rvol1h ?? 0) < ctsMinRvol) return false;
+    }
     return t.lastPrice > 0;
   });
 
@@ -121,6 +165,12 @@ export function rankScreenerTickers(
         return a.priceChangePercent - b.priceChangePercent || b.quoteVolume - a.quoteVolume;
       case 'volatility_leaders':
         return b.rangePct24h - a.rangePct24h || b.quoteVolume - a.quoteVolume;
+      case 'cts_momentum':
+        return (
+          (b.ctsScore ?? 0) - (a.ctsScore ?? 0) ||
+          (b.rvol1h ?? 0) - (a.rvol1h ?? 0) ||
+          b.quoteVolume - a.quoteVolume
+        );
       case 'hot_volume':
       default:
         return b.quoteVolume - a.quoteVolume;

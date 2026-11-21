@@ -6,7 +6,7 @@ A modular, production-structured **Rust** cryptocurrency trading bot built on to
 
 ```text
 rust-bot/
-├── Cargo.toml                     # Cargo workspace (binance-sdk 78.1 Spot + USD-M Futures, Axum, Tokio)
+├── Cargo.toml                     # Cargo workspace (binance-sdk 78.3 Spot + USD-M Futures, Axum, Tokio)
 ├── README.md                      # This guide
 ├── config/
 │   ├── bot.example.toml           # Complete Spot/Futures, Automation, Session Windows, FeatureToggles, Risk & Git config
@@ -25,13 +25,20 @@ rust-bot/
     ├── bot-exchange/              # binance-sdk Spot + USD-M Futures (WS primary + REST fallback, MARKET/LIMIT/GTX/OCO)
     ├── bot-engine/                # Tokio orchestrator: UTC session gating, ATR volatility spike monitor & sanitized git_sync
     ├── bot-web/                   # Embedded Axum HTTP + WebSocket telemetry bridge (:8080)
-    └── bot-desktop/               # Linux Desktop CLI & systemd daemon entry point
+    ├── bot-desktop/               # Linux Desktop CLI & systemd daemon entry point
+    └── bot-keygen/                # Ed25519 keypair generator for WS API session.logon
+```
+
+Generated Ed25519 keys live in `keys/` (created `0700`, private key `0600`, gitignored):
+
+```bash
+cargo run -p bot-keygen -- --environment testnet --out-dir keys --label main
 ```
 
 ## Key Capabilities
 
 1. **Official Binance Rust SDK (`binance-sdk`) — Spot & USD-M Futures**
-   - Supports **Binance Spot** (`/api/v3/*`) and **Binance USD-M Futures** (`/fapi/v1/*`, `/fapi/v3/*` with `/fapi/v2/*` fallback) with configurable leverage (`1x–20x`) and `ISOLATED` / `CROSSED` margin modes.
+   - Supports **Binance Spot** (`/api/v3/*`) and **Binance USD-M Futures** (`/fapi/v1/*`, `/fapi/v3/*` with `/fapi/v2/*` fallback) with configurable leverage (`exchange.leverage`, clamped to `exchange.max_leverage` — default `3x`, hard ceiling `20x`) and `ISOLATED` / `CROSSED` margin modes.
    - Supported order methods: **Market**, **Limit** (`GTC` / `IOC` / `FOK`), **Post-Only Maker** (Spot `LIMIT_MAKER` / Futures `GTX`), and **OCO** (Spot `/api/v3/orderList/oco` + Futures `TAKE_PROFIT_MARKET` & `STOP_MARKET` bracket).
 
 2. **WebSocket-First Architecture with Automatic REST Fallback**
@@ -55,11 +62,11 @@ rust-bot/
    - **ATR Trailing Stop**: Monotonically ratchets SL once `trailing_activation_r` is reached
    - **ATR Volatility Spike Alerts**: Monitors `atr_spike_pct_threshold` (% of price) and `atr_expansion_ratio_threshold` (vs prior ATR / TR) with per-pair `volatility_alert_cooldown_sec`, emitting `VolatilitySpikeAlert` telemetry.
 
-6. **Granular Toggle for All 19 Features (`[features]`)**
+6. **Granular Toggle for All 21 Features (`[features]`)**
    - **Core**: `automated_trading`, `session_window_filter`, `manual_trading`, `signal_generator`
    - **Venues**: `spot_market`, `futures_market`
    - **Transport**: `ws_primary_feed`, `rest_fallback`
-   - **Indicators**: `ema_trend_filter`, `rsi_momentum_filter`, `adx_strength_filter`, `vwap_bias_filter`, `volume_confirmation_filter`
+   - **Indicators**: `ema_trend_filter`, `rsi_momentum_filter`, `adx_strength_filter`, `vwap_bias_filter`, `volume_confirmation_filter`, `htf_trend_filter`, `obi_entry_filter`
    - **Exits**: `atr_dynamic_exits`, `take_profit_ladder`, `break_even_stop`, `trailing_stop`
    - **Protection & Backup**: `circuit_breaker`, `git_auto_backup`
 

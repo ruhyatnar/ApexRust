@@ -40,6 +40,17 @@ impl BotConfig {
         if self.exchange.leverage == 0 || self.exchange.leverage > 20 {
             return Err(crate::BotError::Config("exchange.leverage must be in 1..=20".into()));
         }
+        if self.exchange.max_leverage == 0 || self.exchange.max_leverage > 20 {
+            return Err(crate::BotError::Config(
+                "exchange.max_leverage must be in 1..=20".into(),
+            ));
+        }
+        if self.exchange.leverage > self.exchange.max_leverage {
+            return Err(crate::BotError::Config(format!(
+                "exchange.leverage ({}) exceeds exchange.max_leverage ({})",
+                self.exchange.leverage, self.exchange.max_leverage
+            )));
+        }
         if self.exchange.ws_heartbeat_timeout_ms == 0 {
             return Err(crate::BotError::Config("exchange.ws_heartbeat_timeout_ms must be > 0".into()));
         }
@@ -136,11 +147,24 @@ pub struct ExchangeConfig {
     pub venue: ExchangeVenue,
     #[serde(default = "default_leverage")]
     pub leverage: u8,
+    /// Hard ceiling applied to `leverage` on every config, TOML and order path.
+    #[serde(default = "default_leverage")]
+    pub max_leverage: u8,
     #[serde(default)]
     pub margin_type: MarginType,
     pub paper_trading: bool,
     pub credentials: Option<LiveCredentialsConfig>,
     pub ws_stream_url: String,
+    /// Binance WebSocket API endpoint used for `session.logon` / `order.place`.
+    #[serde(default)]
+    pub ws_api_url: String,
+    /// Route entry orders over the WebSocket API when credentials allow it.
+    #[serde(default)]
+    pub use_ws_api_orders: bool,
+    /// Subscribe to `<symbol>@depth10@100ms` for the order-book imbalance gate.
+    /// Derived at boot from `features.obi_entry_filter`.
+    #[serde(default)]
+    pub depth_stream_enabled: bool,
     pub rest_base_url: String,
     pub ws_heartbeat_timeout_ms: u64,
     pub rest_poll_interval_ms: u64,
@@ -151,6 +175,13 @@ pub struct ExchangeConfig {
 
 fn default_leverage() -> u8 {
     3
+}
+
+/// Effective leverage after the hard `max_leverage` ceiling.
+impl ExchangeConfig {
+    pub fn effective_leverage(&self) -> u8 {
+        self.leverage.min(self.max_leverage.max(1)).clamp(1, 20)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +226,7 @@ pub enum TrendingCategory {
     TopGainers,
     TopLosers,
     VolatilityLeaders,
+    CtsMomentum,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -424,6 +456,10 @@ pub struct FeatureToggles {
     #[serde(default)]
     pub volume_confirmation_filter: bool,
     #[serde(default)]
+    pub htf_trend_filter: bool,
+    #[serde(default)]
+    pub obi_entry_filter: bool,
+    #[serde(default)]
     pub session_window_filter: bool,
     #[serde(default = "default_true_toggle")]
     pub atr_dynamic_exits: bool,
@@ -456,6 +492,8 @@ impl Default for FeatureToggles {
             adx_strength_filter: true,
             vwap_bias_filter: true,
             volume_confirmation_filter: false,
+            htf_trend_filter: false,
+            obi_entry_filter: false,
             session_window_filter: false,
             atr_dynamic_exits: true,
             take_profit_ladder: true,
@@ -543,6 +581,29 @@ pub struct TradingConfig {
     pub ranking_source: TrendingRankingSource,
     #[serde(default = "default_max_same_direction_positions")]
     pub max_same_direction_positions: usize,
+    #[serde(default)]
+    pub cts_screener_enabled: bool,
+    #[serde(default = "default_cts_rvol_weight")]
+    pub cts_rvol_weight: f64,
+    #[serde(default = "default_cts_momentum_weight")]
+    pub cts_momentum_weight: f64,
+    #[serde(default = "default_cts_volume_weight")]
+    pub cts_volume_weight: f64,
+    #[serde(default = "default_cts_min_rvol")]
+    pub cts_min_rvol: f64,
+}
+
+fn default_cts_rvol_weight() -> f64 {
+    0.4
+}
+fn default_cts_momentum_weight() -> f64 {
+    0.4
+}
+fn default_cts_volume_weight() -> f64 {
+    0.2
+}
+fn default_cts_min_rvol() -> f64 {
+    1.2
 }
 
 impl Default for TradingConfig {
@@ -572,6 +633,11 @@ impl Default for TradingConfig {
             trending_hysteresis_rank_buffer: 3,
             ranking_source: TrendingRankingSource::Auto,
             max_same_direction_positions: 2,
+            cts_screener_enabled: false,
+            cts_rvol_weight: 0.4,
+            cts_momentum_weight: 0.4,
+            cts_volume_weight: 0.2,
+            cts_min_rvol: 1.2,
         }
     }
 }
@@ -611,6 +677,21 @@ fn default_min_di_spread() -> f64 {
 }
 fn default_max_spread_bps() -> f64 {
     20.0
+}
+fn default_donchian_lookback() -> usize {
+    20
+}
+fn default_atr_expansion_min_ratio() -> f64 {
+    1.15
+}
+fn default_htf_ema_period() -> usize {
+    200
+}
+fn default_obi_levels() -> usize {
+    10
+}
+fn default_obi_min_imbalance() -> f64 {
+    0.35
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,6 +737,18 @@ pub struct IndicatorConfig {
     pub require_macro_ema_in_scalping: bool,
     #[serde(default = "default_max_spread_bps")]
     pub max_spread_bps: f64,
+    #[serde(default = "default_donchian_lookback")]
+    pub donchian_lookback: usize,
+    #[serde(default)]
+    pub atr_expansion_filter_enabled: bool,
+    #[serde(default = "default_atr_expansion_min_ratio")]
+    pub atr_expansion_min_ratio: f64,
+    #[serde(default = "default_htf_ema_period")]
+    pub htf_ema_period: usize,
+    #[serde(default = "default_obi_levels")]
+    pub obi_levels: usize,
+    #[serde(default = "default_obi_min_imbalance")]
+    pub obi_min_imbalance: f64,
 }
 
 impl Default for IndicatorConfig {
@@ -688,6 +781,12 @@ impl Default for IndicatorConfig {
             min_di_spread: 3.0,
             require_macro_ema_in_scalping: true,
             max_spread_bps: 20.0,
+            donchian_lookback: 20,
+            atr_expansion_filter_enabled: false,
+            atr_expansion_min_ratio: 1.15,
+            htf_ema_period: 200,
+            obi_levels: 10,
+            obi_min_imbalance: 0.35,
         }
     }
 }
@@ -713,6 +812,26 @@ pub struct RiskConfig {
     pub max_lose_streak: u32,
     pub streak_cooldown_minutes: u64,
     pub flatten_on_circuit_breaker: bool,
+    /// Block new entries when BTC drops faster than the threshold inside the window.
+    #[serde(default = "default_true")]
+    pub btc_crash_guard_enabled: bool,
+    #[serde(default = "default_btc_crash_threshold_pct")]
+    pub btc_crash_threshold_pct: f64,
+    #[serde(default = "default_btc_crash_window_minutes")]
+    pub btc_crash_window_minutes: u64,
+    /// Fail open after this many seconds without a fresh BTC price sample.
+    #[serde(default = "default_btc_crash_max_staleness_sec")]
+    pub btc_crash_max_staleness_sec: u64,
+}
+
+fn default_btc_crash_threshold_pct() -> f64 {
+    1.5
+}
+fn default_btc_crash_window_minutes() -> u64 {
+    15
+}
+fn default_btc_crash_max_staleness_sec() -> u64 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

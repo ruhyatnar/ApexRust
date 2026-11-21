@@ -235,6 +235,27 @@ export function evaluateEntrySignal(
     return null;
   }
 
+  // Higher-timeframe (closed 1h) trend alignment. Missing HTF data fails open.
+  const useHtf = options?.features?.htfTrendFilter === true;
+  const htfLongOk =
+    !useHtf || ind.htfClose == null || ind.htfEmaMacro == null || ind.htfClose >= ind.htfEmaMacro;
+  const htfShortOk =
+    !useHtf || ind.htfClose == null || ind.htfEmaMacro == null || ind.htfClose <= ind.htfEmaMacro;
+
+  // Order-book imbalance gate. A missing book snapshot fails open.
+  const useObi = options?.features?.obiEntryFilter === true;
+  const obiThreshold = Math.max(0, indCfg.obiMinImbalance ?? 0.35);
+  const obiLongOk = !useObi || ind.obi == null || ind.obi >= obiThreshold;
+  const obiShortOk = !useObi || ind.obi == null || ind.obi <= -obiThreshold;
+
+  // Volatility regime: ATR must be expanding versus its SMA(50) baseline.
+  const atrBaseline = ind.atrSma50 ?? null;
+  const atrExpansionOk =
+    indCfg.atrExpansionFilterEnabled !== true ||
+    atrBaseline == null ||
+    atrBaseline <= 0 ||
+    ind.atr / atrBaseline >= (indCfg.atrExpansionMinRatio ?? 1.15);
+
   if (profile === 'vwap_reversion') {
     if (
       (useVwap && ind.vwap === null) ||
@@ -249,6 +270,8 @@ export function evaluateEntrySignal(
     const qualLong = evaluateSignalQualityMitigation('Long', candle, ind, tradingCfg, indCfg, options);
     if (
       allowLong &&
+      htfLongOk &&
+      obiLongOk &&
       qualLong.warmupOk &&
       qualLong.gapOk &&
       qualLong.spreadOk &&
@@ -270,6 +293,8 @@ export function evaluateEntrySignal(
     const qualShort = evaluateSignalQualityMitigation('Short', candle, ind, tradingCfg, indCfg, options);
     if (
       allowShort &&
+      htfShortOk &&
+      obiShortOk &&
       qualShort.warmupOk &&
       qualShort.gapOk &&
       qualShort.spreadOk &&
@@ -291,6 +316,10 @@ export function evaluateEntrySignal(
     return null;
   }
 
+  if (!atrExpansionOk) {
+    return null;
+  }
+
   if (useAdx && ind.adx < indCfg.adxMinTrend) {
     return null;
   }
@@ -304,11 +333,12 @@ export function evaluateEntrySignal(
   const qualShort = evaluateSignalQualityMitigation('Short', candle, ind, tradingCfg, indCfg, options);
 
   if (profile === 'ema_breakout') {
+    const lookback = Math.max(3, Math.min(200, Math.round(indCfg.donchianLookback ?? 20)));
     const rawHistory = options?.recentCandles ?? [];
     const history =
       rawHistory.length > 0 && rawHistory[rawHistory.length - 1]?.openTimeMs === candle.openTimeMs
-        ? rawHistory.slice(-11, -1)
-        : rawHistory.slice(-10);
+        ? rawHistory.slice(-(lookback + 1), -1)
+        : rawHistory.slice(-lookback);
     const priorHigh = history.length > 0 ? Math.max(...history.map((c) => c.high)) : candle.open;
     const priorLow = history.length > 0 ? Math.min(...history.map((c) => c.low)) : candle.open;
     const avgVol =
@@ -327,6 +357,8 @@ export function evaluateEntrySignal(
 
     if (
       allowLong &&
+      htfLongOk &&
+      obiLongOk &&
       candle.close > priorHigh &&
       emaLongOk &&
       qualLong.allOk &&
@@ -342,13 +374,15 @@ export function evaluateEntrySignal(
         atr: ind.atr,
         adx: ind.adx,
         rsi: ind.rsi,
-        rationale: `Momentum Breakout Long · Close > 10-bar High · ADX ${ind.adx.toFixed(1)} · Vol ${(candle.volume / Math.max(avgVol, 1)).toFixed(2)}×`,
+        rationale: `Momentum Breakout Long · Close > ${lookback}-bar High · ADX ${ind.adx.toFixed(1)} · Vol ${(candle.volume / Math.max(avgVol, 1)).toFixed(2)}×`,
         timestampMs: nowMs,
       };
     }
 
     if (
       allowShort &&
+      htfShortOk &&
+      obiShortOk &&
       candle.close < priorLow &&
       emaShortOk &&
       qualShort.allOk &&
@@ -364,7 +398,7 @@ export function evaluateEntrySignal(
         atr: ind.atr,
         adx: ind.adx,
         rsi: ind.rsi,
-        rationale: `Momentum Breakout Short · Close < 10-bar Low · ADX ${ind.adx.toFixed(1)} · Vol ${(candle.volume / Math.max(avgVol, 1)).toFixed(2)}×`,
+        rationale: `Momentum Breakout Short · Close < ${lookback}-bar Low · ADX ${ind.adx.toFixed(1)} · Vol ${(candle.volume / Math.max(avgVol, 1)).toFixed(2)}×`,
         timestampMs: nowMs,
       };
     }
@@ -390,7 +424,16 @@ export function evaluateEntrySignal(
       ind.rsi <= indCfg.rsiShortPullbackMax &&
       ind.rsi < ind.prevRsi);
 
-  if (allowLong && emaPullLongOk && qualLong.allOk && diLongOk && rsiPullLongOk && vwapLongOk) {
+  if (
+    allowLong &&
+    htfLongOk &&
+    obiLongOk &&
+    emaPullLongOk &&
+    qualLong.allOk &&
+    diLongOk &&
+    rsiPullLongOk &&
+    vwapLongOk
+  ) {
     return {
       symbol,
       side: 'Long',
@@ -403,7 +446,16 @@ export function evaluateEntrySignal(
     };
   }
 
-  if (allowShort && emaPullShortOk && qualShort.allOk && diShortOk && rsiPullShortOk && vwapShortOk) {
+  if (
+    allowShort &&
+    htfShortOk &&
+    obiShortOk &&
+    emaPullShortOk &&
+    qualShort.allOk &&
+    diShortOk &&
+    rsiPullShortOk &&
+    vwapShortOk
+  ) {
     return {
       symbol,
       side: 'Short',
@@ -458,6 +510,8 @@ export function evaluateSignalDiagnostics(
   const useAdx = options?.features?.adxStrengthFilter !== false;
   const useVwap = options?.features?.vwapBiasFilter !== false;
   const useVolConfirm = options?.features?.volumeConfirmationFilter === true;
+  const useHtf = options?.features?.htfTrendFilter === true;
+  const useObi = options?.features?.obiEntryFilter === true;
 
   const emaBull =
     ind.emaFast !== null &&
@@ -525,10 +579,11 @@ export function evaluateSignalDiagnostics(
   let checks: Array<{ label: string; ok: boolean }>;
 
   if (profile === 'ema_breakout') {
+    const lookback = Math.max(3, Math.min(200, Math.round(indCfg.donchianLookback ?? 20)));
     const recent =
       candles.length > 0 && candles[candles.length - 1]?.openTimeMs === latestCandle.openTimeMs
-        ? candles.slice(-11, -1)
-        : candles.slice(-10);
+        ? candles.slice(-(lookback + 1), -1)
+        : candles.slice(-lookback);
     const priorHigh = recent.length > 0 ? Math.max(...recent.map((c) => c.high)) : latestCandle.open;
     const priorLow = recent.length > 0 ? Math.min(...recent.map((c) => c.low)) : latestCandle.open;
     const avgVol =
@@ -561,7 +616,7 @@ export function evaluateSignalDiagnostics(
     const qualDiag = evaluateSignalQualityMitigation(preferredSide, latestCandle, ind, tradingCfg, indCfg, options);
 
     checks = [
-      { label: '10-Bar Donchian Breakout', ok: breakoutOk },
+      { label: `${lookback}-Bar Donchian Breakout`, ok: breakoutOk },
       { label: 'EMA Stack (9 > 21 > 50)', ok: !useEma || (allowLong && emaStackBull) || (allowShort && emaStackBear) },
       { label: 'Macro EMA Alignment (200)', ok: qualDiag.macroOk && macroOk },
       { label: `ADX ≥ ${indCfg.adxMinTrend} & +DI/-DI (${ind.adx?.toFixed(1) ?? '—'})`, ok: adxOk && diOk && qualDiag.adxSlopeOk && qualDiag.diSpreadOk },
@@ -575,6 +630,23 @@ export function evaluateSignalDiagnostics(
         ok: volSurgeOk,
       },
     ];
+    if (useHtf) {
+      const htfOk =
+        ind.htfClose == null ||
+        ind.htfEmaMacro == null ||
+        (preferShortBreakout ? ind.htfClose <= ind.htfEmaMacro : ind.htfClose >= ind.htfEmaMacro);
+      checks.push({
+        label: `HTF 1h EMA${indCfg.htfEmaPeriod ?? 200} Alignment`,
+        ok: htfOk,
+      });
+    }
+    if (useObi) {
+      const threshold = Math.max(0, indCfg.obiMinImbalance ?? 0.35);
+      checks.push({
+        label: `Order-Book Imbalance ≥ ±${threshold.toFixed(2)} (${ind.obi == null ? '—' : ind.obi.toFixed(2)})`,
+        ok: ind.obi == null || (preferShortBreakout ? ind.obi <= -threshold : ind.obi >= threshold),
+      });
+    }
   } else if (profile === 'vwap_reversion') {
     const atr = ind.atr ?? 0;
     const refAnchor = useVwap && ind.vwap !== null ? ind.vwap : ind.emaMid;
@@ -655,6 +727,20 @@ export function evaluateSignalDiagnostics(
       checks.push({
         label: `Volume ${useVolConfirm ? `(Required ≥ ${minVolMult.toFixed(1)}×)` : `(Info ≥ ${minVolMult.toFixed(1)}×)`} (${volRatio.toFixed(2)}×)`,
         ok: volRatio >= minVolMult,
+      });
+    }
+    if (useHtf) {
+      const htfOk =
+        ind.htfClose == null ||
+        ind.htfEmaMacro == null ||
+        (preferShortPull ? ind.htfClose <= ind.htfEmaMacro : ind.htfClose >= ind.htfEmaMacro);
+      checks.push({ label: `HTF 1h EMA${indCfg.htfEmaPeriod ?? 200} Alignment`, ok: htfOk });
+    }
+    if (useObi) {
+      const threshold = Math.max(0, indCfg.obiMinImbalance ?? 0.35);
+      checks.push({
+        label: `Order-Book Imbalance ≥ ±${threshold.toFixed(2)} (${ind.obi == null ? '—' : ind.obi.toFixed(2)})`,
+        ok: ind.obi == null || (preferShortPull ? ind.obi <= -threshold : ind.obi >= threshold),
       });
     }
   }

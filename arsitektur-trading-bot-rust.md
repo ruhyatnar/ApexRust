@@ -194,3 +194,39 @@ src/
 1. **Validasi Lingkungan Testnet**: Uji coba alur konektivitas dan eksekusi pada Testnet resmi sebelum beralih ke lingkungan produksi.
 2. **Sinkronisasi Waktu Server**: Pastikan sinkronisasi jam sistem operasi dengan NTP beroperasi secara kontinu dengan deviasi waktu di bawah 50 milidetik terhadap peladen bursa.
 3. **Simulasi Paper Trading**: Jalankan modul pemindai dan sinyal dalam mode simulasi (*dry-run*) minimal 72 jam untuk mengevaluasi stabilitas dan kinerja sinyal sebelum alokasi modal langsung.
+
+---
+
+## 9. Status Implementasi dan Catatan Keputusan
+
+Bagian ini adalah **sumber kebenaran status**. Dokumen di atas tetap menjadi spesifikasi
+aspirasional; setiap penyimpangan yang disengaja dicatat di sini agar tidak dilaporkan
+sebagai bug berulang.
+
+| § | Item spesifikasi | Status | Implementasi | Catatan keputusan |
+| :--- | :--- | :--- | :--- | :--- |
+| 3.1 | Scanner `!miniTicker@arr` | **Selesai** | `bot-core::watchlist::rank_screener_tickers`, `src/engine/watchlist.ts`, `src/server/binanceScreenerHub.ts` | Kategori `hot_volume`/`top_gainers`/`top_losers`/`volatility_leaders` + `cts_momentum`. |
+| 3.2 | CTS (RVOL + momentum 1h + volume) | **Selesai (dinormalisasi)** | `compute_cts_score` (Rust), `computeCtsScore` (TS), cache kandil 1h dengan refresh 5 menit di `bot-engine` dan `binanceScreenerHub` | Formula spesifikasi mencampur satuan tak terbatas sehingga volume mendominasi. Implementasi membatasi tiap komponen ke `[0,1]` sebelum dibobot. RVOL butuh 24 bar 1h; listing baru di-skip (bukan ditebak). |
+| 4 | Subscription supervisor | **Selesai (ekuivalen)** | `bot-exchange::binance_ws` (`watch` diff + `SUBSCRIBE`/`UNSUBSCRIBE`, rotasi < 23 jam) | Tidak memakai worker pool terpisah; satu koneksi gabungan per venue dengan diff in-place. |
+| 5.1 | Filter tren HTF | **Selesai (opsional)** | `features.htf_trend_filter`, `indicators.htf_ema_period`, EMA 1h di `bot-engine` + `App.tsx` | Default **off** agar frekuensi trade tidak berubah diam-diam. Data HTF hilang = fail-open. Memakai REST 1h (bukan stream ke-3) supaya kapasitas koneksi tetap. |
+| 5.2 | Donchian 20 + ekspansi ATR | **Selesai (dapat dikonfigurasi)** | `indicators.donchian_lookback` (default 20), `atr_expansion_filter_enabled`, `atr_sma_50` | Lookback lama 10 di-hardcode; kini config. Filter ekspansi default **off**. |
+| 5.3 | OBI / depth | **Selesai (opsional)** | `features.obi_entry_filter`, `@depth10@100ms`, `compute_order_book_imbalance` | Memakai partial book depth (tanpa snapshot/diff sequencing). Stream hanya berlangganan bila toggle aktif. Ambang default ±0,35. |
+| 6 | WebSocket API `session.logon` | **Selesai (terbatas)** | `bot-exchange::ws_api`, `bot-keygen`, `POST /api/live/ed25519-keygen` | `session.logon` **hanya untuk kunci Ed25519**; HMAC memakai penandatanganan per-request. Order lewat WS hanya untuk entry tanpa bracket; entry ber-bracket dan semua exit tetap REST agar proteksi SL/TP tidak pernah hilang. Fallback REST otomatis. |
+| 7 | Tabel risiko (BTC guard, cap leverage) | **Selesai** | `bot-risk::btc_guard`, `RiskManager` (TS), `exchange.max_leverage`, `trading.maxLeverage` | Leverage default 3 dan divalidasi di config, TOML, dan setiap jalur order. BTC guard hanya memblokir entry; exit tetap 24/7; feed basi = fail-open dengan `btc_crash_max_staleness_sec`. |
+| 8 | Layout `src/main.rs` | **Usang** | Workspace `rust-bot/crates/*` | Dipertahankan sebagai catatan historis; struktur aktual adalah 9 crate (termasuk `bot-keygen`). |
+
+### 9.1. Penyimpangan yang disengaja
+
+1. **Bracket order tidak lewat WS API.** Binance WS API tidak menyediakan satu panggilan
+   atomik setara bracket Futures/`algoOrder` + OCO Spot yang sudah terbukti di REST.
+   Memindahkannya berisiko meninggalkan posisi tanpa SL/TP. Karena itu WS API dipakai
+   untuk entry tanpa bracket saja.
+2. **HTF gate memakai REST 1h, bukan stream `kline_1h`.** Menambah stream ke-3 per pair
+   mengubah asumsi kapasitas koneksi dan menaikkan beban pesan; cache 5 menit cukup untuk
+   filter makro pada horizon 5m.
+3. **Default filter baru = off.** `htf_trend_filter`, `obi_entry_filter`, dan
+   `atr_expansion_filter_enabled` sengaja nonaktif agar upgrade tidak mengubah perilaku
+   strategi pengguna yang sudah berjalan.
+4. **19 → 21 FeatureToggles.** Dua toggle baru (`htf_trend_filter`, `obi_entry_filter`)
+   ditambahkan; dokumentasi dan UI diperbarui agar invariant "19 toggles" tidak lagi
+   dikutip secara usang.

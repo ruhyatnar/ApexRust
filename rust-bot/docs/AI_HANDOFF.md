@@ -12,7 +12,7 @@ This document helps developers and AI coding assistants inspect, modify, and ext
    - `bot-indicators`, `bot-strategy`, and `bot-risk` (Rust) and `src/engine/indicators.ts`, `strategy.ts`, `risk.ts`, `quantAnalytics.ts`, `sessionWindows.ts`, and `configStorage.ts` (TypeScript) MUST remain pure, deterministic, and free of network I/O or hidden `Date.now()` / `Utc::now()` calls. Always pass `nowMs` / `now: DateTime<Utc>` as an explicit parameter.
 2. **Risk Gate & Feature Toggle Precedence**:
    - Every entry MUST pass `RiskManager::authorize_entry` / `RiskManager.authorizeEntry` before execution. Never bypass `CircuitBreakerState::Halted` when `features.circuit_breaker` is enabled.
-   - All 19 `FeatureToggles` flags MUST be honored identically across `rust-bot/crates/bot-engine/src/lib.rs`, `src/engine/simulator.ts`, and UI components.
+   - All 21 `FeatureToggles` flags MUST be honored identically across `rust-bot/crates/bot-engine/src/lib.rs`, `src/engine/simulator.ts`, and UI components.
 3. **UTC Session Window Entry-Only Gating (24/7 Exit Continuity)**:
    - When `features.session_window_filter` / `sessionWindowFilter` is `true`, ONLY automated **new entry evaluations** (`evaluate_entry_signal*`, `evaluateAutoPair`, `runAutoScanNow`, `stepBar` auto-entries) are gated by `[[automation.session_windows]]`.
    - Open position exit management (`manage_position_tick` / `managePositionTick` for SL, Break-Even, ATR Trailing Stop, TP1/TP2, and Circuit Breaker Flatten) MUST ALWAYS run 24/7 even outside active UTC windows.

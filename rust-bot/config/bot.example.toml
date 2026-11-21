@@ -5,10 +5,15 @@
 environment = "testnet" # "testnet" | "production"
 venue = "spot"          # "spot" | "futures"
 leverage = 3            # Used when venue = "futures" (1..=20)
+max_leverage = 3        # Hard ceiling enforced on config, TOML and every order path
 margin_type = "ISOLATED"# "ISOLATED" | "CROSSED"
 paper_trading = true    # Isolated virtual paper sandbox when true; live signed orders require credentials + armed_for_live_orders
 ws_stream_url = "wss://stream.testnet.binance.vision/stream"
 ws_api_url = "wss://ws-api.testnet.binance.vision/ws-api/v3"
+# Route bare entry orders over the WebSocket API (session.logon). Requires an
+# Ed25519 key for session.logon; HMAC keys fall back to per-request signing.
+# Generate a keypair with: cargo run -p bot-keygen -- --environment testnet
+use_ws_api_orders = false
 rest_base_url = "https://testnet.binance.vision"
 # Transport Failover & Watchdog
 ws_heartbeat_timeout_ms = 4500
@@ -21,6 +26,9 @@ max_consecutive_rest_failures = 5
 auth_method = "hmac-sha256" # "hmac-sha256" | "ed25519"
 api_key_env = "BINANCE_API_KEY"
 api_secret_env = "BINANCE_API_SECRET"
+# Ed25519 only: PKCS#8 PEM path (e.g. "rust-bot/keys/ed25519-testnet.pem").
+# The generated key file is gitignored; never commit it.
+# ed25519_key_path = "rust-bot/keys/ed25519-testnet.pem"
 recv_window_ms = 5000
 max_order_notional_usdt = 250.0
 require_preflight_test_order = true
@@ -38,13 +46,20 @@ taker_fee_bps = 10.0
 pair_selection_mode = "hybrid"       # "static" | "hybrid" | "dynamic"
 quote_asset = "USDT"
 max_watchlist_pairs = 20
-trending_category = "hot_volume"     # "hot_volume" | "top_gainers" | "top_losers" | "volatility_leaders"
+trending_category = "hot_volume"     # "hot_volume" | "top_gainers" | "top_losers" | "volatility_leaders" | "cts_momentum"
 trending_top_n = 5
 trending_min_quote_volume_usdt = 10000000.0
 trending_min_dwell_minutes = 15
 trending_hysteresis_rank_buffer = 3
 ranking_source = "auto"              # "auto" | "production" | "environment"
 max_same_direction_positions = 2
+
+# CTS screener: 1h RVOL + 1h momentum + cross-sectionally normalized volume.
+cts_screener_enabled = false
+cts_rvol_weight = 0.4
+cts_momentum_weight = 0.4
+cts_volume_weight = 0.2
+cts_min_rvol = 1.2
 
 [automation]
 enabled = true
@@ -101,6 +116,8 @@ rsi_momentum_filter = true
 adx_strength_filter = true
 vwap_bias_filter = true
 volume_confirmation_filter = false
+htf_trend_filter = false
+obi_entry_filter = false
 session_window_filter = false
 atr_dynamic_exits = true
 take_profit_ladder = true
@@ -139,6 +156,12 @@ require_rising_adx = true
 min_di_spread = 3.0
 require_macro_ema_in_scalping = true
 max_spread_bps = 20.0
+donchian_lookback = 20
+atr_expansion_filter_enabled = false
+atr_expansion_min_ratio = 1.15
+htf_ema_period = 200
+obi_levels = 10
+obi_min_imbalance = 0.35
 
 [exits]
 atr_sl_multiplier = 1.5
@@ -158,6 +181,12 @@ max_win_streak = 5
 max_lose_streak = 3
 streak_cooldown_minutes = 30
 flatten_on_circuit_breaker = true
+# Block new entries when BTC falls faster than this inside the window.
+# Exits keep running 24/7; a stale BTC feed fails open.
+btc_crash_guard_enabled = true
+btc_crash_threshold_pct = 1.5
+btc_crash_window_minutes = 15
+btc_crash_max_staleness_sec = 120
 
 [git_backup]
 enabled = true

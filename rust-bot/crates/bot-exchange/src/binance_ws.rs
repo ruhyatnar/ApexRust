@@ -90,6 +90,32 @@ pub enum WsStreamEvent {
         best_ask: f64,
     },
     MiniTickerAll(Vec<MarketTicker24h>),
+    /// Top N partial book levels (`@depthN@100ms`); no snapshot sequencing needed.
+    DepthBook {
+        symbol: String,
+        bids: Vec<(f64, f64)>,
+        asks: Vec<(f64, f64)>,
+    },
+}
+
+/// Streams per pair in the combined connection (kline + bookTicker [+ depth]).
+fn streams_per_pair(include_depth: bool) -> usize {
+    if include_depth {
+        3
+    } else {
+        2
+    }
+}
+
+fn pair_subscriptions(symbol_lower: &str, timeframe: &str, include_depth: bool) -> Vec<String> {
+    let mut out = vec![
+        format!("{symbol_lower}@kline_{timeframe}"),
+        format!("{symbol_lower}@bookTicker"),
+    ];
+    if include_depth {
+        out.push(format!("{symbol_lower}@depth10@100ms"));
+    }
+    out
 }
 
 /// Binance combined WebSocket stream wrapper (`<symbol>@kline_<tf>`, `<symbol>@bookTicker`,
@@ -249,21 +275,22 @@ impl BinanceWsDriver {
         pairs: &[String],
         timeframe: &str,
         include_mini_ticker: bool,
+        include_depth: bool,
     ) -> String {
-        let mut streams = Vec::with_capacity(pairs.len() * 2 + 1);
+        let mut streams = Vec::with_capacity(pairs.len() * 3 + 1);
         if include_mini_ticker {
             streams.push("!miniTicker@arr".to_string());
         }
+        let per_pair = streams_per_pair(include_depth);
         for p in pairs {
-            if streams.len() + 2 > MAX_COMBINED_STREAMS_PER_CONN {
+            if streams.len() + per_pair > MAX_COMBINED_STREAMS_PER_CONN {
                 break;
             }
             let lower = p.trim().to_lowercase();
             if lower.is_empty() {
                 continue;
             }
-            streams.push(format!("{lower}@kline_{timeframe}"));
-            streams.push(format!("{lower}@bookTicker"));
+            streams.extend(pair_subscriptions(&lower, timeframe, include_depth));
         }
         if streams.is_empty() {
             streams.push("!miniTicker@arr".to_string());
@@ -280,7 +307,9 @@ impl BinanceWsDriver {
         tx: &mpsc::Sender<WsStreamEvent>,
         include_mini_ticker: bool,
     ) -> Result<()> {
-        let max_pairs = (MAX_COMBINED_STREAMS_PER_CONN - usize::from(include_mini_ticker)) / 2;
+        let include_depth = self.cfg.depth_stream_enabled;
+        let max_pairs = (MAX_COMBINED_STREAMS_PER_CONN - usize::from(include_mini_ticker))
+            / streams_per_pair(include_depth);
         let initial_pairs: Vec<String> = pairs_rx
             .borrow_and_update()
             .iter()
@@ -294,6 +323,7 @@ impl BinanceWsDriver {
             &initial_pairs,
             &self.timeframe,
             include_mini_ticker,
+            include_depth,
         );
         info!(%url, count = initial_pairs.len(), "Connecting to Binance reactive combined WebSocket");
 
@@ -337,11 +367,10 @@ impl BinanceWsDriver {
                     let to_remove: Vec<String> = active_pairs.difference(&target_set).cloned().collect();
 
                     if !to_remove.is_empty() {
-                        let mut streams = Vec::with_capacity(to_remove.len() * 2);
+                        let mut streams = Vec::with_capacity(to_remove.len() * 3);
                         for sym in &to_remove {
                             let l = sym.to_lowercase();
-                            streams.push(format!("{l}@kline_{}", self.timeframe));
-                            streams.push(format!("{l}@bookTicker"));
+                            streams.extend(pair_subscriptions(&l, &self.timeframe, include_depth));
                         }
                         send_stream_batches(
                             &mut ws,
@@ -354,11 +383,10 @@ impl BinanceWsDriver {
                     }
 
                     if !to_add.is_empty() {
-                        let mut streams = Vec::with_capacity(to_add.len() * 2);
+                        let mut streams = Vec::with_capacity(to_add.len() * 3);
                         for sym in &to_add {
                             let l = sym.to_lowercase();
-                            streams.push(format!("{l}@kline_{}", self.timeframe));
-                            streams.push(format!("{l}@bookTicker"));
+                            streams.extend(pair_subscriptions(&l, &self.timeframe, include_depth));
                         }
                         send_stream_batches(
                             &mut ws,
@@ -465,6 +493,67 @@ impl BinanceWsDriver {
             let items: Vec<MiniTickerRaw> = serde_json::from_value(env.data).ok()?;
             return Some(WsStreamEvent::MiniTickerAll(Self::convert_mini_tickers(venue, items)));
         }
+        if env.stream.contains("@depth") {
+            let symbol_from_stream = env
+                .stream
+                .split('@')
+                .next()
+                .unwrap_or_default()
+                .to_uppercase();
+            let (symbol, raw_bids, raw_asks) = if let Some(s) = env
+                .data
+                .get("s")
+                .and_then(|v| v.as_str())
+            {
+                (
+                    s.to_uppercase(),
+                    env.data.get("b").cloned().unwrap_or_default(),
+                    env.data.get("a").cloned().unwrap_or_default(),
+                )
+            } else {
+                (
+                    symbol_from_stream,
+                    env.data
+                        .get("bids")
+                        .cloned()
+                        .or_else(|| env.data.get("b").cloned())
+                        .unwrap_or_default(),
+                    env.data
+                        .get("asks")
+                        .cloned()
+                        .or_else(|| env.data.get("a").cloned())
+                        .unwrap_or_default(),
+                )
+            };
+            if symbol.is_empty() {
+                return None;
+            }
+            let parse_levels = |value: serde_json::Value| -> Vec<(f64, f64)> {
+                value
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|row| {
+                                let pair = row.as_array()?;
+                                let price = pair.first()?.as_str()?.parse::<f64>().ok()?;
+                                let qty = pair.get(1)?.as_str()?.parse::<f64>().ok()?;
+                                (price > 0.0 && qty.is_finite()).then_some((price, qty))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let bids = parse_levels(raw_bids);
+            let asks = parse_levels(raw_asks);
+            if bids.is_empty() && asks.is_empty() {
+                return None;
+            }
+            return Some(WsStreamEvent::DepthBook {
+                symbol,
+                bids,
+                asks,
+            });
+        }
         if env.stream.ends_with("@bookTicker") {
             let payload: BookTickerPayload = serde_json::from_value(env.data).ok()?;
             let best_bid = payload.best_bid.parse::<f64>().ok()?;
@@ -537,6 +626,9 @@ impl BinanceWsDriver {
                     in_watchlist: false,
                     source_tag: None,
                     updated_at_ms: if item.event_time_ms > 0 { item.event_time_ms } else { fallback_now },
+                    rvol_1h: None,
+                    momentum_1h_pct: None,
+                    cts_score: None,
                 })
             })
             .collect()
@@ -567,6 +659,50 @@ mod tests {
             ws_reconnect_initial_ms: 1_000,
             ws_reconnect_max_ms: 30_000,
             max_consecutive_rest_failures: 5,
+            max_leverage: 3,
+            ws_api_url: String::new(),
+            use_ws_api_orders: false,
+            depth_stream_enabled: false,
+        }
+    }
+
+    #[test]
+    fn depth_partial_book_parses_futures_and_spot_shapes() {
+        let futures_frame = serde_json::json!({
+            "stream": "btcusdt@depth10@100ms",
+            "data": {
+                "e": "depthUpdate",
+                "s": "BTCUSDT",
+                "b": [["100.0", "2.5"], ["99.5", "1.0"]],
+                "a": [["100.5", "1.0"]]
+            }
+        })
+        .to_string();
+        match BinanceWsDriver::parse_combined_event_ex(ExchangeVenue::Futures, &futures_frame) {
+            Some(WsStreamEvent::DepthBook { symbol, bids, asks }) => {
+                assert_eq!(symbol, "BTCUSDT");
+                assert_eq!(bids.len(), 2);
+                assert_eq!(asks.len(), 1);
+            }
+            other => panic!("unexpected depth parse: {other:?}"),
+        }
+
+        let spot_frame = serde_json::json!({
+            "stream": "ethusdt@depth10@100ms",
+            "data": {
+                "lastUpdateId": 160,
+                "bids": [["10.0", "3.0"]],
+                "asks": [["10.1", "1.0"]]
+            }
+        })
+        .to_string();
+        match BinanceWsDriver::parse_combined_event_ex(ExchangeVenue::Spot, &spot_frame) {
+            Some(WsStreamEvent::DepthBook { symbol, bids, asks }) => {
+                assert_eq!(symbol, "ETHUSDT");
+                assert_eq!(bids[0], (10.0, 3.0));
+                assert_eq!(asks[0], (10.1, 1.0));
+            }
+            other => panic!("unexpected spot depth parse: {other:?}"),
         }
     }
 

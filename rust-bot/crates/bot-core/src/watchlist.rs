@@ -72,6 +72,67 @@ pub fn has_candle_sequence_gap(prev_open_time_ms: Option<i64>, next_open_time_ms
     (next_open_time_ms - prev) as f64 > step * 1.5
 }
 
+/// Cliff-normalizes a value into `[0, 1]`.
+fn clamp01(value: f64) -> f64 {
+    if !value.is_finite() {
+        0.0
+    } else {
+        value.clamp(0.0, 1.0)
+    }
+}
+
+pub fn median_f64(values: &[f64]) -> f64 {
+    let mut clean: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if clean.is_empty() {
+        return 0.0;
+    }
+    clean.sort_by(f64::total_cmp);
+    let mid = clean.len() / 2;
+    if clean.len().is_multiple_of(2) {
+        (clean[mid - 1] + clean[mid]) / 2.0
+    } else {
+        clean[mid]
+    }
+}
+
+/// Composite Trend Score (CTS): RVOL + 1h momentum + relative volume.
+///
+/// Every component is normalized into `[0, 1]` before weighting, so a single
+/// unbounded term (raw USDT volume of BTC-sized symbols) can never dominate.
+/// Returns `None` when RVOL is unavailable (e.g. a listing younger than 24h).
+pub fn compute_cts_score(
+    rvol_1h: f64,
+    momentum_1h_pct: f64,
+    quote_volume: f64,
+    median_quote_volume: f64,
+    weights: (f64, f64, f64),
+) -> Option<f64> {
+    if !rvol_1h.is_finite() || rvol_1h <= 0.0 {
+        return None;
+    }
+    let (w_rvol, w_momentum, w_volume) = (
+        weights.0.max(0.0),
+        weights.1.max(0.0),
+        weights.2.max(0.0),
+    );
+    let total = w_rvol + w_momentum + w_volume;
+    if total <= 0.0 {
+        return None;
+    }
+    let rvol_score = clamp01(rvol_1h / 3.0);
+    let momentum = if momentum_1h_pct.is_finite() { momentum_1h_pct } else { 0.0 };
+    let momentum_score = clamp01(momentum / 5.0 * 0.5 + 0.5);
+    let rel_volume = if median_quote_volume > 0.0 {
+        quote_volume / median_quote_volume
+    } else {
+        0.0
+    };
+    let volume_score = clamp01(rel_volume / 10.0);
+    Some(
+        (rvol_score * w_rvol + momentum_score * w_momentum + volume_score * w_volume) / total,
+    )
+}
+
 pub fn rank_screener_tickers(
     tickers: &[MarketTicker24h],
     category: TrendingCategory,
@@ -96,6 +157,7 @@ pub fn rank_screener_tickers(
                 && (!only_tradable || t.tradable_on_active_env)
                 && t.quote_volume >= min_vol
                 && (query.is_empty() || t.symbol.contains(&query))
+                && (category != TrendingCategory::CtsMomentum || t.cts_score.is_some())
                 && t.last_price > 0.0
         })
         .cloned()
@@ -113,6 +175,16 @@ pub fn rank_screener_tickers(
         TrendingCategory::VolatilityLeaders => b
             .range_pct_24h
             .total_cmp(&a.range_pct_24h)
+            .then_with(|| b.quote_volume.total_cmp(&a.quote_volume)),
+        TrendingCategory::CtsMomentum => b
+            .cts_score
+            .unwrap_or(f64::NEG_INFINITY)
+            .total_cmp(&a.cts_score.unwrap_or(f64::NEG_INFINITY))
+            .then_with(|| {
+                b.rvol_1h
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.rvol_1h.unwrap_or(0.0))
+            })
             .then_with(|| b.quote_volume.total_cmp(&a.quote_volume)),
         TrendingCategory::HotVolume => b.quote_volume.total_cmp(&a.quote_volume),
     });
@@ -291,7 +363,22 @@ mod tests {
             in_watchlist: false,
             source_tag: None,
             updated_at_ms: 1_000,
+            rvol_1h: None,
+            momentum_1h_pct: None,
+            cts_score: None,
         }
+    }
+
+    #[test]
+    fn cts_score_is_bounded_and_volume_cannot_dominate() {
+        let btc_like = compute_cts_score(2.0, 1.0, 50_000_000_000.0, 20_000_000.0, (0.4, 0.4, 0.2))
+            .unwrap();
+        let alt_like = compute_cts_score(3.0, 4.0, 200_000_000.0, 20_000_000.0, (0.4, 0.4, 0.2))
+            .unwrap();
+        assert!((0.0..=1.0).contains(&btc_like));
+        assert!(alt_like > btc_like, "alt momentum must outrank raw mega-volume");
+        assert_eq!(compute_cts_score(0.0, 5.0, 1.0, 1.0, (0.4, 0.4, 0.2)), None);
+        assert_eq!(compute_cts_score(2.0, 0.0, 1.0, 1.0, (0.0, 0.0, 0.0)), None);
     }
 
     #[test]

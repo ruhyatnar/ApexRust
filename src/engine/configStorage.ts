@@ -78,7 +78,8 @@ export function mergeBotConfigWithDefaults(
     rawCategory === 'hot_volume' ||
     rawCategory === 'top_gainers' ||
     rawCategory === 'top_losers' ||
-    rawCategory === 'volatility_leaders'
+    rawCategory === 'volatility_leaders' ||
+    rawCategory === 'cts_momentum'
       ? rawCategory
       : (base.trading.trendingCategory ?? 'hot_volume');
 
@@ -90,10 +91,30 @@ export function mergeBotConfigWithDefaults(
       ? rawRankingSource
       : (base.trading.rankingSource ?? 'auto');
 
+  const maxLeverage = Math.max(
+    1,
+    Math.min(20, Math.round(Number(tradingRaw.maxLeverage ?? base.trading.maxLeverage ?? 3)))
+  );
+
   const merged: BotConfig = {
     trading: {
       ...base.trading,
       ...(tradingRaw as Partial<BotConfig['trading']>),
+      maxLeverage,
+      leverage: Math.min(
+        maxLeverage,
+        Math.max(1, Math.round(Number(tradingRaw.leverage ?? base.trading.leverage ?? 3)))
+      ),
+      ctsRvolWeight: Math.max(0, Number(tradingRaw.ctsRvolWeight ?? base.trading.ctsRvolWeight ?? 0.4)),
+      ctsMomentumWeight: Math.max(
+        0,
+        Number(tradingRaw.ctsMomentumWeight ?? base.trading.ctsMomentumWeight ?? 0.4)
+      ),
+      ctsVolumeWeight: Math.max(
+        0,
+        Number(tradingRaw.ctsVolumeWeight ?? base.trading.ctsVolumeWeight ?? 0.2)
+      ),
+      ctsMinRvol: Math.max(0, Number(tradingRaw.ctsMinRvol ?? base.trading.ctsMinRvol ?? 1.2)),
       pairs: normalizeSymbolList(tradingRaw.pairs, base.trading.pairs),
       pairSelectionMode,
       trendingCategory,
@@ -126,6 +147,23 @@ export function mergeBotConfigWithDefaults(
     indicators: {
       ...base.indicators,
       ...(indicatorsRaw as Partial<BotConfig['indicators']>),
+      donchianLookback: Math.max(
+        3,
+        Math.min(200, Math.round(Number(indicatorsRaw.donchianLookback ?? base.indicators.donchianLookback ?? 20)))
+      ),
+      atrExpansionMinRatio: Math.max(
+        0.5,
+        Number(indicatorsRaw.atrExpansionMinRatio ?? base.indicators.atrExpansionMinRatio ?? 1.15)
+      ),
+      htfEmaPeriod: Math.max(
+        20,
+        Math.min(500, Math.round(Number(indicatorsRaw.htfEmaPeriod ?? base.indicators.htfEmaPeriod ?? 200)))
+      ),
+      obiLevels: Math.max(1, Math.min(50, Math.round(Number(indicatorsRaw.obiLevels ?? base.indicators.obiLevels ?? 10)))),
+      obiMinImbalance: Math.min(
+        1,
+        Math.max(0, Number(indicatorsRaw.obiMinImbalance ?? base.indicators.obiMinImbalance ?? 0.35))
+      ),
     },
     exits: {
       ...base.exits,
@@ -134,6 +172,21 @@ export function mergeBotConfigWithDefaults(
     risk: {
       ...base.risk,
       ...(riskRaw as Partial<BotConfig['risk']>),
+      btcCrashThresholdPct: Math.max(
+        0.1,
+        Number(riskRaw.btcCrashThresholdPct ?? base.risk.btcCrashThresholdPct ?? 1.5)
+      ),
+      btcCrashWindowMinutes: Math.max(
+        1,
+        Math.min(240, Math.round(Number(riskRaw.btcCrashWindowMinutes ?? base.risk.btcCrashWindowMinutes ?? 15)))
+      ),
+      btcCrashMaxStalenessSec: Math.max(
+        5,
+        Math.min(
+          3600,
+          Math.round(Number(riskRaw.btcCrashMaxStalenessSec ?? base.risk.btcCrashMaxStalenessSec ?? 120))
+        )
+      ),
     },
     automation: {
       ...base.automation,

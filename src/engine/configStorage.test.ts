@@ -42,6 +42,7 @@ test('savePersistedBotConfig and loadPersistedBotConfig round-trip all customize
   customized.trading.mode = 'intraday';
   customized.trading.timeframe = '15m';
   customized.trading.venue = 'Futures';
+  customized.trading.maxLeverage = 10;
   customized.trading.leverage = 7;
   customized.trading.positionSizingMode = 'half_kelly';
   customized.trading.baseRiskPerTradePct = 1.4;
@@ -65,6 +66,7 @@ test('savePersistedBotConfig and loadPersistedBotConfig round-trip all customize
   assert.equal(hydrated.trading.mode, 'intraday');
   assert.equal(hydrated.trading.timeframe, '15m');
   assert.equal(hydrated.trading.venue, 'Futures');
+  assert.equal(hydrated.trading.maxLeverage, 10);
   assert.equal(hydrated.trading.leverage, 7);
   assert.equal(hydrated.trading.positionSizingMode, 'half_kelly');
   assert.equal(hydrated.trading.baseRiskPerTradePct, 1.4);

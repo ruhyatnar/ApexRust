@@ -228,6 +228,26 @@ export class SessionVwap {
   }
 }
 
+class RollingMean {
+  private readonly period: number;
+  private readonly ring: number[] = [];
+  private sum = 0;
+
+  constructor(period: number) {
+    this.period = Math.max(1, Math.floor(period));
+  }
+
+  next(value: number): number | null {
+    const clean = Number.isFinite(value) ? value : 0;
+    this.ring.push(clean);
+    this.sum += clean;
+    if (this.ring.length > this.period) {
+      this.sum -= this.ring.shift() ?? 0;
+    }
+    return this.ring.length > 0 ? this.sum / this.ring.length : null;
+  }
+}
+
 class VolumeSma {
   private readonly period: number;
   private readonly ring: number[] = [];
@@ -263,6 +283,7 @@ export class IndicatorPipeline {
   private readonly adx: Adx;
   private readonly vwap: SessionVwap;
   private readonly volSma: VolumeSma;
+  private readonly atrSma50: RollingMean;
   private warmupBarsCount = 0;
   private latest: IndicatorSnapshot = {
     emaFast: null,
@@ -294,6 +315,7 @@ export class IndicatorPipeline {
     this.adx = new Adx(cfg.adxPeriod);
     this.vwap = new SessionVwap();
     this.volSma = new VolumeSma(20);
+    this.atrSma50 = new RollingMean(50);
   }
 
   update(candle: Candle, hasBarGap = false): IndicatorSnapshot {
@@ -307,6 +329,7 @@ export class IndicatorPipeline {
     const { adx, prevAdx, plusDi, minusDi } = this.adx.next(candle);
     const vwap = this.vwap.next(candle);
     const { sma: volumeSma20, ratio: volumeRatio } = this.volSma.next(candle.volume);
+    const atrSma50 = atr === null ? null : this.atrSma50.next(atr);
     this.warmupBarsCount += 1;
 
     this.latest = {
@@ -325,6 +348,7 @@ export class IndicatorPipeline {
       vwap,
       volumeSma20,
       volumeRatio,
+      atrSma50,
       warmupBarsCount: this.warmupBarsCount,
       hasBarGap,
     };

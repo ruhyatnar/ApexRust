@@ -14,7 +14,8 @@ export type TrendingCategory =
   | 'hot_volume'
   | 'top_gainers'
   | 'top_losers'
-  | 'volatility_leaders';
+  | 'volatility_leaders'
+  | 'cts_momentum';
 
 export type TrendingRankingSource = 'auto' | 'production' | 'environment';
 
@@ -118,6 +119,14 @@ export interface IndicatorSnapshot {
   vwap: number | null;
   volumeSma20?: number | null;
   volumeRatio?: number | null;
+  /** SMA(50) of ATR — regime baseline for the ATR expansion filter. */
+  atrSma50?: number | null;
+  /** Closed 1h candle close for the higher-timeframe trend gate. */
+  htfClose?: number | null;
+  /** EMA(htfEmaPeriod) computed on closed 1h candles. */
+  htfEmaMacro?: number | null;
+  /** Order-book imbalance in [-1, 1] from the top depth levels. */
+  obi?: number | null;
   warmupBarsCount?: number;
   hasBarGap?: boolean;
 }
@@ -357,6 +366,8 @@ export interface EntrySignal {
 export interface TradingConfig {
   venue: ExchangeVenue;
   leverage: number;
+  /** Hard ceiling applied to `leverage` on every config, TOML and order path. */
+  maxLeverage?: number;
   marginType: MarginType;
   mode: StrategyMode;
   timeframe: Timeframe;
@@ -376,6 +387,12 @@ export interface TradingConfig {
   trendingHysteresisRankBuffer?: number;
   rankingSource?: TrendingRankingSource;
   maxSameDirectionPositions?: number;
+  /** CTS screener: relative volume + 1h momentum blended score. */
+  ctsScreenerEnabled?: boolean;
+  ctsRvolWeight?: number;
+  ctsMomentumWeight?: number;
+  ctsVolumeWeight?: number;
+  ctsMinRvol?: number;
 }
 
 export interface IndicatorConfig {
@@ -406,6 +423,17 @@ export interface IndicatorConfig {
   minDiSpread?: number;
   requireMacroEmaInScalping?: boolean;
   maxSpreadBps?: number;
+  /** Donchian breakout lookback in closed bars (spec default 20). */
+  donchianLookback?: number;
+  /** Require ATR to be expanding versus its SMA(50) baseline. */
+  atrExpansionFilterEnabled?: boolean;
+  atrExpansionMinRatio?: number;
+  /** EMA period evaluated on closed 1h candles for the HTF trend gate. */
+  htfEmaPeriod?: number;
+  /** Number of top book levels used to compute OBI. */
+  obiLevels?: number;
+  /** Minimum |OBI| in [0, 1] required to allow an entry. */
+  obiMinImbalance?: number;
 }
 
 export interface VolatilitySpikeAlert {
@@ -440,6 +468,12 @@ export interface RiskConfig {
   maxLoseStreak: number;
   streakCooldownMinutes: number;
   flattenOnCircuitBreaker: boolean;
+  /** Block new entries when BTC drops faster than the threshold inside the window. */
+  btcCrashGuardEnabled?: boolean;
+  btcCrashThresholdPct?: number;
+  btcCrashWindowMinutes?: number;
+  /** Fail-open after this many seconds without a fresh BTC price sample. */
+  btcCrashMaxStalenessSec?: number;
 }
 
 export interface UtcTimeWindow {
@@ -486,6 +520,8 @@ export interface FeatureToggles {
   adxStrengthFilter: boolean;
   vwapBiasFilter: boolean;
   volumeConfirmationFilter?: boolean;
+  htfTrendFilter?: boolean;
+  obiEntryFilter?: boolean;
   sessionWindowFilter: boolean;
   atrDynamicExits: boolean;
   takeProfitLadder: boolean;
@@ -517,6 +553,10 @@ export interface RiskStatus {
   winStreak: number;
   loseStreak: number;
   quarantinedPairs: string[];
+  /** BTC move (%) across the guard window, null until two samples exist. */
+  btcChangePctWindow?: number | null;
+  btcWindowMinutes?: number;
+  btcGuardBlocking?: boolean;
 }
 
 export interface PairRuntimeState {
@@ -554,6 +594,10 @@ export interface MarketTicker24h {
   inWatchlist?: boolean;
   sourceTag?: PairSourceTag;
   updatedAtMs: number;
+  /** CTS screener metrics (1h RVOL / 1h momentum / blended score). */
+  rvol1h?: number;
+  momentum1hPct?: number;
+  ctsScore?: number;
 }
 
 export interface ScreenerSnapshotPayload {

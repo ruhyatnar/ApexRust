@@ -137,6 +137,18 @@ const TOGGLE_GROUPS: ToggleGroup[] = [
         label: 'Volume Expansion Filter (≥1.5× Avg)',
         description: 'Requires trigger candle volume to exceed 1.5×–2.0× 20-bar baseline volume to confirm institutional participation.',
       },
+      {
+        key: 'htfTrendFilter',
+        label: 'Higher-Timeframe Trend Gate (1h EMA200)',
+        description:
+          'Requires the closed 1h candle to sit on the same side of its EMA200 as the entry side; fails open until 1h data is loaded.',
+      },
+      {
+        key: 'obiEntryFilter',
+        label: 'Order-Book Imbalance Filter',
+        description:
+          'Requires depth-10 bid/ask imbalance to lean with the entry side (threshold from indicators.obiMinImbalance).',
+      },
     ],
   },
   {
@@ -320,6 +332,8 @@ export const FeatureTogglesView: React.FC<FeatureTogglesViewProps> = ({
         adxStrengthFilter: true,
         vwapBiasFilter: true,
         volumeConfirmationFilter: false,
+        htfTrendFilter: false,
+        obiEntryFilter: false,
         sessionWindowFilter: false,
         atrDynamicExits: true,
         takeProfitLadder: true,

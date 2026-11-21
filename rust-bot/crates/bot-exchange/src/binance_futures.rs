@@ -249,6 +249,70 @@ impl BinanceFuturesClient {
     /// Execute a live USD-M Futures order (and optional `/fapi/v1/algoOrder` TP/SL brackets)
     /// via `binance-sdk`. Skips margin/leverage updates on `reduce_only` exits to prevent `-4048`,
     /// runs preflight test orders before mutating margin/leverage, and honors Hedge vs One-Way mode.
+    /// Builds `order.place` params for the WebSocket API with venue filters applied.
+    /// Used only for bare entries (no bracket prices); bracketed entries stay on REST.
+    pub(crate) async fn build_ws_order_params(
+        &self,
+        req: &LiveOrderRequest,
+    ) -> Result<serde_json::Value> {
+        let sym = req.symbol.trim().to_uppercase();
+        let ref_px = req.limit_price.filter(|p| p.is_finite() && *p > 0.0).unwrap_or(1.0);
+        let filters = get_or_fetch_symbol_filters(
+            &self.http,
+            &self.filter_cache,
+            self.rest_base_url(),
+            ExchangeVenue::Futures,
+            &sym,
+            ref_px,
+            &self.rate_budget,
+        )
+        .await;
+        let is_limit = matches!(
+            req.order_method,
+            OrderExecutionMethod::Limit | OrderExecutionMethod::LimitMaker
+        );
+        let (step, dec) = if is_limit {
+            (filters.step_size, filters.step_decimals)
+        } else {
+            (filters.market_step_size, filters.market_step_decimals)
+        };
+        let qty_dec = to_binance_step_decimal(req.quantity, step, dec)?;
+        let qty_num = qty_dec.to_string().parse::<f64>().unwrap_or(req.quantity);
+        let limit_px_num = if is_limit {
+            Some(
+                req.limit_price
+                    .filter(|&p| p.is_finite() && p > 0.0)
+                    .ok_or_else(|| {
+                        BotError::RestApi("Futures WS LIMIT order missing positive price".into())
+                    })?,
+            )
+        } else {
+            None
+        };
+        validate_exchange_filters(
+            &sym,
+            &filters,
+            limit_px_num,
+            Some(qty_num),
+            qty_num * limit_px_num.unwrap_or(ref_px),
+            !is_limit,
+            req.reduce_only,
+        )?;
+        let side = match req.side {
+            Side::Long => "BUY",
+            Side::Short => "SELL",
+        };
+        crate::ws_api::build_order_place_params(
+            &sym,
+            side,
+            if is_limit { "LIMIT" } else { "MARKET" },
+            qty_num,
+            limit_px_num.map(|px| (px, Some(req.time_in_force.as_str()))),
+            req.reduce_only,
+            None,
+        )
+    }
+
     pub async fn execute_futures_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
         let sym = req.symbol.to_uppercase();
         let ref_px = if let Some(px) = req.limit_price.filter(|&p| p.is_finite() && p > 0.0) {
@@ -394,7 +458,7 @@ impl BinanceFuturesClient {
 
             let l_params = ChangeInitialLeverageParams::builder(
                 sym.clone(),
-                i64::from(self.cfg.leverage.clamp(1, 20)),
+                i64::from(self.cfg.effective_leverage()),
             )
             .recv_window(recv_window)
             .build()

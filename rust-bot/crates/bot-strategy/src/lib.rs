@@ -45,8 +45,46 @@ fn passes_quality_mitigation(
         }
     }
 
+    // Higher-timeframe (closed 1h) alignment. Missing HTF data fails open.
+    if features.htf_trend_filter {
+        if let (Some(htf_close), Some(htf_ema)) = (ind.htf_close, ind.htf_ema_macro) {
+            let aligned = match side {
+                Side::Long => htf_close >= htf_ema,
+                Side::Short => htf_close <= htf_ema,
+            };
+            if !aligned {
+                return false;
+            }
+        }
+    }
+
+    // Order-book imbalance gate. A missing book snapshot fails open.
+    if features.obi_entry_filter {
+        if let Some(obi) = ind.obi {
+            let threshold = ind_cfg.obi_min_imbalance.max(0.0);
+            let aligned = match side {
+                Side::Long => obi >= threshold,
+                Side::Short => obi <= -threshold,
+            };
+            if !aligned {
+                return false;
+            }
+        }
+    }
+
     if matches!(profile, StrategyProfile::VwapReversion) {
         return true;
+    }
+
+    // Volatility regime: ATR must be expanding versus its SMA(50) baseline.
+    if ind_cfg.atr_expansion_filter_enabled {
+        if let (Some(atr), Some(baseline)) = (ind.atr, ind.atr_sma_50) {
+            if baseline > 0.0
+                && atr / baseline < ind_cfg.atr_expansion_min_ratio.max(0.5)
+            {
+                return false;
+            }
+        }
     }
 
     let require_macro = features.ema_trend_filter
@@ -250,11 +288,12 @@ pub fn evaluate_entry_signal_with_options(
     let qual_short = passes_quality_mitigation(Side::Short, candle, ind, trading_cfg, ind_cfg, features, profile, spread_bps);
 
     if matches!(profile, StrategyProfile::EmaBreakout) {
+        let donchian_lookback = ind_cfg.donchian_lookback.clamp(3, 200);
         let lookback: Vec<&Candle> = recent_candles
             .iter()
             .rev()
             .skip(if recent_candles.last().is_some_and(|c| c.open_time_ms == candle.open_time_ms) { 1 } else { 0 })
-            .take(10)
+            .take(donchian_lookback)
             .collect();
         let prior_high = if lookback.is_empty() {
             candle.open
@@ -300,7 +339,9 @@ pub fn evaluate_entry_signal_with_options(
                 atr,
                 adx,
                 rsi,
-                rationale: format!("Momentum Breakout Long · Close > 10-bar High · ADX {adx:.1}"),
+                rationale: format!(
+                    "Momentum Breakout Long · Close > {donchian_lookback}-bar High · ADX {adx:.1}"
+                ),
                 timestamp: now,
             });
         }
@@ -321,7 +362,9 @@ pub fn evaluate_entry_signal_with_options(
                 atr,
                 adx,
                 rsi,
-                rationale: format!("Momentum Breakout Short · Close < 10-bar Low · ADX {adx:.1}"),
+                rationale: format!(
+                    "Momentum Breakout Short · Close < {donchian_lookback}-bar Low · ADX {adx:.1}"
+                ),
                 timestamp: now,
             });
         }
@@ -935,6 +978,7 @@ mod tests {
             volume_ratio: Some(2.0),
             warmup_bars_count: 220,
             has_bar_gap: false,
+            ..IndicatorSnapshot::default()
         }
     }
 
@@ -958,6 +1002,7 @@ mod tests {
             volume_ratio: Some(2.0),
             warmup_bars_count: 220,
             has_bar_gap: false,
+            ..IndicatorSnapshot::default()
         }
     }
 

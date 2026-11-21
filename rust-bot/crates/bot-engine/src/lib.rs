@@ -6,8 +6,8 @@
 pub mod git_sync;
 
 use bot_core::{
-    has_candle_sequence_gap, normalize_symbol_list, rank_screener_tickers,
-    resolve_effective_watchlist, BotConfig, Candle, CircuitBreakerState,
+    compute_cts_score, has_candle_sequence_gap, median_f64, normalize_symbol_list,
+    rank_screener_tickers, resolve_effective_watchlist, BotConfig, Candle, CircuitBreakerState,
     ClosedTrade, DirectionPolicy, EngineSnapshot, ExchangeEnvironment, ExchangeVenue, ExitPlan,
     ExitReason, MarketTicker24h, OrderExecutionLog, OrderExecutionMethod,
     OrderHistoryStore, PairSelectionMode, PairSnapshot, PairSourceTag, PendingOrderSnapshot,
@@ -157,12 +157,38 @@ pub struct TradingEngine {
     tradable_symbols: Arc<RwLock<HashSet<String>>>,
     active_watchlist: Arc<RwLock<Vec<ResolvedWatchlistEntry>>>,
     bbo_quotes: BboQuoteMap,
+    obi_quotes: Arc<RwLock<HashMap<String, f64>>>,
+    htf_trends: Arc<RwLock<HashMap<String, HtfTrend>>>,
+    last_htf_refresh_ms: std::sync::atomic::AtomicI64,
     pair_selection_mode: Arc<RwLock<PairSelectionMode>>,
     futures_hedge_mode: AtomicBool,
 }
 
+/// Closed 1h trend + RVOL snapshot used by the HTF gate and the CTS screener.
+#[derive(Debug, Clone, Copy)]
+struct HtfTrend {
+    close: f64,
+    ema: f64,
+    rvol: Option<f64>,
+    momentum_pct: Option<f64>,
+}
+
+/// Normalized order-book imbalance in `[-1, 1]` from summed top-level quantity.
+fn compute_order_book_imbalance(bids: &[(f64, f64)], asks: &[(f64, f64)]) -> Option<f64> {
+    let bid_qty: f64 = bids.iter().map(|(_, q)| q.max(0.0)).sum();
+    let ask_qty: f64 = asks.iter().map(|(_, q)| q.max(0.0)).sum();
+    let total = bid_qty + ask_qty;
+    if total <= f64::EPSILON {
+        None
+    } else {
+        Some((bid_qty - ask_qty) / total)
+    }
+}
+
 impl TradingEngine {
-    pub fn new(cfg: BotConfig) -> Result<Self> {
+    pub fn new(mut cfg: BotConfig) -> Result<Self> {
+        // Derive the depth stream from the OBI toggle so the feed is only paid for when used.
+        cfg.exchange.depth_stream_enabled = cfg.features.obi_entry_filter;
         let initial_pairs = normalize_symbol_list(&cfg.trading.pairs, &[]);
         let gateway = Arc::new(FailoverGateway::new_with_toggles(
             cfg.exchange.clone(),
@@ -243,6 +269,9 @@ impl TradingEngine {
             tradable_symbols: Arc::new(RwLock::new(HashSet::new())),
             active_watchlist: Arc::new(RwLock::new(initial_wl)),
             bbo_quotes: Arc::new(RwLock::new(HashMap::new())),
+            obi_quotes: Arc::new(RwLock::new(HashMap::new())),
+            htf_trends: Arc::new(RwLock::new(HashMap::new())),
+            last_htf_refresh_ms: std::sync::atomic::AtomicI64::new(0),
             pair_selection_mode: Arc::new(RwLock::new(pair_mode)),
             futures_hedge_mode: AtomicBool::new(false),
         })
@@ -273,7 +302,9 @@ impl TradingEngine {
         limit: usize,
         search_query: Option<&str>,
     ) -> ScreenerSnapshotPayload {
-        let tickers: Vec<MarketTicker24h> = self.screener_cache.read().await.values().cloned().collect();
+        let mut tickers: Vec<MarketTicker24h> =
+            self.screener_cache.read().await.values().cloned().collect();
+        self.stamp_cts_metrics(&mut tickers).await;
         let tradable = self.tradable_symbols.read().await;
         let wl = self.active_watchlist.read().await;
         let tag_map: HashMap<&str, PairSourceTag> = wl
@@ -317,6 +348,44 @@ impl TradingEngine {
             updated_at_ms: Utc::now().timestamp_millis(),
             rate_weight_used_1m: Some(self.gateway.used_weight_1m()),
             tickers: enriched,
+        }
+    }
+
+    /// Stamps 1h RVOL / momentum / CTS score from the closed-1h trend cache.
+    async fn stamp_cts_metrics(&self, tickers: &mut [MarketTicker24h]) {
+        let htf = self.htf_trends.read().await;
+        if htf.is_empty() {
+            return;
+        }
+        let median_volume = median_f64(
+            &tickers
+                .iter()
+                .map(|t| t.quote_volume)
+                .filter(|v| *v > 0.0)
+                .collect::<Vec<f64>>(),
+        );
+        let weights = (
+            self.cfg.trading.cts_rvol_weight,
+            self.cfg.trading.cts_momentum_weight,
+            self.cfg.trading.cts_volume_weight,
+        );
+        for ticker in tickers.iter_mut() {
+            let Some(trend) = htf.get(&ticker.symbol) else {
+                continue;
+            };
+            ticker.rvol_1h = trend.rvol;
+            ticker.momentum_1h_pct = trend.momentum_pct;
+            if let (Some(rvol), Some(momentum)) = (trend.rvol, trend.momentum_pct) {
+                if rvol >= self.cfg.trading.cts_min_rvol {
+                    ticker.cts_score = compute_cts_score(
+                        rvol,
+                        momentum,
+                        ticker.quote_volume,
+                        median_volume,
+                        weights,
+                    );
+                }
+            }
         }
     }
 
@@ -1136,7 +1205,9 @@ impl TradingEngine {
         let trad_guard = self.tradable_symbols.read().await;
         let trad_opt = (!trad_guard.is_empty()).then_some(&*trad_guard);
 
-        let tickers: Vec<MarketTicker24h> = self.screener_cache.read().await.values().cloned().collect();
+        let mut tickers: Vec<MarketTicker24h> =
+            self.screener_cache.read().await.values().cloned().collect();
+        self.stamp_cts_metrics(&mut tickers).await;
         let cur_trending: Vec<String> = self
             .active_watchlist
             .read()
@@ -1198,6 +1269,87 @@ impl TradingEngine {
                 if next_syms.len() > 2 {
                     tokio::time::sleep(Duration::from_millis(120)).await;
                 }
+            }
+        }
+
+        // Closed 1h trend cache for the HTF gate (refreshed at most every 5 minutes).
+        if self.cfg.features.htf_trend_filter || self.cfg.trading.cts_screener_enabled {
+            let now_ms = Utc::now().timestamp_millis();
+            let last = self
+                .last_htf_refresh_ms
+                .load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last) > 5 * 60 * 1000 {
+                self.last_htf_refresh_ms.store(now_ms, Ordering::Relaxed);
+                let gateway = Arc::clone(&self.gateway);
+                let cache = Arc::clone(&self.htf_trends);
+                let period = self.cfg.indicators.htf_ema_period.clamp(20, 500);
+                let symbols = next_syms.clone();
+                tokio::spawn(async move {
+                    for sym in symbols {
+                        match gateway.fetch_klines(&sym, "1h", period + 10).await {
+                            Ok(candles) => {
+                                let closes: Vec<f64> = candles
+                                    .iter()
+                                    .filter(|c| c.is_closed && c.close > 0.0)
+                                    .map(|c| c.close)
+                                    .collect();
+                                if closes.len() >= 10 {
+                                    let seed_len = period.min(closes.len());
+                                    let mut ema =
+                                        closes[..seed_len].iter().sum::<f64>() / seed_len as f64;
+                                    let mult = 2.0 / (period as f64 + 1.0);
+                                    for close in &closes[seed_len..] {
+                                        ema = (close - ema) * mult + ema;
+                                    }
+                                    if let Some(last_close) = closes.last() {
+                                        let volumes: Vec<f64> = candles
+                                            .iter()
+                                            .filter(|c| c.is_closed && c.volume > 0.0)
+                                            .map(|c| c.volume)
+                                            .collect();
+                                        let rvol = if volumes.len() >= 6 {
+                                            let baseline_bars =
+                                                &volumes[..volumes.len().saturating_sub(1)];
+                                            let start = baseline_bars.len().saturating_sub(24);
+                                            let window = &baseline_bars[start..];
+                                            let baseline = if window.is_empty() {
+                                                0.0
+                                            } else {
+                                                window.iter().sum::<f64>() / window.len() as f64
+                                            };
+                                            let last_vol = *volumes.last().unwrap_or(&0.0);
+                                            (baseline > 0.0 && last_vol > 0.0)
+                                                .then_some(last_vol / baseline)
+                                        } else {
+                                            None
+                                        };
+                                        let momentum_pct = if closes.len() >= 6 {
+                                            let anchor_idx = closes.len().saturating_sub(25);
+                                            let anchor = closes[anchor_idx];
+                                            (anchor > 0.0)
+                                                .then_some((*last_close - anchor) / anchor * 100.0)
+                                        } else {
+                                            None
+                                        };
+                                        cache.write().await.insert(
+                                            sym,
+                                            HtfTrend {
+                                                close: *last_close,
+                                                ema,
+                                                rvol,
+                                                momentum_pct,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(symbol = %sym, %err, "HTF 1h kline refresh failed");
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                    }
+                });
             }
         }
     }
@@ -2146,6 +2298,9 @@ impl TradingEngine {
                 Some(ws_ev) = mkt_rx.recv() => {
                     let ev = match ws_ev {
                         WsStreamEvent::MiniTickerAll(tickers) => {
+                            if let Some(btc) = tickers.iter().find(|t| t.symbol == "BTCUSDT") {
+                                risk.observe_btc_price(btc.last_price, Utc::now());
+                            }
                             {
                                 let mut sc = self.screener_cache.write().await;
                                 for t in tickers {
@@ -2164,6 +2319,12 @@ impl TradingEngine {
                             let _ = self.screener_tx.send(sc_snap);
                             continue;
                         }
+                        WsStreamEvent::DepthBook { symbol, bids, asks } => {
+                            if let Some(obi) = compute_order_book_imbalance(&bids, &asks) {
+                                self.obi_quotes.write().await.insert(symbol, obi);
+                            }
+                            continue;
+                        }
                         WsStreamEvent::BookTicker { symbol, best_bid, best_ask } => {
                             let mid = (best_bid + best_ask) * 0.5;
                             let spread_bps = if mid > 0.0 && best_ask >= best_bid {
@@ -2178,6 +2339,9 @@ impl TradingEngine {
                     };
 
                     last_prices.insert(ev.symbol.clone(), ev.price);
+                    if ev.symbol == "BTCUSDT" {
+                        risk.observe_btc_price(ev.price, Utc::now());
+                    }
                     let pipe = pipelines
                         .entry(ev.symbol.clone())
                         .or_insert_with(|| IndicatorPipeline::new(&self.cfg.indicators));
@@ -2187,7 +2351,7 @@ impl TradingEngine {
                         && last_closed_bar_ms.get(&ev.symbol).copied() != Some(ev.candle.open_time_ms);
 
                     let mut prev_close_for_tr = prev_closes.get(&ev.symbol).copied().unwrap_or(ev.candle.close);
-                    let ind = if is_newly_closed {
+                    let mut ind = if is_newly_closed {
                         if has_candle_sequence_gap(
                             last_closed_bar_ms.get(&ev.symbol).copied(),
                             ev.candle.open_time_ms,
@@ -2248,6 +2412,13 @@ impl TradingEngine {
                     } else {
                         pipe.snapshot()
                     };
+
+                    // Stamp derived regime context (closed 1h trend + depth-10 OBI) onto the snapshot.
+                    if let Some(htf) = self.htf_trends.read().await.get(&ev.symbol).copied() {
+                        ind.htf_close = Some(htf.close);
+                        ind.htf_ema_macro = Some(htf.ema);
+                    }
+                    ind.obi = self.obi_quotes.read().await.get(&ev.symbol).copied();
 
                     // Evaluate ATR volatility spike alerts once per closed bar (11-bar baseline matching simulator.ts)
                     if is_newly_closed && self.cfg.indicators.volatility_alerts_enabled {

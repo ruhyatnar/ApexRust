@@ -9,6 +9,7 @@ members = [
     "crates/bot-engine",
     "crates/bot-web",
     "crates/bot-desktop",
+    "crates/bot-keygen",
 ]
 
 [workspace.package]
@@ -36,6 +37,12 @@ serde_json = "1.0"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = "1.37"
+
+# Binance WebSocket API session.logon signing (Ed25519) / HMAC
+ed25519-dalek = { version = "2.1", features = ["pkcs8", "pem", "rand_core"] }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
 rusqlite = { version = "0.33.0", features = ["bundled"] }
 
 # Logging & Error Handling

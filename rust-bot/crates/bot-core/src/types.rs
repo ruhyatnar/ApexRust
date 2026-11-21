@@ -53,6 +53,18 @@ pub struct IndicatorSnapshot {
     pub avg_volume_20: Option<f64>,
     #[serde(default)]
     pub volume_ratio: Option<f64>,
+    /// SMA(50) of ATR — regime baseline for the ATR expansion filter.
+    #[serde(default)]
+    pub atr_sma_50: Option<f64>,
+    /// Closed 1h candle close for the higher-timeframe trend gate.
+    #[serde(default)]
+    pub htf_close: Option<f64>,
+    /// EMA(`htf_ema_period`) computed on closed 1h candles.
+    #[serde(default)]
+    pub htf_ema_macro: Option<f64>,
+    /// Order-book imbalance in [-1, 1] from the top depth levels.
+    #[serde(default)]
+    pub obi: Option<f64>,
     #[serde(default)]
     pub warmup_bars_count: usize,
     #[serde(default)]
@@ -163,6 +175,13 @@ pub struct RiskStatus {
     pub win_streak: u32,
     pub lose_streak: u32,
     pub quarantined_pairs: Vec<String>,
+    /// BTC move (%) across the guard window, absent until two samples exist.
+    #[serde(default)]
+    pub btc_change_pct_window: Option<f64>,
+    #[serde(default)]
+    pub btc_window_minutes: u64,
+    #[serde(default)]
+    pub btc_guard_blocking: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -234,6 +253,13 @@ pub struct MarketTicker24h {
     #[serde(default)]
     pub source_tag: Option<PairSourceTag>,
     pub updated_at_ms: i64,
+    /// CTS screener metrics (1h RVOL / 1h momentum / blended score).
+    #[serde(default)]
+    pub rvol_1h: Option<f64>,
+    #[serde(default)]
+    pub momentum_1h_pct: Option<f64>,
+    #[serde(default)]
+    pub cts_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,7 +5,7 @@
 
 ## 1. Mandatory WebApp ↔ Desktop Parity
 - Every change, bugfix, config field, feature toggle, strategy/risk rule, or execution capability MUST be implemented in **both** the WebApp (`src/`, `server.ts`) and the Rust Desktop/Daemon workspace (`rust-bot/`) in the same change set, with matching unit tests.
-- Keep `BotConfig`, all 19 `FeatureToggles`, `UtcSessionWindow`, `StrategyProfile`, `PositionSizingMode` (including Kelly negative-expectancy block), `VolatilitySpikeAlert`, and `RiskManager` behavior (including `reset_circuit_breaker` clearing `quarantined_pairs`) synchronized across:
+- Keep `BotConfig`, all 21 `FeatureToggles`, `UtcSessionWindow`, `StrategyProfile`, `PositionSizingMode` (including Kelly negative-expectancy block), `VolatilitySpikeAlert`, and `RiskManager` behavior (including `reset_circuit_breaker` clearing `quarantined_pairs` and the BTC crash guard) synchronized across:
   - TypeScript: `src/engine/types.ts`, `simulator.ts`, `configStorage.ts`, `strategy.ts`, `risk.ts`
   - Express Proxy: `server.ts` (`buildSyncedTomlFromPayload`, `/api/live/*`, `/api/git/*`)
   - Rust: `rust-bot/crates/bot-core`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-exchange`, `bot-engine`, `bot-web`, and `rust-bot/config/bot.example.toml`

@@ -314,6 +314,40 @@ impl SessionVwap {
     }
 }
 
+/// Fixed-window arithmetic mean used for the ATR regime baseline.
+#[derive(Debug, Clone, Default)]
+pub struct RollingMean {
+    window: std::collections::VecDeque<f64>,
+    period: usize,
+    sum: f64,
+}
+
+impl RollingMean {
+    pub fn new(period: usize) -> Self {
+        Self {
+            window: std::collections::VecDeque::with_capacity(period.max(1)),
+            period: period.max(1),
+            sum: 0.0,
+        }
+    }
+
+    pub fn next(&mut self, value: f64) -> Option<f64> {
+        let clean = if value.is_finite() { value } else { 0.0 };
+        self.window.push_back(clean);
+        self.sum += clean;
+        if self.window.len() > self.period {
+            if let Some(old) = self.window.pop_front() {
+                self.sum -= old;
+            }
+        }
+        if self.window.is_empty() {
+            None
+        } else {
+            Some(self.sum / self.window.len() as f64)
+        }
+    }
+}
+
 /// Rolling 20-bar volume SMA for volume expansion confirmation filters.
 #[derive(Debug, Clone)]
 pub struct RollingVolumeSma {
@@ -371,6 +405,7 @@ pub struct IndicatorPipeline {
     adx: Adx,
     vwap: SessionVwap,
     volume_sma_20: RollingVolumeSma,
+    atr_sma_50: RollingMean,
     warmup_bars_count: usize,
     latest: IndicatorSnapshot,
 }
@@ -387,6 +422,7 @@ impl IndicatorPipeline {
             adx: Adx::new(cfg.adx_period),
             vwap: SessionVwap::default(),
             volume_sma_20: RollingVolumeSma::new(20),
+            atr_sma_50: RollingMean::new(50),
             warmup_bars_count: 0,
             latest: IndicatorSnapshot::default(),
         }
@@ -408,6 +444,7 @@ impl IndicatorPipeline {
         let (adx, prev_adx, plus_di, minus_di) = self.adx.next(candle);
         let vwap = self.vwap.next(candle);
         let (avg_volume_20, volume_ratio) = self.volume_sma_20.next(candle.volume);
+        let atr_sma_50 = atr.and_then(|a| self.atr_sma_50.next(a));
         self.warmup_bars_count += 1;
 
         self.latest = IndicatorSnapshot {
@@ -427,6 +464,10 @@ impl IndicatorPipeline {
             vwap,
             avg_volume_20,
             volume_ratio,
+            atr_sma_50,
+            htf_close: None,
+            htf_ema_macro: None,
+            obi: None,
             warmup_bars_count: self.warmup_bars_count,
             has_bar_gap,
         };
