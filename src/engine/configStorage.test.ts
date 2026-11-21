@@ -143,6 +143,7 @@ test('savePersistedWorkspaceUiState and loadPersistedWorkspaceUiState persist ta
       selectedSymbol: 'SOLUSDT',
       environment: 'Production',
       paperFeedSource: 'BinanceLive',
+      paperRunning: false,
     },
     storage
   );
@@ -155,4 +156,23 @@ test('savePersistedWorkspaceUiState and loadPersistedWorkspaceUiState persist ta
   assert.equal(restored.selectedSymbol, 'SOLUSDT');
   assert.equal(restored.environment, 'Production');
   assert.equal(restored.paperFeedSource, 'BinanceLive');
+  assert.equal(restored.paperRunning, false);
+});
+
+test('loadPersistedWorkspaceUiState defaults paperRunning to true when the field is absent', () => {
+  const storage = createMockStorage();
+  storage.setItem(
+    UI_STATE_STORAGE_KEY,
+    JSON.stringify({
+      accountMode: 'Paper',
+      section: 'trade',
+      botSubTab: 'strategy',
+      selectedSymbol: 'BTCUSDT',
+      environment: 'Testnet',
+      paperFeedSource: 'Simulated',
+    })
+  );
+
+  assert.equal(loadPersistedWorkspaceUiState(storage).paperRunning, true);
+  assert.equal(loadPersistedWorkspaceUiState(createMockStorage()).paperRunning, true);
 });

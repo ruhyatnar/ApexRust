@@ -138,6 +138,11 @@ export default function App() {
     if (initialUi.paperFeedSource === 'BinanceLive') {
       paperRuntimeRef.current.snapshot.transport.feedSource = 'BinanceLive';
     }
+    if (initialUi.paperRunning === false) {
+      // Restore the operator's Paper pause silently (no "paused by operator" log on boot).
+      // Live deliberately always boots paused: browser state is not restored after a reload.
+      paperRuntimeRef.current.snapshot.running = false;
+    }
   }
   if (!liveRuntimeRef.current) {
     liveRuntimeRef.current = new SimulationRuntime(initialConfig, Date.now(), {
@@ -157,6 +162,8 @@ export default function App() {
     structuredClone(liveRuntimeRef.current!.snapshot)
   );
   const [liveStatus, setLiveStatus] = useState<LiveCredentialStatus>(INITIAL_LIVE_STATUS);
+  // Distinguishes "never started in this session" from "paused by the operator" in the header CTA
+  const [liveStartedThisSession, setLiveStartedThisSession] = useState(false);
 
   const [section, setSection] = useState<ActiveSection>(initialUi.section);
   const [botSubTab, setBotSubTab] = useState<BotSubTab>(initialUi.botSubTab);
@@ -1776,6 +1783,7 @@ export default function App() {
       selectedSymbol,
       environment: snapshot.transport.environment,
       paperFeedSource: paperSnapshot.transport.feedSource,
+      paperRunning: paperSnapshot.running,
     });
   }, [
     accountMode,
@@ -1784,6 +1792,7 @@ export default function App() {
     selectedSymbol,
     snapshot.transport.environment,
     paperSnapshot.transport.feedSource,
+    paperSnapshot.running,
   ]);
 
   // Mirror newly generated Paper and Live execution fills into persistent backend /api/orders/history
@@ -2114,6 +2123,9 @@ export default function App() {
       setSection('bot');
       setBotSubTab('credentials');
       return;
+    }
+    if (accountMode === 'Live' && !snapshot.running) {
+      setLiveStartedThisSession(true);
     }
     rt.setRunning(!snapshot.running);
     syncSnapshots();
@@ -3215,7 +3227,9 @@ export default function App() {
                     ? 'Resume VPS Bot'
                     : accountMode === 'Paper'
                       ? 'Resume Paper Sim'
-                      : 'Resume Local Bot'}
+                      : liveStartedThisSession
+                        ? 'Resume Local Bot'
+                        : 'Start Local Bot'}
                 </span>
               </>
             )}

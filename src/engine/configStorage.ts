@@ -19,6 +19,8 @@ export interface PersistedWorkspaceUiState {
   selectedSymbol: string;
   environment?: 'Testnet' | 'Production';
   paperFeedSource?: 'Simulated' | 'BinanceLive';
+  /** Last Paper sandbox run state; Live is intentionally never auto-resumed on reload. */
+  paperRunning?: boolean;
 }
 
 function isObjectRecord(val: unknown): val is Record<string, unknown> {
@@ -238,6 +240,7 @@ export function loadPersistedWorkspaceUiState(
     selectedSymbol: 'BTCUSDT',
     environment: 'Testnet',
     paperFeedSource: 'Simulated',
+    paperRunning: true,
   };
 
   const targetStorage =
@@ -277,6 +280,7 @@ export function loadPersistedWorkspaceUiState(
           : 'BTCUSDT',
       environment: parsed.environment === 'Production' ? 'Production' : 'Testnet',
       paperFeedSource: parsed.paperFeedSource === 'BinanceLive' ? 'BinanceLive' : 'Simulated',
+      paperRunning: parsed.paperRunning !== false,
     };
   } catch {
     return fallback;
