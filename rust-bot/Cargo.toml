@@ -10,6 +10,7 @@ members = [
     "crates/bot-web",
     "crates/bot-desktop",
     "crates/bot-keygen",
+    "crates/bot-cli",
 ]
 
 [workspace.package]

@@ -93,6 +93,8 @@ Commands:
   token <action>        Manage Access Token (APEXRUST_PROXY_TOKEN): status | show | generate | rotate | clear
   uninstall             Stop processes and remove OS services / runtime state (--purge deletes build/config)
   run <component>       Internal foreground supervisor used by detached runner and OS services
+  bot <command>         Run the Rust apexrust CLI (run, status, keygen, ws-api, config, order, ...)
+                        Examples: ./apexrust bot status | ./apexrust bot keygen --label main | ./apexrust bot --help
 
 Targets: web | bot | both (default uses saved state from setup)
 
@@ -744,14 +746,19 @@ async function cmdSetup(flags) {
     }
 
     if (needRust) {
-      info('Compiling Rust trading engine in release mode (cargo build --release --bin bot-desktop)...');
+      info('Compiling Rust daemon and CLI in release mode (cargo build --release --bin bot-desktop --bin apexrust)...');
       if (botRunning) {
         info('Stopping running bot daemon before rebuilding binary...');
         await stopComponent('bot');
       }
-      const cargoRes = runStreaming('cargo', ['build', '--release', '--bin', 'bot-desktop'], { cwd: PATHS.rustDir });
+      const cargoRes = runStreaming(
+        'cargo',
+        ['build', '--release', '--bin', 'bot-desktop', '--bin', 'apexrust'],
+        { cwd: PATHS.rustDir }
+      );
       if (!cargoRes.ok) throw new Error('Cargo release build failed.');
       ok(`Rust binary built at ${path.relative(REPO_DIR, PATHS.botBinary)}`);
+      ok(`Rust CLI built at ${path.relative(REPO_DIR, path.join(PATHS.rustDir, 'target', 'release', IS_WIN ? 'apexrust.exe' : 'apexrust'))}`);
     }
   } else {
     warn('Skipping build steps (--no-build).');
@@ -1705,8 +1712,12 @@ async function cmdUpdate(flags) {
   }
 
   if (needRust) {
-    info('Rebuilding Rust release binary...');
-    const cargoRes = runStreaming('cargo', ['build', '--release', '--bin', 'bot-desktop'], { cwd: PATHS.rustDir });
+    info('Rebuilding Rust release binaries (daemon + CLI)...');
+    const cargoRes = runStreaming(
+      'cargo',
+      ['build', '--release', '--bin', 'bot-desktop', '--bin', 'apexrust'],
+      { cwd: PATHS.rustDir }
+    );
     if (!cargoRes.ok) throw new Error('Cargo build failed.');
   }
 
@@ -1988,10 +1999,65 @@ async function cmdUninstall(flags) {
 }
 
 // ---------------------------------------------------------------------------
+// Rust CLI delegation (`./apexrust bot <command> ...`)
+// ---------------------------------------------------------------------------
+function rustCliCandidates() {
+  const names = IS_WIN ? ['apexrust.exe'] : ['apexrust'];
+  const candidates = [];
+  const override = process.env.APEXRUST_CLI;
+  if (override && override.trim()) candidates.push(override.trim());
+  for (const profile of ['release', 'debug']) {
+    for (const name of names) {
+      candidates.push(path.join(PATHS.rustDir, 'target', profile, name));
+    }
+  }
+  return candidates;
+}
+
+function resolveRustCli() {
+  for (const candidate of rustCliCandidates()) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // Ignore unreadable candidates and keep looking.
+    }
+  }
+  return null;
+}
+
+async function cmdBot(rustArgs) {
+  const binary = resolveRustCli();
+  if (!binary) {
+    fail('Rust CLI `apexrust` belum di-build.');
+    info('Build sekali saja: (cd rust-bot && cargo build --release --bin apexrust)');
+    info('Atau jalankan `./apexrust setup` yang kini juga membangun binary CLI.');
+    process.exitCode = 1;
+    return;
+  }
+  const child = spawn(binary, rustArgs, { stdio: 'inherit' });
+  await new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.on('exit', (code, signal) => {
+      if (signal) {
+        process.exitCode = 1;
+      } else {
+        process.exitCode = code ?? 0;
+      }
+      resolve();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
 async function main() {
-  const { command, positionals, flags } = parseCliArgs(process.argv.slice(2));
+  const rawArgs = process.argv.slice(2);
+  if (rawArgs[0] === 'bot') {
+    await cmdBot(rawArgs.slice(1));
+    return;
+  }
+  const { command, positionals, flags } = parseCliArgs(rawArgs);
   if (flags.yes || flags['non-interactive']) {
     setNonInteractive(true);
   }

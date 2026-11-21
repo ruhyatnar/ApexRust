@@ -102,7 +102,31 @@ cargo test --workspace
 cargo run --release -p bot-desktop -- --config config/bot.toml --web-port 8080
 ```
 
-### 4. Auto-Start Service, Access Token & Backup via Git
+### 4. Unified `apexrust` CLI
+
+The workspace ships one friendly binary for every day-to-day operation, so you rarely need `cargo run` flags or hand-written `curl` calls:
+
+```bash
+cargo build --release --bin apexrust
+./target/release/apexrust --help
+
+./target/release/apexrust doctor                     # config, credentials, REST, daemon, binaries
+./target/release/apexrust config validate            # parse + invariants + warnings
+./target/release/apexrust keygen --label main        # Ed25519 pair with 0600 permissions
+./target/release/apexrust ws-api logon               # real session.logon check
+./target/release/apexrust indicators BTCUSDT         # indicator pipeline + gate checks, no daemon
+./target/release/apexrust signal BTCUSDT             # strategy dry-run, never sends orders
+./target/release/apexrust screen --category top_gainers
+./target/release/apexrust status | snapshot | watch  # reads the running daemon
+./target/release/apexrust order manual --symbol BTCUSDT --notional 15 --yes
+./target/release/apexrust risk pause | resume | trip | reset
+./target/release/apexrust run --config config/bot.toml
+```
+
+Global flags: `--config <path>`, `--url <daemon>`, `--token <token>`, `--json`, `--no-color`.
+From the repository root the Node wrapper exposes the same surface as `./apexrust bot <command>`.
+
+### 5. Auto-Start Service, Access Token & Backup via Git
 
 From the repository root, use the ApexRust CLI to manage OS auto-start services (`systemd --user` on Linux, `launchd` on macOS, Scheduled Tasks on Windows) and API access tokens (`APEXRUST_PROXY_TOKEN` / `APEXRUST_WEB_TOKEN`):
 

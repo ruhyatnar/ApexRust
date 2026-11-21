@@ -140,6 +140,32 @@ cargo run --release -p bot-desktop -- --config config/bot.toml --web-port 8080
 
 Subcommand `bot-desktop` mencakup `connect` (profil VPS remote), `snapshot`, `watch`, `orders`, `trending`, `manual-order`, `trip-cb`/`reset-cb`, `flatten-all`, dan utilitas operasional lain; jalankan `cargo run -p bot-desktop -- --help`.
 
+### CLI Rust terpadu (`apexrust`)
+
+Binary `apexrust` membungkus semua operasi Rust dengan output ramah (tabel, warna, hint error), sehingga tidak perlu mengingat perintah `cargo run` yang panjang:
+
+```bash
+# build sekali
+(cd rust-bot && cargo build --release --bin apexrust)
+
+./rust-bot/target/release/apexrust --help
+./apexrust bot --help          # pintu yang sama lewat wrapper Node
+```
+
+| Perintah | Kegunaan |
+| :--- | :--- |
+| `apexrust run` | Menjalankan daemon engine (mendelegasikan ke `bot-desktop`). |
+| `apexrust status` / `snapshot` / `watch` | Health, tabel pair, dashboard live dari daemon. |
+| `apexrust keygen` / `key fingerprint` / `key inspect` | Generate key Ed25519, cek fingerprint, dan pastikan pasangan key tidak tertukar (penyebab `-2015`). |
+| `apexrust ws-api ping` / `ws-api logon` | Uji endpoint dan kredensial WS API sebelum bot dijalankan. |
+| `apexrust config validate` / `show` / `sync` | Validasi TOML, ringkasan tanpa rahasia, dan export `bot.synced.toml` tersanitasi. |
+| `apexrust screen` / `indicators` / `signal` | Screener, snapshot indikator, dan dry-run sinyal tanpa daemon. |
+| `apexrust order manual` / `order flatten` | Order manual lewat daemon (dengan konfirmasi dan batas notional). |
+| `apexrust risk pause\|resume\|trip\|reset` | Kontrol entry otomatis dan circuit breaker. |
+| `apexrust backup` / `doctor` | Backup Git tersanitasi dan pemeriksaan config/kredensial/konektivitas. |
+
+Semua perintah menerima `--json`, `--no-color`, `--config <path>`, `--url <daemon>` dan `--token <token>`.
+
 ---
 
 ## Struktur Proyek
