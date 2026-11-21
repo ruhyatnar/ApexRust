@@ -2285,7 +2285,7 @@ impl TradingEngine {
                                 if self.is_live_armed() {
                                     // Trigger the pending-order reconciler now rather than
                                     // waiting up to one polling interval for the fill.
-                                    reconcile_tick.reset();
+                                    reconcile_tick.reset_immediately();
                                 }
                             }
                         }

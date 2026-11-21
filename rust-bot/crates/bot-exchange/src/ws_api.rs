@@ -113,11 +113,14 @@ impl WsApiCredentials {
                 base64::engine::general_purpose::STANDARD.encode(key.sign(payload.as_bytes()).to_bytes())
             }
             WsApiSigner::Hmac(secret) => {
-                use base64::Engine as _;
                 let mut mac = HmacSha256::new_from_slice(secret)
                     .expect("HMAC accepts keys of any length");
                 mac.update(payload.as_bytes());
-                base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+                mac.finalize()
+                    .into_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect()
             }
         }
     }
@@ -210,7 +213,9 @@ pub fn build_order_place_params(
             return Err(BotError::RestApi("Invalid WS API limit price".into()));
         }
         params["price"] = json!(format_decimal(px));
-        params["timeInForce"] = json!(time_in_force.unwrap_or("GTC").to_uppercase());
+        if let Some(tif) = time_in_force {
+            params["timeInForce"] = json!(tif.to_uppercase());
+        }
     }
     if reduce_only {
         params["reduceOnly"] = json!(true);
@@ -258,19 +263,32 @@ struct Session {
 /// Single-flight authenticated WebSocket API session.
 pub struct WsApiClient {
     url: String,
+    venue: ExchangeVenue,
     creds: WsApiCredentials,
     recv_window_ms: u64,
     session: Mutex<Option<Session>>,
 }
 
 impl WsApiClient {
-    pub fn new(url: impl Into<String>, creds: WsApiCredentials, recv_window_ms: u64) -> Self {
+    pub fn new(
+        url: impl Into<String>,
+        venue: ExchangeVenue,
+        creds: WsApiCredentials,
+        recv_window_ms: u64,
+    ) -> Self {
         Self {
             url: url.into(),
+            venue,
             creds,
             recv_window_ms: recv_window_ms.clamp(1_000, 60_000),
             session: Mutex::new(None),
         }
+    }
+
+    /// `session.logon` is only supported on Spot WebSocket API with Ed25519 keys.
+    /// USD-M Futures WS API (`FUTURES_WS.yaml`) requires per-request signing.
+    fn use_session_logon(&self) -> bool {
+        self.venue == ExchangeVenue::Spot && self.creds.supports_session_logon()
     }
 
     pub fn from_config(cfg: &ExchangeConfig) -> Result<Option<Self>> {
@@ -290,7 +308,7 @@ impl WsApiClient {
             .as_ref()
             .map(|c| c.recv_window_ms)
             .unwrap_or(5_000);
-        Ok(Some(Self::new(url, creds, recv_window)))
+        Ok(Some(Self::new(url, cfg.venue, creds, recv_window)))
     }
 
     async fn connect(&self) -> Result<Session> {
@@ -300,7 +318,7 @@ impl WsApiClient {
             .map_err(|e| BotError::WebSocket(format!("WS API connect failed: {e}")))?;
         let mut session = Session { ws, next_id: 1 };
 
-        if self.creds.supports_session_logon() {
+        if self.use_session_logon() {
             let params = build_logon_params(&self.creds, Utc::now().timestamp_millis(), Some(self.recv_window_ms));
             let response = send_rpc(&mut session, "session.logon", params).await?;
             if response.get("status").and_then(Value::as_i64) != Some(200) {
@@ -314,16 +332,18 @@ impl WsApiClient {
         Ok(session)
     }
 
-    /// Adds `timestamp` + `signature` for HMAC keys (which cannot use `session.logon`).
+    /// Ensures `timestamp` is present, and adds `apiKey`, `recvWindow`, and `signature`
+    /// when not authenticated via Spot `session.logon`.
     fn sign_request_params(&self, params: Value) -> Value {
-        if self.creds.supports_session_logon() {
-            return params;
-        }
         let mut object = params.as_object().cloned().unwrap_or_default();
         object.insert(
             "timestamp".into(),
             json!(Utc::now().timestamp_millis()),
         );
+        if self.use_session_logon() {
+            return Value::Object(object);
+        }
+        object.insert("apiKey".into(), json!(self.creds.api_key));
         object.insert("recvWindow".into(), json!(self.recv_window_ms));
         let mut keys: Vec<&String> = object.keys().collect();
         keys.sort();
@@ -347,13 +367,13 @@ impl WsApiClient {
 
     /// Sends one authenticated JSON-RPC request, reconnecting once on failure.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let params = self.sign_request_params(params);
+        let signed_params = self.sign_request_params(params.clone());
         let mut guard = self.session.lock().await;
         if guard.is_none() {
             *guard = Some(self.connect().await?);
         }
         let session = guard.as_mut().expect("session initialised above");
-        let result = send_rpc(session, method, params.clone()).await;
+        let result = send_rpc(session, method, signed_params).await;
         match result {
             Ok(value) => {
                 if value.get("status").and_then(Value::as_i64) == Some(200) {
@@ -369,7 +389,8 @@ impl WsApiClient {
                 warn!(%first_err, method, "WS API request failed; reconnecting once");
                 *guard = None;
                 let mut fresh = self.connect().await?;
-                let retry = send_rpc(&mut fresh, method, params).await?;
+                let retry_params = self.sign_request_params(params);
+                let retry = send_rpc(&mut fresh, method, retry_params).await?;
                 if retry.get("status").and_then(Value::as_i64) == Some(200) {
                     *guard = Some(fresh);
                     Ok(retry.get("result").cloned().unwrap_or(Value::Null))
@@ -493,9 +514,12 @@ mod tests {
         };
         let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
         mac.update(b"apiKey=k&timestamp=1");
-        use base64::Engine as _;
-        let expected =
-            base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let expected: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(creds.sign("apiKey=k&timestamp=1"), expected);
         assert!(!creds.supports_session_logon());
     }
@@ -531,11 +555,45 @@ mod tests {
             api_key: "k".into(),
             signer: WsApiSigner::Hmac(b"secret".to_vec()),
         };
-        let client = WsApiClient::new("wss://example.invalid", creds.clone(), 5_000);
+        let client = WsApiClient::new(
+            "wss://example.invalid",
+            ExchangeVenue::Spot,
+            creds.clone(),
+            5_000,
+        );
         let signed = client.sign_request_params(json!({"symbol": "BTCUSDT", "quantity": "0.01"}));
+        assert_eq!(signed["apiKey"], "k");
         assert!(signed.get("signature").is_some());
         assert_eq!(signed["recvWindow"], 5_000);
         assert!(signed["timestamp"].as_i64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn session_logon_is_spot_ed25519_only_and_retains_timestamp() {
+        let creds = ed_cfg();
+        let spot_client = WsApiClient::new(
+            "wss://example.invalid",
+            ExchangeVenue::Spot,
+            creds.clone(),
+            5_000,
+        );
+        assert!(spot_client.use_session_logon());
+        let spot_params = spot_client.sign_request_params(json!({"symbol": "BTCUSDT"}));
+        assert!(spot_params["timestamp"].as_i64().unwrap_or(0) > 0);
+        assert!(spot_params.get("apiKey").is_none());
+        assert!(spot_params.get("signature").is_none());
+
+        let futures_client = WsApiClient::new(
+            "wss://example.invalid",
+            ExchangeVenue::Futures,
+            creds,
+            5_000,
+        );
+        assert!(!futures_client.use_session_logon());
+        let futures_params = futures_client.sign_request_params(json!({"symbol": "BTCUSDT"}));
+        assert_eq!(futures_params["apiKey"], "test-api-key-123456");
+        assert!(futures_params.get("signature").is_some());
+        assert!(futures_params["timestamp"].as_i64().unwrap_or(0) > 0);
     }
 
     #[test]

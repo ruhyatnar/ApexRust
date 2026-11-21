@@ -176,10 +176,28 @@ impl FailoverGateway {
     }
 
     pub async fn execute_live_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {
-        // WebSocket API entry path: only bare entries without bracket legs, so a
-        // protective SL/TP is never silently dropped. Any failure falls back to REST.
+        let ref_px = if let Some(px) = req.limit_price.filter(|&p| p.is_finite() && p > 0.0) {
+            px
+        } else if let Some(q) = req
+            .quote_order_qty
+            .filter(|&q| q.is_finite() && q > 0.0 && req.quantity > 0.0)
+        {
+            q / req.quantity
+        } else {
+            self.fetch_ticker_price(&req.symbol).await.unwrap_or(0.0)
+        };
+        crate::validate_live_safety(&self.cfg, self.cfg.venue, req, ref_px)?;
+
+        // WebSocket API entry path: only bare entries without bracket legs or
+        // preflight test-order requirement, so protective SL/TP or preflight is never bypassed.
+        let require_preflight = self
+            .cfg
+            .credentials
+            .as_ref()
+            .is_some_and(|c| c.require_preflight_test_order);
         if let Some(ws_api) = self.ws_api.as_ref() {
-            if !req.reduce_only
+            if !require_preflight
+                && !req.reduce_only
                 && req.take_profit_price.is_none()
                 && req.stop_loss_price.is_none()
             {

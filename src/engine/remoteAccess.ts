@@ -256,7 +256,7 @@ export class AuthFailureLimiter {
   }
 }
 
-export function safeTokenMatch(provided: string, expected: string): boolean {
+function safeTokenMatch(provided: string, expected: string): boolean {
   if (!provided || !expected) return false;
   const a = Buffer.from(provided, 'utf8');
   const b = Buffer.from(expected, 'utf8');
@@ -264,10 +264,10 @@ export function safeTokenMatch(provided: string, expected: string): boolean {
   return crypto.timingSafeEqual(a, b);
 }
 
-export const TOKEN_LOCKOUT_ERROR =
+const TOKEN_LOCKOUT_ERROR =
   'Too many failed token attempts from this IP. Try again in 5 minutes.';
 
-export const TOKEN_INVALID_ERROR =
+const TOKEN_INVALID_ERROR =
   'Unauthorized: missing or invalid Access Token (APEXRUST_PROXY_TOKEN).';
 
 export type TokenAuthDecision =

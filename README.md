@@ -1,98 +1,69 @@
 # ApexRust Quant
 
-Platform trading kuantitatif Binance dengan dua runtime yang dijaga **parity** satu sama lain:
+Platform trading kuantitatif **Binance (Spot & USD-M Futures)** yang menggabungkan **Web Command Center (PWA)** dan **Rust Engine 24/7** dengan **parity penuh** di kedua sisi: setiap konfigurasi, 21 feature toggle, aturan manajemen risiko, indikator, dan jalur eksekusi identik antara TypeScript dan Rust.
 
-1. **WebApp / Desktop PWA** — React 19 + TypeScript + Tailwind v4, mesin simulasi `SimulationRuntime`, dan proxy Express (`server.ts`) untuk signing order, ledger SQLite, backup Git, serta relay WebSocket.
-2. **Rust Workspace** (`rust-bot/`) — 9 crate Tokio di atas `binance-sdk 78.3.0` untuk Spot & USD-M Futures, dapat dijalankan sebagai daemon 24/7 di VPS atau CLI desktop.
-
-Setiap field konfigurasi, toggle fitur, aturan risiko, dan jalur eksekusi diimplementasikan di kedua runtime dengan unit test masing-masing (lihat `AGENTS.md`).
-
-> **Peringatan:** perangkat lunak ini dapat mengirim order nyata. Gunakan Testnet, `paper_trading = true`, dan `armed_for_live_orders = false` sampai strategi tervalidasi. Tidak ada jaminan profit; kerugian sepenuhnya tanggung jawab pengguna.
+> **Peringatan Risiko:** Perangkat lunak ini dapat mengirim order nyata ke bursa. Selalu mulai dengan `environment = "testnet"`, `paper_trading = true`, dan `armed_for_live_orders = false` hingga strategi dan konfigurasi Anda tervalidasi. Tidak ada jaminan profit; seluruh risiko finansial menjadi tanggung jawab pengguna.
 
 ---
 
 ## Daftar Isi
 
-1. [Fitur Utama](#fitur-utama)
+1. [Gambaran Umum & Cara Kerja](#gambaran-umum--cara-kerja)
 2. [Instalasi Cepat](#instalasi-cepat)
-3. [Menjalankan](#menjalankan)
-4. [Struktur Proyek](#struktur-proyek)
-5. [Kredensial, Ed25519 & WebSocket API](#kredensial-ed25519--websocket-api)
-6. [Konfigurasi (`bot.toml`)](#konfigurasi-bottoml)
-7. [Gate Entry & Screener](#gate-entry--screener)
-8. [Manajemen Risiko & Exit](#manajemen-risiko--exit)
-9. [Arsitektur Runtime](#arsitektur-runtime)
-10. [Environment Variables](#environment-variables)
+3. [Menjalankan & Mengelola Layanan](#menjalankan--mengelola-layanan)
+4. [Mengenal Web Command Center](#mengenal-web-command-center)
+5. [Kredensial Binance, Ed25519 & WebSocket API](#kredensial-binance-ed25519--websocket-api)
+6. [Strategi, Screener & 21 Feature Toggles](#strategi-screener--21-feature-toggles)
+7. [Manajemen Risiko & Exit Lifecycle](#manajemen-risiko--exit-lifecycle)
+8. [Konfigurasi (`bot.toml` & `.env`)](#konfigurasi-bottoml--env)
+9. [Mode VPS 24/7 & Remote Access](#mode-vps-247--remote-access)
+10. [Arsitektur & Struktur Proyek](#arsitektur--struktur-proyek)
 11. [Verifikasi & Pengujian](#verifikasi--pengujian)
-12. [Dokumentasi Lain](#dokumentasi-lain)
+12. [Troubleshooting (Mengatasi Masalah)](#troubleshooting-mengatasi-masalah)
+13. [Dokumentasi Tambahan](#dokumentasi-tambahan)
 
 ---
 
-## Fitur Utama
+## Gambaran Umum & Cara Kerja
 
-**Screening & pemilihan pair**
+ApexRust Quant memiliki dua runtime yang saling melengkapi:
 
-- `static`, `hybrid`, dan `dynamic` watchlist dengan hysteresis ranking + dwell time untuk mencegah churn.
-- Kategori trending: `hot_volume`, `top_gainers`, `top_losers`, `volatility_leaders`, dan `cts_momentum`.
-- **CTS score** = RVOL 1 jam + momentum 1 jam + volume, masing-masing dinormalisasi ke `[0,1]` agar pair bervolume besar tidak otomatis menang. Metrik dihitung dari kandil 1 jam dan di-refresh tiap 5 menit di kedua runtime, dengan konkurensi fetch dibatasi.
-- Filter minat: quote volume minimum, RVOL minimum (`cts_min_rvol`), spread maksimum.
-
-**Gate entry (semua opsional dan dapat dimatikan)**
-
-| Gate | Field | Default |
+| Komponen | Teknologi | Kegunaan Utama |
 | :--- | :--- | :--- |
-| Tren EMA (fast/mid/slow/macro) | `ema_trend_filter` + `require_macro_ema_in_scalping` | aktif |
-| Momentum RSI pullback | `rsi_momentum_filter` | aktif |
-| Kekuatan ADX / DI spread / rising ADX | `adx_strength_filter` | aktif |
-| Bias VWAP | `vwap_bias_filter` | aktif |
-| Konfirmasi volume | `volume_confirmation_filter` | nonaktif |
-| **Tren HTF (EMA 1 jam)** | `htf_trend_filter`, `htf_ema_period` | nonaktif |
-| **Order Book Imbalance** | `obi_entry_filter`, `obi_levels`, `obi_min_imbalance` | nonaktif |
-| **Ekspansi ATR** | `atr_expansion_filter_enabled`, `atr_expansion_min_ratio` | nonaktif |
-| Donchian breakout | `donchian_lookback` (default **20**) | dipakai profil `ema_breakout` |
-| Sesi UTC | `session_window_filter` + `[[automation.session_windows]]` | nonaktif |
+| **Web Command Center + Proxy** | React 19, TypeScript, Tailwind v4, Express (`server.ts`, port `3000`) | Dashboard visual, grafik candlestick, simulasi Paper/Live di browser, signing API server-side, ledger SQLite, backup Git, serta gateway ke VPS. |
+| **Rust Engine (`rust-bot/`)** | 10 crate Rust + Tokio + Axum (`bot-web` port `8080`) di atas `binance-sdk 78.3.0` | Mesin trading native berkinerja tinggi untuk berjalan 24/7 di VPS/desktop (`bot-desktop`), lengkap dengan CLI terpadu (`apexrust`). |
 
-**Eksekusi**
-
-- Order MARKET / LIMIT / LIMIT_MAKER, TP/SL bracket, dan OCO Spot sesuai aturan Binance.
-- USD-M Futures memakai `newOrderRespType=RESULT`; TP/SL kondisional dirutekan ke `POST /fapi/v1/algoOrder` dan direkonsiliasi lewat `GET /fapi/v1/openAlgoOrders`.
-- Exit `reduceOnly` melewati `marginType`/`leverage` agar error `-4048` tidak memblokir proteksi.
-- Rekonsiliasi order menggantung memverifikasi status exchange sebelum menghapus order lokal, dan mempromosikan `FILLED` menjadi posisi.
-- Failover WS → REST dengan watchdog heartbeat, backoff reconnect, dan batas kegagalan REST.
-- **WebSocket API** (`session.logon`) untuk entry tanpa bracket, dengan fallback REST otomatis.
-
-**Manajemen posisi**
-
-- Exit plan ATR: SL, TP1 (partial), TP2, break-even, trailing stop monoton.
-- Break-even dan trailing dievaluasi **sebelum** partial close TP1 sehingga runner tetap terlindungi.
-- Dynamic cancel pending order (runaway ATR, exhaustion, reversal), opsi flip posisi.
-- Exit berjalan 24/7; filter sesi hanya membatasi entry otomatis baru.
-
-**Risiko**
-
-- Circuit breaker harian: drawdown harian/pair, target profit harian, win/lose streak + cooldown, karantina pair.
-- **BTC crash guard**: memblokir entry baru saat BTC turun melewati ambang dalam jendela waktu tertentu. Feed basi (> `btc_crash_max_staleness_sec`) = fail-open; exit tidak pernah diblokir.
-- **Cap leverage**: `max_leverage` (default **3**) di-clamp pada config, TOML tersinkron, dan setiap jalur order.
-- Position sizing: fixed USDT, fixed risk %, dan Kelly (quarter/half/full) dengan blok expectancy negatif.
-- Volatility spike alert (ATR) + notifikasi Web Notification API.
+### Tiga Skenario Pemakaian
+1. **Lokal (Komputer Sendiri):** Jalankan WebApp + Rust daemon di komputer yang sama untuk riset, paper trading, atau eksekusi lokal.
+2. **VPS 24/7 + Client Desktop/HP:** Jalankan Rust daemon + Express gateway di VPS (`APEXRUST_ENGINE_AUTHORITY=daemon`), lalu akses dashboard PWA dari laptop/HP (termasuk lewat Cloudflare One / Zero Trust).
+3. **Browser-Only Paper Sandbox:** Jalankan WebApp saja tanpa kredensial Binance untuk menguji strategi secara virtual di memori/browser.
 
 ---
 
 ## Instalasi Cepat
 
-Prasyarat: Node.js `^20.19.0 || >=22.12.0`, Rust `>= 1.85.0`, header build C/OpenSSL.
+### Prasyarat
+- **Node.js:** `^20.19.0` atau `>= 22.12.0`
+- **Rust:** `>= 1.85.0` (diperlukan jika membangun engine Rust)
+- **Build Tools:** Compiler C & header OpenSSL (Linux: `build-essential`, `pkg-config`, `libssl-dev`; macOS: Xcode CLT; Windows: MSVC Build Tools)
+
+### Instalasi Otomatis (Direkomendasikan)
+
+Skrip installer akan memeriksa toolchain, memasang dependensi, membangun aplikasi, membuat `.env` dan `rust-bot/config/bot.toml` (dalam mode aman `paper_trading = true`), serta menawarkan pendaftaran service auto-start:
 
 ```bash
 git clone <repo-url> ApexRust
 cd ApexRust
 
-./install.sh          # Linux / macOS
-.\install.ps1         # Windows PowerShell (atau install.cmd)
+# Linux / macOS
+./install.sh
+
+# Windows (PowerShell atau Command Prompt)
+.\install.ps1
+# atau: install.cmd
 ```
 
-Installer memeriksa/memasang toolchain user-local, membangun WebApp dan/atau daemon Rust, menulis `.env` serta `rust-bot/config/bot.toml` dengan `paper_trading = true`, dan opsional mendaftarkan service auto-start.
-
-Setup non-interaktif:
+**Mode non-interaktif (misal untuk VPS / CI):**
 
 ```bash
 ./install.sh --yes --non-interactive --components both \
@@ -100,202 +71,255 @@ Setup non-interaktif:
   --trending-category hot_volume --no-service
 ```
 
-### Instalasi manual
+### Instalasi Manual
 
 ```bash
 npm install
 cp .env.example .env
 cp rust-bot/config/bot.example.toml rust-bot/config/bot.toml
+
 npm run build
 cd rust-bot && cargo build --release --workspace
 ```
 
 ---
 
-## Menjalankan
+## Menjalankan & Mengelola Layanan
+
+ApexRust menyediakan wrapper `./apexrust` (atau `apexrust.cmd` di Windows) untuk mengelola daemon, layanan OS, token akses, hingga diagnosis sistem tanpa harus mengingat perintah panjang.
+
+### Perintah Manajemen Utama
 
 ```bash
-./apexrust start | stop | restart | status | logs -f | doctor | update
-./apexrust token [status|show|generate|rotate|clear]
-./apexrust remote [status|connect|use-local|use-vps]
-./apexrust service install     # systemd --user, launchd, atau Scheduled Tasks
-./apexrust uninstall [--purge]
+./apexrust start [web|bot|both]     # Jalankan di background
+./apexrust stop [web|bot|both]      # Hentikan layanan dengan aman
+./apexrust restart [web|bot|both]   # Restart layanan
+./apexrust status                   # Cek PID, health endpoint, URL, dan service OS
+./apexrust logs [web|bot] -f        # Pantau log secara real-time (-n 100 untuk 100 baris)
+./apexrust doctor                   # Cek toolchain, config, binary, port, dan konektivitas
+./apexrust update                   # git pull, rebuild, dan restart layanan aktif
+./apexrust service install          # Pasang auto-start (systemd --user / launchd / Task Scheduler)
+./apexrust uninstall [--purge]      # Hentikan & hapus service (--purge hapus build & config)
 ```
 
-Pengembangan WebApp (Vite middleware + Express pada port `3000`):
+Setelah berjalan, buka dashboard di browser: **`http://127.0.0.1:3000`**
+
+### Mode Pengembangan (Development)
 
 ```bash
-npm run dev        # tsx server.ts
-npm run lint
-npm run build
-```
+# Menjalankan Vite + Express proxy dengan hot-reload pada port 3000
+npm run dev
 
-Daemon Rust:
-
-```bash
+# Menjalankan Rust daemon secara langsung
 cd rust-bot
-cargo run --release -p bot-desktop -- --config config/bot.toml
 cargo run --release -p bot-desktop -- --config config/bot.toml --web-port 8080
 ```
 
-Subcommand `bot-desktop` mencakup `connect` (profil VPS remote), `snapshot`, `watch`, `orders`, `trending`, `manual-order`, `trip-cb`/`reset-cb`, `flatten-all`, dan utilitas operasional lain; jalankan `cargo run -p bot-desktop -- --help`.
+### CLI Rust Terpadu (`./apexrust bot ...`)
 
-### CLI Rust terpadu (`apexrust`)
-
-Binary `apexrust` membungkus semua operasi Rust dengan output ramah (tabel, warna, hint error), sehingga tidak perlu mengingat perintah `cargo run` yang panjang:
+Untuk operasional harian mesin Rust (key Ed25519, cek sinyal, validasi config, order manual, kontrol risiko), gunakan CLI Rust terpadu:
 
 ```bash
-# build sekali
+# Build binary CLI sekali (jika belum dibuild oleh installer)
 (cd rust-bot && cargo build --release --bin apexrust)
 
-./rust-bot/target/release/apexrust --help
-./apexrust bot --help          # pintu yang sama lewat wrapper Node
+# Akses lewat wrapper Node atau langsung dari target/release/apexrust
+./apexrust bot --help
 ```
 
-| Perintah | Kegunaan |
+| Perintah | Fungsi |
 | :--- | :--- |
-| `apexrust run` | Menjalankan daemon engine (mendelegasikan ke `bot-desktop`). |
-| `apexrust status` / `snapshot` / `watch` | Health, tabel pair, dashboard live dari daemon. |
-| `apexrust keygen` / `key fingerprint` / `key inspect` | Generate key Ed25519, cek fingerprint, dan pastikan pasangan key tidak tertukar (penyebab `-2015`). |
-| `apexrust ws-api ping` / `ws-api logon` | Uji endpoint dan kredensial WS API sebelum bot dijalankan. |
-| `apexrust config validate` / `show` / `sync` | Validasi TOML, ringkasan tanpa rahasia, dan export `bot.synced.toml` tersanitasi. |
-| `apexrust screen` / `indicators` / `signal` | Screener, snapshot indikator, dan dry-run sinyal tanpa daemon. |
-| `apexrust order manual` / `order flatten` | Order manual lewat daemon (dengan konfirmasi dan batas notional). |
-| `apexrust risk pause\|resume\|trip\|reset` | Kontrol entry otomatis dan circuit breaker. |
-| `apexrust backup` / `doctor` | Backup Git tersanitasi dan pemeriksaan config/kredensial/konektivitas. |
+| `apexrust bot status` / `snapshot` / `watch` | Lihat status kesehatan, tabel pair aktif, atau live dashboard terminal. |
+| `apexrust bot keygen --label main` | Buat pasangan kunci Ed25519 baru di `rust-bot/keys/`. |
+| `apexrust bot key inspect <path.pem>` | Pastikan public key dan private key cocok (mencegah error `-2015`). |
+| `apexrust bot ws-api ping` / `ws-api logon` | Uji koneksi dan autentikasi WebSocket API sebelum bot dijalankan. |
+| `apexrust bot config validate` / `show` / `sync` | Validasi `bot.toml`, tampilkan ringkasan aman, atau export `bot.synced.toml`. |
+| `apexrust bot screen --category cts_momentum` | Jalankan screener pair dari public ticker Binance. |
+| `apexrust bot indicators BTCUSDT` / `signal BTCUSDT` | Hitung indikator atau dry-run sinyal tanpa menjalankan daemon. |
+| `apexrust bot risk pause\|resume\|trip\|reset` | Jeda entry baru atau trip/reset circuit breaker. |
+| `apexrust bot order manual` / `order flatten` | Kirim order manual atau tutup semua posisi (dengan konfirmasi & batas notional). |
+| `apexrust bot doctor` | Pemeriksaan cepat config, kredensial, REST ping, dan daemon. |
 
-Semua perintah menerima `--json`, `--no-color`, `--config <path>`, `--url <daemon>` dan `--token <token>`.
-
----
-
-## Struktur Proyek
-
-```text
-.
-├── src/                     # React PWA: engine TS, komponen UI, adapter
-│   ├── engine/              # SimulationRuntime, indikator, strategi, risiko, storage
-│   ├── server/              # Screener hub, order ledger, relay WS
-│   └── components/          # Command Center
-├── server.ts                # Express: signing, /api/live/*, /api/market/*, /api/git/*
-├── rust-bot/
-│   ├── crates/
-│   │   ├── bot-core/        # BotConfig, 21 FeatureToggles, tipe domain, watchlist/CTS
-│   │   ├── bot-indicators/  # EMA, RSI, ADX, ATR, VWAP, Donchian, SMA50(ATR), OBI
-│   │   ├── bot-strategy/    # 3 profil + gate entry + exit plan
-│   │   ├── bot-risk/        # Circuit breaker, sizing, BTC guard
-│   │   ├── bot-exchange/    # binance-sdk, WS market, WS API, failover, depth
-│   │   ├── bot-engine/      # Orkestrasi Tokio, HTF/CTS refresh, paper/live
-│   │   ├── bot-web/         # Axum REST + WS telemetry
-│   │   ├── bot-desktop/     # CLI & daemon 24/7
-│   │   └── bot-keygen/      # Generator kunci Ed25519
-│   ├── config/bot.example.toml
-│   └── docs/ARCHITECTURE.md
-├── arsitektur-trading-bot-rust.md   # Spesifikasi + status implementasi (§9)
-└── AGENTS.md                        # Aturan parity & verifikasi
-```
+Semua subcommand Rust mendukung `--json`, `--no-color`, `--config <path>`, `--url <daemon>`, dan `--token <token>`.
 
 ---
 
-## Kredensial, Ed25519 & WebSocket API
+## Mengenal Web Command Center
 
-### Penyimpanan kredensial
+Dashboard Web (`http://127.0.0.1:3000`) terbagi menjadi beberapa tab utama:
 
-- Kunci yang disimpan dari UI ditulis ke `.apexrust/secrets.env` (mode `0600`, gitignored) bila `APEXRUST_PERSIST_VAULT=true`; selain itu hanya di memori proses.
-- Variabel environment proses selalu menang atas file.
-- Jangan pernah commit `.env*`, `*.pem`, `*.key`, `rust-bot/config/bot.toml`, `rust-bot/keys/`, atau `.apexrust-order-logs.json`.
-
-### Generate kunci Ed25519
-
-Dua jalur, keduanya menulis private key PKCS#8 (mode `0600`) dan public key:
-
-```bash
-# Rust (butuh cargo)
-cd rust-bot
-cargo run -p bot-keygen -- --environment testnet --out-dir keys --label main
-# -> keys/ed25519-testnet-main.pem, keys/ed25519-testnet-main.pub.pem
-```
-
-```bash
-# WebApp proxy (menulis ke .apexrust/keys/, mode 0700)
-curl -X POST http://127.0.0.1:3000/api/live/ed25519-keygen \
-  -H 'Content-Type: application/json' \
-  -d '{"environment":"Testnet","label":"main","overwrite":false}'
-```
-
-Respons berisi `privateKeyPath`, `publicKeyPath`, `publicKeyPem`, `publicKeyBase64`, dan `fingerprint`. Daftarkan **public key** di Binance API Management, lalu set:
-
-```toml
-[exchange]
-use_ws_api_orders = true
-
-[exchange.credentials]
-auth_method = "ed25519"
-ed25519_key_path = "keys/ed25519-testnet-main.pem"
-```
-
-`.gitignore` sudah mengecualikan `rust-bot/keys/`; `.apexrust/` juga gitignored.
-
-### Cara kerja WS API
-
-- `session.logon` hanya berlaku untuk kunci **Ed25519**. Kunci HMAC tidak memakai sesi; setiap request ditandatangani (`sign_request_params`, query string terurut).
-- Hanya **entry tanpa bracket** yang dirutekan ke `order.place` melalui WS. Entry ber-bracket dan semua order protektif/exit tetap REST agar SL/TP tidak pernah hilang bila sesi WS terputus.
-- Kegagalan WS apa pun (logon, timeout, error ack) otomatis jatuh ke REST.
-- URL default: Futures testnet `wss://testnet.binancefuture.com/ws-fapi/v1`, Spot testnet `wss://ws-api.testnet.binance.vision/ws-api/v3`; ubah lewat `exchange.ws_api_url`.
-- Gunakan `use_ws_api_orders = false` untuk memaksa seluruh jalur lewat REST.
+- **Trade:** Grafik candlestick interaktif, ringkasan saldo/PnL, posisi terbuka, serta panel tiket order manual.
+- **Markets:** Pemantauan watchlist (`static` / `hybrid` / `dynamic`), skor **CTS Momentum**, spread, dan indikator live per pair.
+- **Orders:** Riwayat order, eksekusi fill, status order menggantung (resting), serta analitik performa.
+- **Bot:** Pusat kendali konfigurasi dengan 6 sub-tab:
+  - **Strategy:** Profil strategi, timeframe, pair selection, dan sizing.
+  - **Features:** Saklar on/off untuk seluruh **21 Feature Toggles**.
+  - **Risk:** Circuit breaker, leverage cap, BTC crash guard, dan batas drawdown.
+  - **Credentials:** Pengaturan Environment (`Testnet`/`Production`), Venue (`Spot`/`Futures`), metode auth (`HMAC`/`Ed25519`), dan tombol arming live order.
+  - **Git:** Backup konfigurasi tersanitasi (`bot-config-backup.json` & `bot.synced.toml`) tanpa membocorkan API key.
+  - **VPS:** Penghubung ke daemon Rust lokal atau VPS remote.
+- **Signal:** Diagnostik alasan sinyal diterima atau ditolak oleh tiap gate entry.
+- **Rust:** Penjelajah kode sumber workspace Rust bawaan dari UI.
 
 ---
 
-## Konfigurasi (`bot.toml`)
+## Kredensial Binance, Ed25519 & WebSocket API
 
-Sumber contoh lengkap: `rust-bot/config/bot.example.toml`. WebApp menyimpan konfigurasi setara di `localStorage` dan menulis TOML tersanitasi ke `rust-bot/config/bot.synced.toml` lewat `POST /api/git/backup` (payload `config`).
+### Prinsip Penyimpanan Rahasia
+- File `.env`, `.apexrust/secrets.env`, `*.pem`, `*.key`, `rust-bot/config/bot.toml`, `rust-bot/keys/`, dan `.apexrust-order-logs.json` sudah di-**gitignore**. **Jangan pernah commit file-file ini.**
+- Kredensial yang disimpan dari UI ditulis ke `.apexrust/secrets.env` (izin `0600`) **hanya jika** `APEXRUST_PERSIST_VAULT=true`; jika `false` (default), kredensial hanya disimpan di memori selama proses berjalan.
+- Environment variable sistem (`export BINANCE_API_KEY=...`) selalu memiliki prioritas tertinggi di atas file.
 
-### Field baru / penting
+### Opsi 1: HMAC-SHA256 (Standar)
+Cocok untuk pemakaian umum melalui REST API. Isi `BINANCE_API_KEY` dan `BINANCE_API_SECRET` di `.env` atau tab **Bot → Credentials**.
 
-| Section | Field | Arti |
+### Opsi 2: Ed25519 + WebSocket API (Direkomendasikan untuk Latensi Rendah)
+Diperlukan jika ingin mengaktifkan `use_ws_api_orders = true` (`session.logon` untuk entry order via WebSocket).
+
+1. **Generate Keypair:**
+   ```bash
+   ./apexrust bot keygen --environment testnet --label main
+   # Menghasilkan:
+   # - rust-bot/keys/ed25519-testnet-main.pem      (Private key - JANGAN dibagikan)
+   # - rust-bot/keys/ed25519-testnet-main.pub.pem  (Public key - daftarkan ke Binance)
+   ```
+   *(Atau via WebApp proxy: `POST /api/live/ed25519-keygen`)*
+2. **Daftarkan Public Key** di dashboard **Binance API Management** (atau Binance Testnet), aktifkan izin Spot/Futures sesuai kebutuhan, lalu simpan API Key yang diberikan Binance.
+3. **Konfigurasi di `bot.toml` dan `.env`:**
+   ```toml
+   [exchange]
+   use_ws_api_orders = true
+
+   [exchange.credentials]
+   auth_method = "ed25519"
+   ed25519_key_path = "rust-bot/keys/ed25519-testnet-main.pem"
+   ```
+4. **Uji sebelum menyalakan bot:**
+   ```bash
+   ./apexrust bot key inspect rust-bot/keys/ed25519-testnet-main.pem
+   ./apexrust bot ws-api logon
+   ```
+
+> **Catatan Jalur Order WS API:** Hanya **entry tanpa bracket** yang dikirim melalui WebSocket API. Entry yang membawa bracket TP/SL serta seluruh order protektif/exit selalu dikirim melalui REST API agar proteksi tidak pernah hilang jika koneksi WS terputus. Jika WS API gagal atau timeout, sistem otomatis fallback ke REST.
+
+### Checklist Sebelum Mengaktifkan Live Trading
+1. Pastikan `environment` (`testnet` vs `production`) sesuai dengan asal API Key Anda (key Testnet tidak berlaku di Production, dan sebaliknya).
+2. Pastikan `paper_trading = false` dan `armed_for_live_orders = true`.
+3. Pertahankan `require_preflight_test_order = true` agar order diuji ke `/order/test` sebelum dikirim nyata.
+4. Atur `max_order_notional_usdt` dan `max_leverage` (default `3`) sesuai batas risiko Anda.
+
+---
+
+## Strategi, Screener & 21 Feature Toggles
+
+### 1. Screener & Pemilihan Pair (`pair_selection_mode`)
+- **`static`**: Hanya memantau daftar `trading.pairs` manual.
+- **`hybrid`**: Menggabungkan `trading.pairs` dengan hasil screener trending.
+- **`dynamic`**: Sepenuhnya memilih pair dari hasil screener dengan *hysteresis rank buffer* dan *dwell time* (`trending_min_dwell_minutes`) agar daftar pair tidak terus-terusan berganti.
+- **Kategori Trending:** `hot_volume`, `top_gainers`, `top_losers`, `volatility_leaders`, dan **`cts_momentum`** (menggabungkan 1h Relative Volume + 1h Momentum + Volume yang dinormalisasi `[0, 1]` dan di-refresh tiap 5 menit).
+
+### 2. Tiga Profil Strategi (`strategy_profile`)
+1. **`trend_pullback` (Default):** Mencari pullback ke EMA mid saat tren EMA (`9/21/50/200`) searah, ADX kuat, RSI memantul dari zona pullback, dan harga searah VWAP.
+2. **`ema_breakout`:** Masuk saat harga menembus channel Donchian (`donchian_lookback`, default `20`) yang dikonfirmasi tren EMA, ADX, dan volume.
+3. **`vwap_reversion`:** Mencari pembalikan rata-rata (mean reversion) ketika harga meregang `>= 1.1x ATR` dari VWAP/EMA21 dengan RSI jenuh dan ADX terbatas.
+
+### 3. Daftar Lengkap 21 Feature Toggles (`[features]`)
+
+Semua fitur dapat dinyalakan/dimatikan secara independen tanpa mengubah kode:
+
+| Kategori | Toggle | Default | Fungsi |
+| :--- | :--- | :---: | :--- |
+| **Eksekusi & Sesi** | `automated_trading` | `true` | Izinkan bot membuka posisi otomatis dari sinyal. |
+| | `manual_trading` | `true` | Izinkan pengiriman order manual dari UI/CLI. |
+| | `signal_generator` | `true` | Hitung indikator & evaluasi sinyal pada tiap bar tertutup. |
+| | `session_window_filter` | `false` | Batasi entry otomatis hanya pada jam UTC `[[automation.session_windows]]` (exit tetap 24/7). |
+| **Venue & Transport** | `spot_market` | `true` | Aktifkan dukungan Binance Spot (`long_only`). |
+| | `futures_market` | `true` | Aktifkan dukungan Binance USD-M Futures (Long & Short). |
+| | `ws_primary_feed` | `true` | Gunakan WebSocket stream sebagai sumber harga utama. |
+| | `rest_fallback` | `true` | Otomatis pindah ke polling REST jika heartbeat WS timeout. |
+| **Gate Entry** | `ema_trend_filter` | `true` | Filter arah tren menggunakan stack EMA 9/21/50/200. |
+| | `rsi_momentum_filter` | `true` | Filter zona & arah pantulan RSI(14). |
+| | `adx_strength_filter` | `true` | Cegah entry di market choppy (`ADX >= adx_min_trend`, DI spread). |
+| | `vwap_bias_filter` | `true` | Wajibkan harga berada di sisi yang benar terhadap Session VWAP. |
+| | `volume_confirmation_filter` | `false` | Wajibkan lonjakan volume terhadap rata-rata 20 bar. |
+| | `htf_trend_filter` | `false` | Konfirmasi tren Higher Timeframe (EMA 1 jam). |
+| | `obi_entry_filter` | `false` | Konfirmasi ketimpangan Order Book (Order Book Imbalance). |
+| **Exit Lifecycle** | `atr_dynamic_exits` | `true` | Hitung jarak SL & TP secara dinamis berbasis ATR. |
+| | `take_profit_ladder` | `true` | Tutup sebagian posisi pada TP1 (`tp1_close_ratio`) lalu biarkan runner ke TP2. |
+| | `break_even_stop` | `true` | Geser SL ke harga entry + buffer fee saat profit mencapai `break_even_trigger_r`. |
+| | `trailing_stop` | `true` | Aktifkan trailing stop ATR monoton setelah profit mencapai `trailing_activation_r`. |
+| **Proteksi & Sync** | `circuit_breaker` | `true` | Hentikan entry baru jika batas rugi/target harian atau streak tercapai. |
+| | `git_auto_backup` | `false` | Otomatis commit snapshot konfigurasi tersanitasi ke Git. |
+
+---
+
+## Manajemen Risiko & Exit Lifecycle
+
+1. **Urutan Evaluasi Exit ATR (Anti-Celah):**
+   Pada setiap tick, **Break-Even** dan **Trailing Stop** dievaluasi **sebelum** mengeksekusi partial close TP1. Dengan begitu, jika harga melonjak langsung menembus TP1, sisa posisi (runner) langsung terlindungi.
+2. **Kepatuhan Eksekusi Binance:**
+   - **USD-M Futures:** Menggunakan `newOrderRespType=RESULT`; order kondisional TP/SL dirutekan ke `/fapi/v1/algoOrder` (`algoType=CONDITIONAL`, `workingType=MARK_PRICE`, `priceProtect=true`, `closePosition=true`) dan dipantau lewat `/fapi/v1/openAlgoOrders`. Order exit `reduceOnly` melewati panggilan `marginType`/`leverage` agar error `-4048` tidak pernah memblokir penutupan posisi.
+   - **Spot:** Bracket menggunakan `/api/v3/orderList/oco` dan menolak upaya buka posisi short.
+3. **Circuit Breaker & Karantina Pair:**
+   Mengawasi drawdown harian akun, drawdown per pair, target profit harian, serta batas *lose streak* (disertai cooldown dan karantina pair). Memanggil `reset` pada circuit breaker akan membersihkan daftar `quarantined_pairs` di kedua runtime.
+4. **BTC Crash Guard:**
+   Memantau penurunan tajam BTC dalam jendela waktu tertentu (`btc_crash_threshold_pct` dalam `btc_crash_window_minutes`). Jika terpicu, **hanya entry baru yang diblokir**—exit posisi terbuka tetap berjalan. Jika feed BTC basi melebihi `btc_crash_max_staleness_sec`, guard bersifat *fail-open* agar bot tidak lumpuh.
+5. **Position Sizing & Kelly Guard:**
+   Mendukung `fixed_usdt`, `fixed_risk_pct`, `quarter_kelly`, `half_kelly`, dan `full_kelly`. Pada mode Kelly, sistem otomatis memblokir ukuran posisi jika *expectancy* historis negatif (`f* <= 0`).
+6. **Cap Leverage Keras:**
+   `max_leverage` (default `3`, rentang `1..=20`) dipaksakan pada config, TOML tersinkron, dan setiap jalur pengiriman order.
+
+---
+
+## Konfigurasi (`bot.toml` & `.env`)
+
+### File Konfigurasi Rust (`rust-bot/config/bot.toml`)
+Salin dari `rust-bot/config/bot.example.toml`. Bagian utama:
+- `[exchange]` — `environment`, `venue`, `leverage`, `max_leverage`, `paper_trading`, `use_ws_api_orders`, parameter failover WS/REST.
+- `[exchange.credentials]` — `auth_method`, nama env var key/secret, `ed25519_key_path`, `max_order_notional_usdt`, `require_preflight_test_order`, `armed_for_live_orders`.
+- `[trading]` — `mode`, `timeframe`, `pairs`, `position_sizing_mode`, `pair_selection_mode`, parameter screener & CTS.
+- `[automation]` & `[[automation.session_windows]]` — `strategy_profile`, `direction_policy`, `order_method`, dynamic cancel, serta jadwal sesi UTC.
+- `[features]` — 21 saklar fitur.
+- `[indicators]`, `[exits]`, `[risk]` — parameter indikator, pengali ATR, circuit breaker, dan BTC crash guard.
+
+### Environment Variables Penting (`.env`)
+Salin dari `.env.example`:
+
+| Variabel | Default | Fungsi |
 | :--- | :--- | :--- |
-| `[exchange]` | `max_leverage` | Batas keras leverage (1..=20), default 3. `leverage` di-clamp ke nilai ini. |
-| `[exchange]` | `use_ws_api_orders` | Aktifkan jalur WebSocket API untuk entry tanpa bracket. |
-| `[exchange]` | `ws_api_url` | Endpoint WS API (testnet/production). |
-| `[exchange.credentials]` | `ed25519_key_path` | Path PKCS#8 PEM untuk `session.logon`. |
-| `[trading]` | `trending_category` | Termasuk `cts_momentum`. |
-| `[trading]` | `cts_screener_enabled`, `cts_rvol_weight`, `cts_momentum_weight`, `cts_volume_weight`, `cts_min_rvol` | Bobot & ambang CTS (total bobot dinormalisasi saat runtime). |
-| `[indicators]` | `donchian_lookback` | Window breakout Donchian, default 20. |
-| `[indicators]` | `atr_expansion_filter_enabled`, `atr_expansion_min_ratio` | Gate ekspansi volatilitas (ATR vs SMA50 ATR), default nonaktif. |
-| `[indicators]` | `htf_ema_period`, `obi_levels`, `obi_min_imbalance` | Parameter gate HTF dan OBI. |
-| `[features]` | `htf_trend_filter`, `obi_entry_filter` | Dua toggle baru (total **21**). Default `false`. |
-| `[risk]` | `btc_crash_guard_enabled`, `btc_crash_threshold_pct`, `btc_crash_window_minutes`, `btc_crash_max_staleness_sec` | Guard korelasi BTC; hanya memblokir entry. |
-| `[risk]` | `flatten_on_circuit_breaker` | Tutup semua posisi saat breaker aktif. |
-
-Semua field divalidasi di Rust (`BotConfig::validate`) dan di-clamp ulang saat load/save di TypeScript, sehingga nilai manual yang tidak masuk akal tidak lolos ke jalur order.
-
----
-
-## Gate Entry & Screener
-
-Alur keputusan satu bar tertutup:
-
-1. **Warmup & kualitas data** — minimal `min_warmup_bars`, tanpa gap kandil, spread ≤ `max_spread_bps`.
-2. **Regime** — tren EMA + macro, ADX/DI, RSI pullback, VWAP, volume; opsional HTF 1 jam, OBI, dan ekspansi ATR.
-3. **Struktur** — Donchian breakout (`ema_breakout`) atau pullback ke EMA mid (`trend_pullback`) / reversion VWAP (`vwap_reversion`).
-4. **Sesi** — `session_window_filter` hanya untuk entry otomatis.
-5. **Risiko** — circuit breaker, BTC guard, streak/quarantine, sizing, notional cap, preflight test order.
-6. **Eksekusi** — WS API (bila aktif dan tanpa bracket) atau REST dengan bracket.
-
-Diagnostik setiap gate tersedia di `evaluateSignalDiagnostics` (TS) dan padanannya di Rust, sehingga UI dapat menampilkan alasan penolakan sinyal.
+| `PORT` / `HOST` | `3000` / `127.0.0.1` | Port dan alamat bind Express proxy & UI. |
+| `BINANCE_ENVIRONMENT` | `Testnet` | `Testnet` atau `Production`. |
+| `BINANCE_VENUE` | `Spot` | `Spot` atau `Futures`. |
+| `BINANCE_AUTH_METHOD` | `HMAC-SHA256` | `HMAC-SHA256` atau `Ed25519`. |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Kredensial API Binance. |
+| `BINANCE_PRIVATE_KEY_PATH` | — | Path ke file PKCS#8 PEM (untuk Ed25519). |
+| `APEXRUST_MAX_ORDER_NOTIONAL_USDT` | `250` | Batas maksimum nilai per order (USDT). |
+| `APEXRUST_REQUIRE_PREFLIGHT` | `true` | Wajibkan uji `/order/test` sebelum live order. |
+| `APEXRUST_ORDER_DB_PATH` | `.apexrust-orders.sqlite` | Lokasi database ledger order SQLite. |
+| `APEXRUST_ENGINE_AUTHORITY` | `browser` | `browser` (UI mengirim order) atau `daemon` (Rust VPS mengirim order). |
+| `APEXRUST_ENGINE_URL` | — | URL daemon Rust upstream (misal `http://127.0.0.1:8080`). |
+| `APEXRUST_PROXY_TOKEN` | — | Token akses minimal 32 karakter (wajib saat bind `0.0.0.0`). |
+| `APEXRUST_PERSIST_VAULT` | `false` | Set `true` agar kunci dari UI disimpan ke `.apexrust/secrets.env`. |
+| `APEXRUST_TRUST_PROXY` | — | Set `loopback` atau `true` jika berjalan di belakang reverse proxy / `cloudflared`. |
 
 ---
 
-## Manajemen Risiko & Exit
+## Mode VPS 24/7 & Remote Access
 
-- **Exit plan**: SL `atr_sl_multiplier`, TP1 `atr_tp1_multiplier` (partial `tp1_close_ratio`), TP2 `atr_tp2_multiplier`.
-- **Break-even** pada `break_even_trigger_r` plus buffer fee; **trailing** aktif pada `trailing_activation_r` dengan `atr_trailing_multiplier`, hanya bergerak searah profit.
-- **Urutan evaluasi**: break-even → trailing → partial TP1 → full exit, sehingga posisi yang langsung menyentuh TP1 tetap memiliki proteksi runner.
-- **Circuit breaker**: drawdown harian & per pair, target profit, streak, karantina pair; `reset` membersihkan `quarantined_pairs` di kedua runtime.
-- **BTC guard**: sampel harga BTC disimpan dalam jendela; anchor adalah sampel tertua yang masih dalam jendela. Data lebih tua dari `btc_crash_max_staleness_sec` dianggap tidak ada (fail-open).
+Untuk menjalankan bot nonstop di VPS dan mengontrolnya dari laptop/HP:
+
+1. **Di VPS:** Jalankan `./install.sh` dengan role VPS (atau set `APEXRUST_ENGINE_AUTHORITY=daemon`, `APEXRUST_ENGINE_URL=http://127.0.0.1:8080`, dan buat token akses via `./apexrust token generate`).
+2. **Keamanan Jaringan:** Gunakan **Cloudflare One / Zero Trust** (`cloudflared` atau WARP mesh) atau bind `0.0.0.0` dengan `APEXRUST_PROXY_TOKEN` aktif.
+3. **Di Komputer Lokal (Client):**
+   ```bash
+   ./apexrust remote connect --remote-url https://bot-anda.example.com --remote-token <TOKEN>
+   ./apexrust remote status
+   ```
+4. **Single-Writer Authority:** Pastikan hanya satu pihak (`daemon` **atau** `browser`) yang memegang otoritas eksekusi agar tidak terjadi order ganda.
 
 ---
 
-## Arsitektur Runtime
+## Arsitektur & Struktur Proyek
 
 ```text
                     +-----------------------------+
@@ -304,77 +328,121 @@ Diagnostik setiap gate tersedia di `evaluateSignalDiagnostics` (TS) dan padanann
                     +--------------+--------------+
                                    | /api/live/*, /api/market/*, /api/git/*
                     +--------------v--------------+
-                    |  Express Proxy (server.ts)  |  signing, ledger, Git backup, WS relay
+                    |  Express Proxy (server.ts)  |  Signing, SQLite ledger,
+                    |  Port 3000                  |  Git backup, WS relay
                     +--------------+--------------+
-                                   | HTTP / WS (opsional, VPS)
+                                   | HTTP / WS (opsional, mode VPS)
                     +--------------v--------------+
-                    |  bot-web (Axum)  <->  bot-engine (Tokio)
+                    |  bot-web (Axum :8080)       |
+                    |  <-> bot-engine (Tokio)     |
                     +--------------+--------------+
               +--------------------+--------------------+
               |                    |                    |
       bot-exchange          bot-indicators        bot-strategy
-      (Spot/Futures,        (EMA/RSI/ADX/ATR/    (profil + gate +
-       WS market, WS API,    VWAP/Donchian/OBI)   exit plan)
-       failover, depth)             |
-              +---------------------+--------------------+
-                                    |
-                              bot-risk (CB, sizing, BTC guard)
-                                    |
-                              bot-core (config, tipe, watchlist/CTS)
+      (binance-sdk,         (EMA, RSI, ADX,       (3 Profil, Gate,
+       WS/REST failover)     ATR, VWAP, OBI)       Exit Plan ATR)
+              |                    |                    |
+              +--------------------+--------------------+
+                                   |
+                             bot-risk (Circuit Breaker, Sizing, BTC Guard)
+                                   |
+                             bot-core (BotConfig, 21 FeatureToggles, Watchlist/CTS)
 ```
 
-- **Paper mode** berjalan penuh di memori tanpa kredensial; **Live mode** memerlukan kredensial + `armed_for_live_orders = true` + preflight.
-- **Single-writer authority**: `APEXRUST_ENGINE_AUTHORITY=browser` (default) atau `daemon`; hanya satu yang boleh mengirim order.
-- **Remote VPS**: WebApp dapat bertindak sebagai gateway ke daemon Rust (`APEXRUST_ENGINE_URL`), termasuk di belakang Cloudflare One / Zero Trust (`APEXRUST_TRUST_ZERO_TRUST_MESH`, `APEXRUST_PROXY_TOKEN`).
-- **Rate limiting & token**: token ≥32 karakter wajib saat bind `0.0.0.0`; klien WS mengambil tiket sekali pakai dari `POST /api/ws-ticket`.
-
----
-
-## Environment Variables
-
-Lihat `.env.example` untuk daftar lengkap. Yang paling sering dipakai:
-
-| Variabel | Default | Fungsi |
-| :--- | :--- | :--- |
-| `PORT` / `HOST` | `3000` / `127.0.0.1` | Bind Express. |
-| `BINANCE_ENVIRONMENT` | `Testnet` | `Testnet` atau `Production`. |
-| `BINANCE_VENUE` | `Spot` | `Spot` atau `Futures`. |
-| `BINANCE_AUTH_METHOD` | `HMAC-SHA256` | `HMAC-SHA256` atau `Ed25519`. |
-| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | — | Kredensial HMAC. |
-| `BINANCE_PRIVATE_KEY_PATH` | — | Path/inline PEM Ed25519. |
-| `APEXRUST_MAX_ORDER_NOTIONAL_USDT` | `250` | Cap notional per order. |
-| `APEXRUST_REQUIRE_PREFLIGHT` | `true` | Wajib test order sebelum live. |
-| `APEXRUST_ORDER_DB_PATH` | `.apexrust-orders.sqlite` | Ledger SQLite. |
-| `APEXRUST_ENGINE_AUTHORITY` | `browser` | `browser` atau `daemon`. |
-| `APEXRUST_ENGINE_URL` | — | Upstream daemon Rust. |
-| `APEXRUST_PROXY_TOKEN` | — | Token akses proxy (wajib di `0.0.0.0`). |
-| `APEXRUST_PERSIST_VAULT` | `false` | Simpan kunci UI ke `.apexrust/secrets.env`. |
-| `APEXRUST_TRUST_PROXY` | — | `loopback`/`true` di belakang reverse proxy. |
+### Struktur Direktori
+- `src/` — Aplikasi React 19 + TypeScript (`engine/`, `server/`, `components/`).
+- `server.ts` — Express server: API signing, ledger SQLite, market screener hub, WS relay, serta sinkronisasi `bot.synced.toml`.
+- `scripts/` — CLI Node (`apexrust.mjs`) & installer lintas OS (`install.sh`, `install.ps1`, `install.cmd`).
+- `rust-bot/crates/` — Workspace 10 crate:
+  - `bot-core`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-exchange`, `bot-engine`, `bot-web`, `bot-desktop`, `bot-keygen`, `bot-cli`.
 
 ---
 
 ## Verifikasi & Pengujian
 
-Wajib dijalankan sebelum menyelesaikan perubahan (lihat `AGENTS.md`):
+Jalankan seluruh pengujian berikut sebelum melakukan commit atau deploy ke production:
 
 ```bash
-# Rust
+# 1. Rust Workspace (Clippy strict + Unit/Integration Tests)
 cd rust-bot
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo clippy --workspace
 
-# WebApp / TypeScript
+# 2. WebApp / TypeScript (Type-check, Oxlint, Vite Build, Engine & Server Tests)
+cd ..
 npm run lint
 npm run build
-npx --yes tsx --test src/engine/*.test.ts
-```
+npx --yes tsx --test src/engine/*.test.ts src/server/*.test.ts
 
-Cakupan test engine TS mencakup parity config storage, gate strategi, exit lifecycle, BTC guard, cap leverage, CTS ranking, ledger SQLite, dan adapter snapshot. Sisi Rust mencakup `bot-core` (config/watchlist), `bot-risk` (breaker + BTC guard), `bot-strategy`, `bot-indicators`, `bot-exchange` (WS market/WS API/depth/failover), serta smoke test `bot-engine`/`bot-web`.
+# 3. Installer & CLI Scripts
+npm run test:installer
+sh -n install.sh apexrust
+```
 
 ---
 
-## Dokumentasi Lain
+## Troubleshooting (Mengatasi Masalah)
 
-- `AGENTS.md` — aturan parity WebApp ↔ Rust dan perintah verifikasi.
-- `rust-bot/docs/ARCHITECTURE.md` — graf dependency crate dan alur runtime.
-- `arsitektur-trading-bot-rust.md` — spesifikasi lengkap; **§9 berisi tabel status Implemented/Partial/Not planned** dan catatan penyimpangan yang disengaja.
+Langkah pertama saat menemui kendala apa pun, jalankan pemeriksaan otomatis:
+
+```bash
+./apexrust doctor
+./apexrust bot doctor
+```
+
+### 1. Masalah Instalasi & Build
+
+| Gejala | Penyebab Umum | Solusi |
+| :--- | :--- | :--- |
+| `Node.js version unsupported` | Versi Node < `20.19.0` atau `21.x`. | Pasang Node.js `20.19+` atau `22.12+` (gunakan `fnm` / `nvm`), lalu ulangi `./install.sh`. |
+| Gagal compile crate Rust (`openssl` / `cc` not found) | Toolchain C atau header OpenSSL belum terpasang. | **Ubuntu/Debian:** `sudo apt install build-essential pkg-config libssl-dev`<br>**macOS:** `xcode-select --install`<br>**Windows:** Pasang Visual Studio Build Tools (C++ workload). |
+| `Permission denied` saat menjalankan `./apexrust` atau `./install.sh` | Bit executable hilang setelah clone/copy. | Jalankan `chmod +x install.sh apexrust`. |
+
+### 2. Masalah Kredensial & Error Binance API
+
+| Gejala / Kode Error | Penyebab Umum | Solusi |
+| :--- | :--- | :--- |
+| **`-2015: Invalid API-key, IP, or permissions for action`** | 1. Key Testnet dipakai di Production (atau sebaliknya).<br>2. IP server belum di-whitelist di Binance API.<br>3. Izin Spot/Futures belum dicentang.<br>4. Pasangan key Ed25519 tertukar. | - Cocokkan `environment` (`Testnet` vs `Production`) dengan asal key.<br>- Cek izin API & whitelist IP di Binance.<br>- Untuk Ed25519, verifikasi key dengan `./apexrust bot key inspect <path.pem>`. |
+| **`-1021: Timestamp for this request was 1000ms ahead/outside recvWindow`** | Jam sistem (OS clock) melenceng dari waktu server Binance. | Sinkronkan NTP sistem (`sudo timedatectl set-ntp true` di Linux) atau perbesar `recv_window_ms` (maksimal sesuai batas Binance, misal `5000`–`10000`). |
+| **`-4048: Margin type cannot be changed if there exists position`** | Terjadi saat ingin menutup posisi di Futures. | ApexRust sudah otomatis melewati `/fapi/v1/marginType` pada order `reduceOnly`. Pastikan Anda menjalankan versi terbaru dan tidak mengubah margin type secara manual saat posisi terbuka. |
+| **WS API `session.logon` gagal** | Menggunakan kunci HMAC untuk `use_ws_api_orders = true`, atau URL `ws_api_url` salah. | `session.logon` hanya mendukung **Ed25519**. Uji dengan `./apexrust bot ws-api logon`. Untuk sementara, set `use_ws_api_orders = false` agar seluruh order memakai REST. |
+
+### 3. Bot Berjalan Tapi Tidak Membuka Posisi
+
+Periksa berurutan (atau buka tab **Signal** di UI / jalankan `./apexrust bot signal BTCUSDT`):
+
+1. **Mode Paper vs Live:** Jika ingin order nyata tapi tidak ada order di Binance, cek apakah `paper_trading = true` atau `armed_for_live_orders = false`.
+2. **Toggle `automated_trading` mati:** Pastikan `[features] automated_trading = true`.
+3. **Terblokir Gate Entry:** Beberapa gate opsional seperti `htf_trend_filter`, `obi_entry_filter`, `volume_confirmation_filter`, atau `atr_expansion_filter_enabled` cukup ketat. Cek alasan penolakan di tab **Signal** atau matikan gate yang tidak diperlukan.
+4. **Filter Sesi UTC aktif:** Jika `session_window_filter = true`, entry baru hanya berjalan di dalam jam UTC pada `[[automation.session_windows]]`.
+5. **BTC Crash Guard aktif:** Jika BTC baru turun tajam melewati `btc_crash_threshold_pct`, entry baru ditahan sementara hingga pasar stabil.
+6. **Circuit Breaker / Pair Dikarantina:** Cek `./apexrust bot status`. Jika breaker aktif atau pair masuk karantina akibat *lose streak*, jalankan `./apexrust bot risk reset` setelah mengevaluasi penyebabnya.
+7. **Kelly Negative Expectancy Block:** Jika memakai mode `*_kelly` dan data historis menunjukkan ekspektasi negatif (`f* <= 0`), bot sengaja menahan ukuran posisi ke `0`. Ganti sementara ke `fixed_usdt` atau `fixed_risk_pct` untuk mengumpulkan sampel trade.
+
+### 4. Masalah WebSocket, Data & Sinkronisasi
+
+| Gejala | Penyebab Umum | Solusi |
+| :--- | :--- | :--- |
+| Status transport berubah ke **`RestFallback`** | Koneksi WS ke Binance terputus atau terblokir firewall/ISP, melebihi `ws_heartbeat_timeout_ms`. | Sistem tetap aman berjalan lewat polling REST. Cek koneksi internet/DNS VPS; jika latensi tinggi, naikkan `ws_heartbeat_timeout_ms` (misal ke `8000`). |
+| Tidak ada sinyal setelah baru menyalakan bot | Jumlah kandil belum memenuhi `min_warmup_bars`. | Tunggu beberapa detik hingga warmup historis via REST selesai (terlihat di log). |
+| Order ganda / konflik UI vs Daemon | Otoritas penulis tidak jelas antara browser dan Rust daemon. | Pastikan `APEXRUST_ENGINE_AUTHORITY` diset tegas ke `browser` **atau** `daemon` (jangan jalankan auto-trading di keduanya sekaligus pada akun yang sama). |
+
+### 5. Masalah WebApp, Proxy & Remote VPS
+
+| Gejala | Penyebab Umum | Solusi |
+| :--- | :--- | :--- |
+| **Port `3000` atau `8080` sudah dipakai (`EADDRINUSE`)** | Ada proses ApexRust lama atau aplikasi lain di port yang sama. | Jalankan `./apexrust stop`, cek `lsof -i :3000`, atau ubah port lewat `--web-port` / `--bot-port` dan `.env`. |
+| **Server menolak start saat bind `0.0.0.0`** | Pengaman wajib memblokir expose publik tanpa token. | Buat token akses dengan `./apexrust token generate` (otomatis mengisi `APEXRUST_PROXY_TOKEN` >= 32 karakter) lalu `./apexrust restart`. |
+| **Error `CORS` atau `Origin not allowed` saat akses dari Remote Client** | Origin PWA belum terdaftar di VPS. | Tambahkan URL client ke `APEXRUST_ALLOWED_ORIGINS` di `.env` VPS, lalu restart `web`. |
+| **Endpoint `/api/*` mengembalikan halaman HTML / cache PWA lama** | Service worker Workbox stale atau proxy salah arah. | Pastikan `vite.config.ts` mempertahankan `navigateFallbackDenylist: [/^\/api\//, /^\/_ah\//]`. Di browser, lakukan *Hard Reload* (`Ctrl+Shift+R`) atau *Unregister Service Worker* di DevTools. |
+| **Gagal terhubung ke WebSocket UI (`ws-ticket` expired / 401)** | Tiket WS sekali pakai berumur 30 detik kedaluwarsa atau token tidak cocok. | Refresh halaman UI atau perbarui token remote via `./apexrust remote connect`. |
+
+---
+
+## Dokumentasi Tambahan
+
+- `AGENTS.md` — Aturan wajib parity WebApp ↔ Rust dan standar verifikasi kode.
+- `rust-bot/docs/ARCHITECTURE.md` — Detail graf dependensi crate dan state machine failover.
+- `rust-bot/docs/STRATEGY_GUIDE.md` — Rumus matematis indikator, profil strategi, Kelly Criterion, dan audit pra-trade.
+- `rust-bot/docs/AI_HANDOFF.md` — Checklist langkah demi langkah untuk menambah toggle, indikator, atau profil baru.
+- `arsitektur-trading-bot-rust.md` — Spesifikasi lengkap proyek beserta tabel status implementasi (§9).

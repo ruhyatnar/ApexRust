@@ -44,7 +44,7 @@ function median(values: number[]): number {
  * Derives 1h RVOL and 1h momentum from Binance kline rows, then blends them
  * into a CTS score with cross-sectionally normalized volume.
  */
-export function buildCtsMetrics(
+function buildCtsMetrics(
   tickers: MarketTicker24h[],
   klinesBySymbol: Map<string, Array<Array<string | number>>>,
   weights?: { rvol?: number; momentum?: number; volume?: number }

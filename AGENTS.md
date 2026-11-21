@@ -4,11 +4,13 @@
 # ApexRust Quant -- Project Rules
 
 ## 1. Mandatory WebApp ↔ Desktop Parity
-- Every change, bugfix, config field, feature toggle, strategy/risk rule, or execution capability MUST be implemented in **both** the WebApp (`src/`, `server.ts`) and the Rust Desktop/Daemon workspace (`rust-bot/`) in the same change set, with matching unit tests.
+- Every change, bugfix, config field, feature toggle, strategy/risk rule, or execution capability MUST be implemented in **both** the WebApp (`src/`, `server.ts`) and the Rust workspace (`rust-bot/`) in the same change set, with matching unit tests.
 - Keep `BotConfig`, all 21 `FeatureToggles`, `UtcSessionWindow`, `StrategyProfile`, `PositionSizingMode` (including Kelly negative-expectancy block), `VolatilitySpikeAlert`, and `RiskManager` behavior (including `reset_circuit_breaker` clearing `quarantined_pairs` and the BTC crash guard) synchronized across:
   - TypeScript: `src/engine/types.ts`, `simulator.ts`, `configStorage.ts`, `strategy.ts`, `risk.ts`
   - Express Proxy: `server.ts` (`buildSyncedTomlFromPayload`, `/api/live/*`, `/api/git/*`)
-  - Rust: `rust-bot/crates/bot-core`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-exchange`, `bot-engine`, `bot-web`, and `rust-bot/config/bot.example.toml`
+  - Rust (`rust-bot/crates/`): `bot-core`, `bot-indicators`, `bot-strategy`, `bot-risk`, `bot-exchange`, `bot-engine`, `bot-web`, `bot-desktop`, `bot-cli`, and `rust-bot/config/bot.example.toml`
+- Pure-logic modules (`bot-indicators`, `bot-strategy`, `bot-risk`; `src/engine/{indicators,strategy,risk,quantAnalytics,sessionWindows,configStorage}.ts`) must remain deterministic and I/O-free—pass `nowMs` / `now: DateTime<Utc>` explicitly.
+- See `rust-bot/docs/AI_HANDOFF.md` for step-by-step extension checklists (feature toggles, indicators, strategy profiles).
 
 ## 2. Binance API Compliance (`developers.binance.com`)
 - **USD-M Futures (`/fapi/v1/order`)**: Use `newOrderRespType = RESULT` (never `FULL`, which is Spot-only).
@@ -20,8 +22,10 @@
 ## 3. Strategy, Exit Lifecycle & Build Hygiene
 - **ATR Exit Lifecycle**: In `managePositionTick` / `manage_position_tick`, evaluate Break-Even and monotonic ATR Trailing Stop **before** returning `PartialClose` on TP1 so a direct move to TP1 still protects the remaining runner.
 - **Session Windows**: `sessionWindowFilter` gates only new automated entries; open position exit management runs 24/7.
-- **Build & Secret Hygiene**: Never commit secrets (`.env*`, `*.pem`, `*.key`, `rust-bot/config/bot.toml`, `.apexrust-order-logs.json`), keep `target/` and `rust-bot/target/` gitignored, and exclude `!/rust-bot/target/**` and `!/rust-bot/Cargo.lock` from Vite globs in `src/components/RustCodebaseView.tsx`.
+- **Build & Secret Hygiene**: Never commit secrets (`.env*`, `*.pem`, `*.key`, `rust-bot/config/bot.toml`, `rust-bot/keys/`, `.apexrust/`, `.apexrust-order-logs.json`, `.apexrust-orders.sqlite*`). Keep `target/` and `rust-bot/target/` gitignored, and keep `!/rust-bot/target/**`, `!/rust-bot/Cargo.lock`, and secret exclusions in `src/components/RustCodebaseView.tsx`'s `import.meta.glob`.
+- **PWA Routing (`vite.config.ts`)**: Keep `navigateFallbackDenylist: [/^\/api\//, /^\/_ah\//]` in Workbox so `/api/*` requests always reach Express (`server.ts`).
 
 ## 4. Verification Before Completing Changes
-- **Rust**: `cd rust-bot && cargo test --workspace && cargo clippy --workspace`
-- **WebApp / TS** (when `node_modules` is installed): `npm run lint && npm run build` and `npx --yes tsx --test src/engine/*.test.ts`
+- **Rust**: `cd rust-bot && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` (single crate/test: `cargo test -p <crate> [test_name]`).
+- **WebApp / TS**: `npm run lint && npm run build && npx --yes tsx --test src/engine/*.test.ts src/server/*.test.ts` (`lint` runs `tsc --noEmit && oxlint --deny-warnings src server.ts`; single test: `npx --yes tsx --test <file.test.ts>`).
+- **Installer / CLI** (when touching `install.*`, `apexrust*`, or `scripts/**`): `npm run test:installer` and `sh -n install.sh apexrust`.

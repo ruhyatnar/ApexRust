@@ -56,7 +56,7 @@ interface OrderDatabaseOptions {
 }
 
 /** Seeded showcase rows are identified by the flag or their legacy id prefix. */
-export function isDemoOrderLog(log: OrderExecutionLog): boolean {
+function isDemoOrderLog(log: OrderExecutionLog): boolean {
   return log.demo === true || log.id.startsWith('paper-seed-');
 }
 

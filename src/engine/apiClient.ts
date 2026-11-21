@@ -208,7 +208,7 @@ export function setActiveConnectionProfile(profile: ConnectionProfile): void {
  * Builds a WebSocket (`ws://` or `wss://`) URL for local proxy or Remote VPS endpoints,
  * appending `?token=` when an access token is configured.
  */
-export function buildWebSocketUrl(
+function buildWebSocketUrl(
   wsPath: string,
   profile: ConnectionProfile = getActiveConnectionProfile()
 ): string {

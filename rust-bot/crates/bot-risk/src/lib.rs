@@ -59,11 +59,6 @@ impl RiskManager {
         self.btc_guard.observe(price, now, &self.risk_cfg);
     }
 
-    /// BTC move (%) across the guard window, or `None` when stale/absent.
-    pub fn btc_change_pct(&self, now: DateTime<Utc>) -> Option<f64> {
-        self.btc_guard.change_pct(now, &self.risk_cfg)
-    }
-
     /// True when the BTC crash guard is currently blocking new entries.
     pub fn btc_guard_blocking(&self, now: DateTime<Utc>) -> bool {
         self.btc_guard.is_blocking(now, &self.risk_cfg)

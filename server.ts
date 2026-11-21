@@ -1347,8 +1347,8 @@ function buildSyncedTomlFromPayload(body: Record<string, unknown>): string {
     'backup_dir = "backups"',
     '',
     '[web]',
-    'bind_addr = "127.0.0.1:8080"',
-    'allowed_origin = "http://localhost:3000"',
+    `bind_addr = "${tomlStr(process.env.APEXRUST_BOT_BIND?.trim() || '127.0.0.1:8080')}"`,
+    `allowed_origin = "${tomlStr(process.env.ALLOWED_ORIGIN?.trim() || 'http://localhost:3000')}"`,
     'auth_token = ""',
     '',
   ].join('\n');

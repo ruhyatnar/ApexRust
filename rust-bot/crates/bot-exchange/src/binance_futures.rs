@@ -66,7 +66,8 @@ impl BinanceFuturesClient {
             }
             ExchangeEnvironment::Testnet => {
                 if trimmed.is_empty()
-                    || trimmed.contains("fapi.binance.com")
+                    || (trimmed.contains("fapi.binance.com")
+                        && !trimmed.contains("demo-fapi.binance.com"))
                     || trimmed.contains("api.binance.com")
                     || trimmed.contains("binance.vision")
                 {
@@ -279,13 +280,14 @@ impl BinanceFuturesClient {
         let qty_dec = to_binance_step_decimal(req.quantity, step, dec)?;
         let qty_num = qty_dec.to_string().parse::<f64>().unwrap_or(req.quantity);
         let limit_px_num = if is_limit {
-            Some(
-                req.limit_price
-                    .filter(|&p| p.is_finite() && p > 0.0)
-                    .ok_or_else(|| {
-                        BotError::RestApi("Futures WS LIMIT order missing positive price".into())
-                    })?,
-            )
+            let raw_px = req
+                .limit_price
+                .filter(|&p| p.is_finite() && p > 0.0)
+                .ok_or_else(|| {
+                    BotError::RestApi("Futures WS LIMIT order missing positive price".into())
+                })?;
+            let px_dec = to_binance_step_decimal(raw_px, filters.tick_size, filters.tick_decimals)?;
+            Some(px_dec.to_string().parse::<f64>().unwrap_or(raw_px))
         } else {
             None
         };
@@ -302,15 +304,28 @@ impl BinanceFuturesClient {
             Side::Long => "BUY",
             Side::Short => "SELL",
         };
-        crate::ws_api::build_order_place_params(
+        let tif = if req.order_method == OrderExecutionMethod::LimitMaker {
+            "GTX"
+        } else {
+            req.time_in_force.as_str()
+        };
+        let mut params = crate::ws_api::build_order_place_params(
             &sym,
             side,
             if is_limit { "LIMIT" } else { "MARKET" },
             qty_num,
-            limit_px_num.map(|px| (px, Some(req.time_in_force.as_str()))),
+            limit_px_num.map(|px| (px, Some(tif))),
             req.reduce_only,
             None,
-        )
+        )?;
+        if self.is_hedge_mode().await {
+            let pos_side = match (req.side, req.reduce_only) {
+                (Side::Long, false) | (Side::Short, true) => "LONG",
+                (Side::Short, false) | (Side::Long, true) => "SHORT",
+            };
+            params["positionSide"] = serde_json::json!(pos_side);
+        }
+        Ok(params)
     }
 
     pub async fn execute_futures_order(&self, req: &LiveOrderRequest) -> Result<LiveOrderAck> {

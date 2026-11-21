@@ -7,7 +7,6 @@ use anyhow::anyhow;
 use bot_core::{BotConfig, Candle, IndicatorSnapshot, TrendingCategory};
 use bot_indicators::IndicatorPipeline;
 use bot_strategy::evaluate_entry_signal_with_options;
-use serde_json::Value;
 use std::path::Path;
 
 fn parse_category(raw: &str) -> anyhow::Result<TrendingCategory> {
@@ -508,12 +507,6 @@ pub async fn signal(
         }
     }
     Ok(())
-}
-
-/// Unused helper kept for JSON diagnostics in future commands.
-#[allow(dead_code)]
-fn describe_value(value: &Value) -> String {
-    value.to_string()
 }
 
 #[cfg(test)]

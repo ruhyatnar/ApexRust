@@ -75,7 +75,8 @@ impl BinanceRestClient {
             }
             (ExchangeVenue::Spot, ExchangeEnvironment::Testnet) => {
                 if trimmed.is_empty()
-                    || trimmed.contains("api.binance.com")
+                    || (trimmed.contains("api.binance.com")
+                        && !trimmed.contains("demo-api.binance.com"))
                     || trimmed.contains("fapi")
                     || trimmed.contains("fstream")
                 {
@@ -266,13 +267,14 @@ impl BinanceRestClient {
         let limit_px_num = if is_market {
             None
         } else {
-            Some(
-                req.limit_price
-                    .filter(|&p| p.is_finite() && p > 0.0)
-                    .ok_or_else(|| {
-                        BotError::RestApi("Spot WS LIMIT order missing positive price".into())
-                    })?,
-            )
+            let raw_px = req
+                .limit_price
+                .filter(|&p| p.is_finite() && p > 0.0)
+                .ok_or_else(|| {
+                    BotError::RestApi("Spot WS LIMIT order missing positive price".into())
+                })?;
+            let px_dec = to_binance_step_decimal(raw_px, filters.tick_size, filters.tick_decimals)?;
+            Some(px_dec.to_string().parse::<f64>().unwrap_or(raw_px))
         };
         validate_exchange_filters(
             &sym,
@@ -287,13 +289,18 @@ impl BinanceRestClient {
             Side::Long => "BUY",
             Side::Short => "SELL",
         };
+        let (order_type, tif) = match req.order_method {
+            OrderExecutionMethod::Market | OrderExecutionMethod::Oco => ("MARKET", None),
+            OrderExecutionMethod::LimitMaker => ("LIMIT_MAKER", None),
+            OrderExecutionMethod::Limit => ("LIMIT", Some(req.time_in_force.as_str())),
+        };
         crate::ws_api::build_order_place_params(
             &sym,
             side,
-            if is_market { "MARKET" } else { "LIMIT" },
+            order_type,
             qty_num,
-            limit_px_num.map(|px| (px, Some(req.time_in_force.as_str()))),
-            req.reduce_only,
+            limit_px_num.map(|px| (px, tif)),
+            false,
             None,
         )
     }
